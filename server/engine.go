@@ -290,6 +290,34 @@ func (e *Engine) StopTask(taskID string) {
 	e.deleteMu.Unlock()
 }
 
+// StopAll cancels every live task runtime (planner/worker loops + deadline
+// coordinators) and waits up to timeout for them to drain. Server.Stop uses it
+// at shutdown / test teardown. Tasks in-flight a planner/worker step abort via
+// their runtime ctx; the bounded wait means one stuck step can't hang shutdown.
+func (e *Engine) StopAll(timeout time.Duration) {
+	e.runtimeMu.Lock()
+	rts := make([]*taskRuntime, 0, len(e.runtimes))
+	for _, rt := range e.runtimes {
+		rts = append(rts, rt)
+	}
+	e.runtimeMu.Unlock()
+	for _, rt := range rts {
+		rt.cancel()
+	}
+	done := make(chan struct{})
+	go func() {
+		for _, rt := range rts {
+			rt.wg.Wait()
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		log.Printf("[engine] StopAll: %d 个 runtime 在 %v 内未完全排空", len(rts), timeout)
+	}
+}
+
 // cancelExec cancels a task's current per-task exec context (any in-flight
 // planner.Plan / worker.Execute), if present. Shared by Pause and the settle
 // sequence's hard-drain backstop.

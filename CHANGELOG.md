@@ -4,6 +4,32 @@
 
 ## [Unreleased]
 
+### 安全
+
+#### 新增的功能
+
+- **登录防爆破**：同一「来源 IP + 用户名」在 15 分钟窗口内连续失败 5 次后锁定 15 分钟（慢速爆破也会被前几次失败拖进锁定窗口），登录成功即清零；锁定与每次失败都会写后端日志（「日志」页可见），此前登录失败无任何记录。
+
+#### 修复的问题
+
+- **收紧 CORS**：`/api` 此前对任意 Origin 回显 `Access-Control-Allow-Origin: *`，现在只在 Origin 指向本服务（同源）时才回显。前端是内嵌同源静态导出，合法流量不受影响。
+- **工作区文件操作审计**：`/api/workspace` 的写入/新建目录/删除/上传成功后写一条 `[ws]` 审计日志（含来源 IP、路径、字节数）；读取/下载不记，保持日志信噪比。
+
+### 修复的问题
+
+- **修复 agent 运行时钩子的数据竞争**：`PromptOverride`/`ToolAugment`/`ToolResolve`/`Wrapup*`/`FindingTrafficBindingEnabled` 等包级钩子变量此前是裸函数变量——server 装配时写入、planner/worker goroutine 每轮读取，race detector 已抓到实锤（新 Server 构造与在跑 planner 循环并发）。现全部改为 `sync/atomic.Pointer` + Set/Get 对，`go test -race` 全量归零。
+- **恢复 graph_overview 的 scope 字段**：「精简态势概览」重构误删了 coverage 块里的 `scope`（任务圈定的目标范围根资产，company 行会展开 company_scope/keywords），导致 planner 每轮看不到授权范围边界，且既有测试自删除起一直红。现已恢复。
+- **修复测试间 goroutine 泄漏**：server 测试构造的 Server 之前用 `context.Background()` 且从不取消，restoreTaskRuntimes 恢复的任务循环会跨测试存活、往已清理的 TempDir 写文件（"directory not empty" flaky）。新增 `Server.Stop()`/`Engine.StopAll()`，测试统一走 `newTestServer` 在 t.Cleanup 里排空。
+- **修复跨包测试串扰**：`llmrec`/`config` 测试包此前不参与 PG advisory lock 互斥，与其他包并发跑 `go test ./...` 时会被别人的 schema 迁移/清理踩到（"relation llm_usage does not exist"、死锁 flake）。已补上与 db/server/agent/evidence 相同的 TestMain 锁。
+
+### 新增的功能
+
+- **`POST /api/gc` 从空 stub 变为真实 GC**：按需回收流量库无引用 blob（含后台增量 vacuum 归还磁盘）+ 证据快照/文件回收（`ttl` 参数控制保留期，默认 24h，限幅 1h–90d），返回各部分回收计数。
+
+### CI
+
+- **新增 CI workflow**（此前只有 release）：push/PR 跑 `go build` + `go vet` + `go test -race ./...` 与前端静态构建。web 的 `biome check` 因现存 80+ 个既有 lint 错误暂不入 CI，清理后加回。
+
 ## [0.3.15] - 2026-10-07
 
 ### 拦截

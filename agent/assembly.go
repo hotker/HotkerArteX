@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"runtime/debug"
+	"sync/atomic"
 
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -31,7 +32,24 @@ type DeferredInfo struct {
 //
 // When nil, agents run with only their built-in tools — behavior is unchanged
 // until a user assigns a skill/MCP to the agent in the UI.
-var ToolAugment func(ctx context.Context, agentKey string) (extra []actool.CoreTool, def DeferredInfo, cleanup func())
+// Accessed via SetToolAugment/GetToolAugment (atomic) — see hookvars.go.
+var toolAugment atomic.Pointer[func(context.Context, string) ([]actool.CoreTool, DeferredInfo, func())]
+
+func SetToolAugment(f func(ctx context.Context, agentKey string) (extra []actool.CoreTool, def DeferredInfo, cleanup func())) {
+	if f == nil {
+		toolAugment.Store(nil)
+		return
+	}
+	v := f
+	toolAugment.Store(&v)
+}
+
+func GetToolAugment() func(ctx context.Context, agentKey string) ([]actool.CoreTool, DeferredInfo, func()) {
+	if p := toolAugment.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
 
 // AugmentTools returns base plus the agent's visible skill/MCP tools, the
 // DeferredInfo, and a cleanup func the caller must defer (closes MCP clients).
@@ -42,10 +60,10 @@ func AugmentTools(ctx context.Context, agentKey string, base []actool.CoreTool) 
 		cleanup = func() {}
 		out     = base
 	)
-	if ToolAugment != nil {
+	if f := GetToolAugment(); f != nil {
 		var extra []actool.CoreTool
 		var cl func()
-		extra, def, cl = ToolAugment(ctx, agentKey)
+		extra, def, cl = f(ctx, agentKey)
 		if cl != nil {
 			cleanup = cl
 		}
@@ -57,8 +75,8 @@ func AugmentTools(ctx context.Context, agentKey string, base []actool.CoreTool) 
 	// agent isn't bound to (or that are disabled) and swap in overridden
 	// descriptions/schemas + default injection. MCP/skill/host tools have no row
 	// and pass through untouched, so deferred/unlock wiring stays consistent.
-	if ToolResolve != nil {
-		out = ToolResolve(ctx, agentKey, out)
+	if f := GetToolResolve(); f != nil {
+		out = f(ctx, agentKey, out)
 	}
 	out, def.FindingGuidance = findingWorkflowTools(agentKey, out)
 	for i, t := range out {

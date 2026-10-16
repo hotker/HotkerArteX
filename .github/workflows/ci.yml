@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+          cache: true
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test (race detector)
+        # 并发引擎(planner/worker 池 + 39 个 mutex + 裸 go func)，race detector 是
+        # 这类代码唯一能抓到数据竞争的自动化手段，CI 必须跑。
+        run: go test -race -count=1 ./...
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      # 不跑 `npm run check`：仓库现存 80+ 个既有 lint 错误（nursery 规则），
+      # 先保证构建产物（内嵌进二进制的静态导出）能过；lint 债另行清理后再加回。
+      - run: npm run build:static
+        working-directory: web

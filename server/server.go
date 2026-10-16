@@ -42,6 +42,11 @@ type Server struct {
 	m      *Manager
 	engine *Engine
 	ctx    context.Context
+	// cancelCtx cancels the server-owned derivation of the caller's context.
+	// Every background goroutine New() starts (engine task runtimes, scheduler,
+	// notifier, evidence GC, archive worker) selects on s.ctx, so Stop() takes
+	// them all down. The production caller's context is NOT cancelled by Stop().
+	cancelCtx context.CancelFunc
 
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
@@ -145,7 +150,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
-	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
+	sctx, cancelCtx := context.WithCancel(ctx)
+	s := &Server{m: m, engine: NewEngine(m), ctx: sctx, cancelCtx: cancelCtx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
@@ -175,7 +181,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// Wire DB-stored prompt templates into the agents (新版方案 §3.3 / §5a). With no
 	// override row, agents keep their built-in defaults — behavior is unchanged.
 	if m.pg != nil {
-		agent.PromptOverride = func(key string) (string, bool) {
+		agent.SetPromptOverride(func(key string) (string, bool) {
 			a, err := m.pg.GetAgentByKey(key)
 			if err != nil || a == nil {
 				return "", false
@@ -185,38 +191,38 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 				return "", false
 			}
 			return t, true
-		}
+		})
 		// Wire DB-stored wrap-up (settlement) prompts. Empty column → built-in default.
-		agent.WrapupOverride = func(key string) (string, bool) {
+		agent.SetWrapupOverride(func(key string) (string, bool) {
 			a, err := m.pg.GetAgentByKey(key)
 			if err != nil || a == nil || a.WrapupPrompt == "" {
 				return "", false
 			}
 			return a.WrapupPrompt, true
-		}
+		})
 		// Wire DB-stored wrap-up turn budgets. 0 / missing → built-in per-agent default.
-		agent.WrapupMaxTurnsOverride = func(key string) (int, bool) {
+		agent.SetWrapupMaxTurnsOverride(func(key string) (int, bool) {
 			a, err := m.pg.GetAgentByKey(key)
 			if err != nil || a == nil || a.WrapupMaxTurns <= 0 {
 				return 0, false
 			}
 			return a.WrapupMaxTurns, true
-		}
+		})
 		// Wire DB-stored TASK-TIMEOUT wrap-up prompt/turns (worker/planner). Empty/0 → default.
-		agent.WrapupTaskTimeoutOverride = func(key string) (string, bool) {
+		agent.SetWrapupTaskTimeoutOverride(func(key string) (string, bool) {
 			a, err := m.pg.GetAgentByKey(key)
 			if err != nil || a == nil || a.TaskTimeoutWrapupPrompt == "" {
 				return "", false
 			}
 			return a.TaskTimeoutWrapupPrompt, true
-		}
-		agent.WrapupTaskTimeoutTurnsOverride = func(key string) (int, bool) {
+		})
+		agent.SetWrapupTaskTimeoutTurnsOverride(func(key string) (int, bool) {
 			a, err := m.pg.GetAgentByKey(key)
 			if err != nil || a == nil || a.TaskTimeoutWrapupMaxTurns <= 0 {
 				return 0, false
 			}
 			return a.TaskTimeoutWrapupMaxTurns, true
-		}
+		})
 		wireAgentAugment(m.pg, s.skillDir, s.hostTools) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
 		domainReg := buildDomainReg(m.Assets())
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
@@ -291,6 +297,20 @@ func (s *Server) restoreTaskRuntimes() {
 			s.engine.Run(s.ctx, t)
 		}
 	}
+}
+
+// Stop cancels the server's background context (engine task runtimes, scheduler,
+// notifier, evidence GC, archive worker — they all select on s.ctx) and waits for
+// the engine loops to drain. Tests call it from t.Cleanup: without it, loops
+// restored from tasks persisted in the shared PG keep writing into a previous
+// test's already-removed data dir ("TempDir RemoveAll cleanup: directory not
+// empty"). Safe to call more than once; a nil cancel (pre-init) is a no-op.
+func (s *Server) Stop() {
+	if s.cancelCtx != nil {
+		s.cancelCtx()
+		s.cancelCtx = nil
+	}
+	s.engine.StopAll(5 * time.Second)
 }
 
 // agentMaxTurns returns the configured max_turns for an agent key (0 = unlimited,
@@ -3870,24 +3890,72 @@ func (s *Server) getAudit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"entries": t.Guard.Audit(), "attributions": t.Guard.Attributions()})
 }
 
-// gc is a no-op stub (GC not yet implemented in the new asset store).
+// gc performs an on-demand garbage collection: unreferenced traffic blobs (with
+// the background index reclamation) plus evidence snapshots/blobs past the
+// retention window. ttl is the retention in seconds (query "ttl", default 24h);
+// it is clamped to [1h, 90d] so a typo'd ttl=0 cannot unlink snapshot bodies
+// that a concurrent bind/crash recovery may still be reading.
 func (s *Server) gc(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"removed": 0})
+	ttl := time.Duration(atoiDefault(r.URL.Query().Get("ttl"), 86400)) * time.Second
+	if ttl < time.Hour {
+		ttl = time.Hour
+	}
+	if ttl > 90*24*time.Hour {
+		ttl = 90 * 24 * time.Hour
+	}
+	var trafficBlobs int
+	if tr := s.m.traffic; tr != nil {
+		n, err := tr.ReclaimNow()
+		if err != nil {
+			log.Printf("[gc] 流量 blob 回收: %v", err)
+		}
+		trafficBlobs = n
+	}
+	snapshots, evidenceFiles, err := s.evidenceStore().CollectTTL(r.Context(), time.Now(), ttl)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("[gc] 证据回收: %v", err)
+	}
+	log.Printf("[gc] 手动回收完成 ttl=%s traffic_blobs=%d evidence_files=%d evidence_snapshots=%d",
+		ttl, trafficBlobs, evidenceFiles, snapshots)
+	writeJSON(w, 200, map[string]any{
+		"removed":            trafficBlobs + evidenceFiles,
+		"traffic_blobs":      trafficBlobs,
+		"evidence_files":     evidenceFiles,
+		"evidence_snapshots": snapshots,
+		"ttl_seconds":        int64(ttl.Seconds()),
+	})
 }
 
 // --- utils ---
 
+// cors only echoes the request's Origin when it points back at this very server
+// (same host:port). The UI is a same-origin static export embedded in the binary,
+// so legitimate traffic never needs cross-origin headers; the old wildcard
+// "*" let any website in a victim's browser talk to the API (a JWT is still
+// required, but there is no reason to hand strangers a working channel).
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(204)
-			return
+		if origin := r.Header.Get("Origin"); origin != "" && originHost(origin) == r.Host {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(204)
+				return
+			}
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// originHost extracts host:port from an Origin value ("https://host:port" → "host:port").
+func originHost(origin string) string {
+	s := strings.TrimPrefix(strings.TrimPrefix(origin, "https://"), "http://")
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	return s
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

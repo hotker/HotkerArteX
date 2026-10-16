@@ -344,16 +344,30 @@ func (s *Store) WithInstalledSnapshots(ctx context.Context, snapshots []db.Traff
 	})
 }
 
+// Collect is the periodic collection with the built-in 24h retention; the
+// /api/gc endpoint uses CollectTTL so operators can control the retention.
 func (s *Store) Collect(ctx context.Context, now time.Time) error {
-	return s.DB.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
+	_, _, err := s.CollectTTL(ctx, now, 24*time.Hour)
+	return err
+}
+
+// CollectTTL stamps unreferenced snapshots and deletes the ones past the
+// retention window, then sweeps the blob/staging directories for files no
+// snapshot references (also gated by the same retention so a just-deleted
+// snapshot's body is not unlinked out from under a crash recovery). Returns
+// how many snapshot rows and how many files were removed.
+func (s *Store) CollectTTL(ctx context.Context, now time.Time, ttl time.Duration) (snapshots int64, files int, err error) {
+	err = s.DB.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.Exec(`UPDATE traffic_evidence_snapshots s SET unreferenced_at=$1
 WHERE unreferenced_at IS NULL AND NOT EXISTS(SELECT 1 FROM finding_traffic_bindings b WHERE b.snapshot_id=s.id)`, now); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`DELETE FROM traffic_evidence_snapshots s WHERE unreferenced_at<$1
-AND NOT EXISTS(SELECT 1 FROM finding_traffic_bindings b WHERE b.snapshot_id=s.id)`, now.Add(-24*time.Hour)); err != nil {
+		res, err := tx.Exec(`DELETE FROM traffic_evidence_snapshots s WHERE unreferenced_at<$1
+AND NOT EXISTS(SELECT 1 FROM finding_traffic_bindings b WHERE b.snapshot_id=s.id)`, now.Add(-ttl))
+		if err != nil {
 			return err
 		}
+		snapshots, _ = res.RowsAffected()
 		rows, err := tx.Query(`SELECT req_hash FROM traffic_evidence_snapshots UNION SELECT resp_hash FROM traffic_evidence_snapshots`)
 		if err != nil {
 			return err
@@ -390,10 +404,13 @@ AND NOT EXISTS(SELECT 1 FROM finding_traffic_bindings b WHERE b.snapshot_id=s.id
 				if err != nil {
 					return err
 				}
-				if now.Sub(info.ModTime()) < 24*time.Hour {
+				if now.Sub(info.ModTime()) < ttl {
 					return nil
 				}
-				return os.Remove(path)
+				if os.Remove(path) == nil {
+					files++
+				}
+				return nil
 			})
 			if err != nil {
 				return err
@@ -401,6 +418,7 @@ AND NOT EXISTS(SELECT 1 FROM finding_traffic_bindings b WHERE b.snapshot_id=s.id
 		}
 		return nil
 	})
+	return snapshots, files, err
 }
 
 func (s *Store) RunGC(ctx context.Context) {

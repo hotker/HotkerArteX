@@ -3,12 +3,14 @@ package server
 import (
 	"bytes"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -100,6 +102,14 @@ func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"path": s.wsRel(abs), "entries": out})
 }
 
+// wsAudit records a mutating workspace operation to the backend log (which is
+// persisted to server_logs and viewable on the 日志 page), so write/delete/
+// upload actions have an auditable trail beyond the JWT gate. Read/download are
+// intentionally not logged to keep the log signal-to-noise usable.
+func wsAudit(r *http.Request, action, detail string) {
+	log.Printf("[ws] %s ip=%s %s", action, clientIP(r), detail)
+}
+
 // GET /api/workspace/read?path=<rel> — inline text for view/edit. Binary or oversize
 // files return {binary:true}/{too_large:true} with no content (use download instead).
 func (s *Server) wsRead(w http.ResponseWriter, r *http.Request) {
@@ -160,6 +170,7 @@ func (s *Server) wsWrite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	wsAudit(r, "write", "path="+s.wsRel(abs)+" bytes="+strconv.Itoa(len(req.Content)))
 	writeJSON(w, 200, map[string]any{"ok": true, "path": s.wsRel(abs)})
 }
 
@@ -181,6 +192,7 @@ func (s *Server) wsMkdir(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	wsAudit(r, "mkdir", "path="+s.wsRel(abs))
 	writeJSON(w, 200, map[string]any{"ok": true, "path": s.wsRel(abs)})
 }
 
@@ -204,6 +216,7 @@ func (s *Server) wsDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	wsAudit(r, "delete", "path="+s.wsRel(abs))
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -261,6 +274,7 @@ func (s *Server) wsUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		saved++
+		wsAudit(r, "upload", "path="+s.wsRel(destAbs)+" bytes="+strconv.FormatInt(hdr.Size, 10))
 	}
 	writeJSON(w, 200, map[string]any{"uploaded": saved})
 }

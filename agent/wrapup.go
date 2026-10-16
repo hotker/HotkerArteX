@@ -2,6 +2,7 @@ package agent
 
 import (
 	"strings"
+	"sync/atomic"
 
 	"github.com/Autumn-27/norma/harness"
 )
@@ -16,12 +17,46 @@ import (
 // WrapupOverride, if set, returns the stored wrap-up prompt for an agent key and
 // whether a non-empty one exists. Wired by the server to the agents table (like
 // PromptOverride for system prompts). nil / empty → the built-in default is used.
-var WrapupOverride func(agentKey string) (string, bool)
+// Accessed via SetWrapupOverride/GetWrapupOverride (atomic) — see hookvars.go.
+var wrapupOverride atomic.Pointer[func(string) (string, bool)]
+
+func SetWrapupOverride(f func(agentKey string) (string, bool)) {
+	if f == nil {
+		wrapupOverride.Store(nil)
+		return
+	}
+	v := f
+	wrapupOverride.Store(&v)
+}
+
+func GetWrapupOverride() func(agentKey string) (string, bool) {
+	if p := wrapupOverride.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
 
 // WrapupMaxTurnsOverride, if set, returns the admin-configured turn budget for the
 // wrap-up phase of an agent and whether a positive one exists. Wired to the agents
 // table. nil / ≤0 → the built-in per-agent default (wrapupTurnDefaults) is used.
-var WrapupMaxTurnsOverride func(agentKey string) (int, bool)
+// Accessed via SetWrapupMaxTurnsOverride/GetWrapupMaxTurnsOverride (atomic).
+var wrapupMaxTurnsOverride atomic.Pointer[func(string) (int, bool)]
+
+func SetWrapupMaxTurnsOverride(f func(agentKey string) (int, bool)) {
+	if f == nil {
+		wrapupMaxTurnsOverride.Store(nil)
+		return
+	}
+	v := f
+	wrapupMaxTurnsOverride.Store(&v)
+}
+
+func GetWrapupMaxTurnsOverride() func(agentKey string) (int, bool) {
+	if p := wrapupMaxTurnsOverride.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
 
 // 内置默认收尾提示词,按 agent key 索引。worker 复用历史上硬编码的 settleWrapUpPrompt
 // (定义在 worker.go),planner/mainagent 各有一版;未命中的(自定义 agent)走通用兜底。
@@ -68,8 +103,8 @@ func WrapupTurnsDefault(agentKey string) int {
 // resolveWrapup returns the effective wrap-up prompt: the DB override (if set and
 // non-empty) over the built-in default.
 func resolveWrapup(agentKey string) string {
-	if WrapupOverride != nil {
-		if t, ok := WrapupOverride(agentKey); ok && strings.TrimSpace(t) != "" {
+	if f := GetWrapupOverride(); f != nil {
+		if t, ok := f(agentKey); ok && strings.TrimSpace(t) != "" {
 			return t
 		}
 	}
@@ -79,8 +114,8 @@ func resolveWrapup(agentKey string) string {
 // resolveWrapupTurns returns the effective wrap-up turn budget: a positive DB
 // override over the built-in per-agent default.
 func resolveWrapupTurns(agentKey string) int {
-	if WrapupMaxTurnsOverride != nil {
-		if v, ok := WrapupMaxTurnsOverride(agentKey); ok && v > 0 {
+	if f := GetWrapupMaxTurnsOverride(); f != nil {
+		if v, ok := f(agentKey); ok && v > 0 {
 			return v
 		}
 	}
@@ -107,10 +142,43 @@ func wrapupSettlement(agentKey string, disabledTools []string) *harness.Settleme
 
 // WrapupTaskTimeoutOverride / …TurnsOverride：任务超时收尾词与轮数的 DB 覆盖
 // （wire 到 agents.task_timeout_wrapup_prompt / _max_turns，仅 worker/planner）。
+// Accessed via Set/Get (atomic) — see hookvars.go.
 var (
-	WrapupTaskTimeoutOverride      func(agentKey string) (string, bool)
-	WrapupTaskTimeoutTurnsOverride func(agentKey string) (int, bool)
+	wrapupTaskTimeoutOverride      atomic.Pointer[func(string) (string, bool)]
+	wrapupTaskTimeoutTurnsOverride atomic.Pointer[func(string) (int, bool)]
 )
+
+func SetWrapupTaskTimeoutOverride(f func(agentKey string) (string, bool)) {
+	if f == nil {
+		wrapupTaskTimeoutOverride.Store(nil)
+		return
+	}
+	v := f
+	wrapupTaskTimeoutOverride.Store(&v)
+}
+
+func GetWrapupTaskTimeoutOverride() func(agentKey string) (string, bool) {
+	if p := wrapupTaskTimeoutOverride.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+func SetWrapupTaskTimeoutTurnsOverride(f func(agentKey string) (int, bool)) {
+	if f == nil {
+		wrapupTaskTimeoutTurnsOverride.Store(nil)
+		return
+	}
+	v := f
+	wrapupTaskTimeoutTurnsOverride.Store(&v)
+}
+
+func GetWrapupTaskTimeoutTurnsOverride() func(agentKey string) (int, bool) {
+	if p := wrapupTaskTimeoutTurnsOverride.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
 
 var taskTimeoutWrapupDefaults = map[string]string{
 	"worker":  workerTaskTimeoutDefault,
@@ -129,8 +197,8 @@ func TaskTimeoutWrapupDefault(agentKey string) string {
 // resolveTaskTimeoutWrapup：DB 覆盖(非空) > 内置默认。空串表示该 agent 无任务超时词
 // （非 worker/planner），此时调用方应回退 per-run 词。
 func resolveTaskTimeoutWrapup(agentKey string) string {
-	if WrapupTaskTimeoutOverride != nil {
-		if t, ok := WrapupTaskTimeoutOverride(agentKey); ok && strings.TrimSpace(t) != "" {
+	if f := GetWrapupTaskTimeoutOverride(); f != nil {
+		if t, ok := f(agentKey); ok && strings.TrimSpace(t) != "" {
 			return t
 		}
 	}
@@ -138,8 +206,8 @@ func resolveTaskTimeoutWrapup(agentKey string) string {
 }
 
 func resolveTaskTimeoutTurns(agentKey string) int {
-	if WrapupTaskTimeoutTurnsOverride != nil {
-		if v, ok := WrapupTaskTimeoutTurnsOverride(agentKey); ok && v > 0 {
+	if f := GetWrapupTaskTimeoutTurnsOverride(); f != nil {
+		if v, ok := f(agentKey); ok && v > 0 {
 			return v
 		}
 	}

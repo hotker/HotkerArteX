@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -104,7 +105,24 @@ func BuiltinToolSeeds() []ToolSeed {
 // and wraps the rest so the model sees the DB-overridden description/schema and
 // 缺省入参 get injected. Tools with no matching DB row (MCP/skill/host tools like
 // traffic) pass through untouched. nil = tools unchanged. Wired in server/assembly.go.
-var ToolResolve func(ctx context.Context, agentKey string, tools []actool.CoreTool) []actool.CoreTool
+// Accessed via SetToolResolve/GetToolResolve (atomic) — see hookvars.go.
+var toolResolve atomic.Pointer[func(context.Context, string, []actool.CoreTool) []actool.CoreTool]
+
+func SetToolResolve(f func(ctx context.Context, agentKey string, tools []actool.CoreTool) []actool.CoreTool) {
+	if f == nil {
+		toolResolve.Store(nil)
+		return
+	}
+	v := f
+	toolResolve.Store(&v)
+}
+
+func GetToolResolve() func(ctx context.Context, agentKey string, tools []actool.CoreTool) []actool.CoreTool {
+	if p := toolResolve.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
 
 // DecorateTool wraps t so Description()/InputSchema() report the DB overrides and
 // Call() injects scalar parameter defaults (from schema's "default" props) whenever

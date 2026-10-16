@@ -1059,7 +1059,7 @@ func (t *Traffic) DeleteHost(host string) (int64, error) {
 	t.reapStage(stageDir)
 	if n > 0 {
 		t.reclaim()
-		if err := t.gcBlobs(); err != nil {
+		if _, err := t.gcBlobs(); err != nil {
 			return n, err
 		}
 	}
@@ -1106,7 +1106,7 @@ func (t *Traffic) DeleteAll() (deleted int64, reclaimed int64, err error) {
 		return 0, 0, errors.Join(fmt.Errorf("提交流量索引删除: %w", err), restoreTrees(stageDir, moves))
 	}
 	t.reapStage(stageDir)
-	if err := t.gcBlobs(); err != nil {
+	if _, err := t.gcBlobs(); err != nil {
 		return deleted, 0, err
 	}
 	if err := t.compactIndex(); err != nil {
@@ -1571,7 +1571,7 @@ func (t *Traffic) RecoverHostDeleteStages(archiveCommitted func(int64, int64) (b
 	}
 	if needsGC {
 		t.reclaim()
-		if err := t.gcBlobs(); err != nil {
+		if _, err := t.gcBlobs(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -1664,7 +1664,7 @@ func (s *HostDeleteStage) Commit() error {
 	s.traffic.reapStage(s.stageDir)
 	s.traffic.reclaim()
 	var errs []error
-	if err := s.traffic.gcBlobs(); err != nil {
+	if _, err := s.traffic.gcBlobs(); err != nil {
 		errs = append(errs, fmt.Errorf("回收流量 blob: %w", err))
 	}
 	s.done = true
@@ -1799,31 +1799,33 @@ func (t *Traffic) reclaimChunk(ctx context.Context, conn *sql.Conn, merges *int)
 // removed as well; the previous file-scanning collector deleted only files and
 // left the buckets behind permanently. Best-effort: walk errors only skip the
 // affected entries. Callers must hold wmu so this never races a concurrent
-// record() writing a fresh blob + reference.
-func (t *Traffic) gcBlobs() error {
+// record() writing a fresh blob + reference. Returns the number of blob files
+// removed.
+func (t *Traffic) gcBlobs() (int, error) {
 	refs := make(map[string]struct{})
 	rows, err := t.db.Query(`SELECT DISTINCT hash FROM blob_refs`)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	for rows.Next() {
 		var h string
 		if err := rows.Scan(&h); err != nil {
 			rows.Close()
-			return err
+			return 0, err
 		}
 		refs[h] = struct{}{}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return err
+		return 0, err
 	}
 	if err := t.legacyBlobRefs(refs); err != nil {
-		return err
+		return 0, err
 	}
 
 	root := filepath.Join(t.dir, "_blobs", "sha256")
 	var buckets []string
+	removed := 0
 	if err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d == nil {
 			return nil
@@ -1836,11 +1838,13 @@ func (t *Traffic) gcBlobs() error {
 		}
 		h := strings.TrimSuffix(d.Name(), ".bin")
 		if _, ok := refs[h]; !ok {
-			os.Remove(p)
+			if os.Remove(p) == nil {
+				removed++
+			}
 		}
 		return nil
 	}); err != nil {
-		return err
+		return 0, err
 	}
 	// Deepest first, so a two-level bucket left by the old layout collapses fully.
 	// Remove fails harmlessly on a non-empty directory — exactly the guard needed
@@ -1849,7 +1853,22 @@ func (t *Traffic) gcBlobs() error {
 	for _, b := range buckets {
 		os.Remove(b)
 	}
-	return nil
+	return removed, nil
+}
+
+// ReclaimNow performs an immediate manual garbage collection (backing the
+// /api/gc endpoint): it sweeps unreferenced blobs under the write lock, then
+// kicks the background bounded reclamation that hands the index's freed pages
+// back to the filesystem. Returns the number of orphan blob files removed.
+func (t *Traffic) ReclaimNow() (int, error) {
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	removed, err := t.gcBlobs()
+	if err != nil {
+		return removed, err
+	}
+	t.reclaim()
+	return removed, nil
 }
 
 // legacyBlobRefs adds hashes referenced by pre-SQLite exchanges, whose bodies are

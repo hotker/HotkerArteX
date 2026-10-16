@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"sync/atomic"
 	"text/template"
 	"time"
 )
@@ -10,7 +11,27 @@ import (
 // key and whether one exists. The server wires it to the PG agent_prompts table.
 // When nil or no override exists, agents use their built-in default prompt — so
 // behavior is identical until a user edits a prompt in the UI.
-var PromptOverride func(agentKey string) (string, bool)
+//
+// It is read from planner/worker goroutines on every turn while the server may
+// be rewiring it, so access goes through SetPromptOverride/GetPromptOverride
+// (atomic) rather than direct assignment.
+var promptOverride atomic.Pointer[func(string) (string, bool)]
+
+func SetPromptOverride(f func(agentKey string) (string, bool)) {
+	if f == nil {
+		promptOverride.Store(nil)
+		return
+	}
+	v := f
+	promptOverride.Store(&v)
+}
+
+func GetPromptOverride() func(agentKey string) (string, bool) {
+	if p := promptOverride.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
 
 // Prompt-variable structs — fields mirror each agent's catalog (docs §5a) so a
 // user template referencing a catalog variable renders; referencing anything else
@@ -37,8 +58,8 @@ func nowStr() string { return time.Now().Format("2006-01-02 15:04:05 MST") }
 // 输出规约) AFTER this, so those can't be edited away via the DB body.
 func renderSystem(agentKey, def string, vars any) string {
 	tmpl := def
-	if PromptOverride != nil {
-		if t, ok := PromptOverride(agentKey); ok && t != "" {
+	if f := GetPromptOverride(); f != nil {
+		if t, ok := f(agentKey); ok && t != "" {
 			tmpl = t
 		}
 	}

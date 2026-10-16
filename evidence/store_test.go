@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -329,5 +330,33 @@ func TestEvidenceGCGraceAndActiveRestore(t *testing.T) {
 	bad.URL = "http://tampered.local/"
 	if err = s.InstallSnapshots(ctx, []db.TrafficEvidenceSnapshot{bad}, archive); err == nil {
 		t.Fatal("accepted tampered snapshot")
+	}
+}
+
+func TestCollectTTLCustomRetention(t *testing.T) {
+	s, _, dir := evidenceFixture(t)
+	ctx := context.Background()
+	// 一个没有任何 snapshot 引用的孤儿文件，mtime 设为 2 小时前。
+	orphan := filepath.Join(dir, "evidence", "blobs", strings.Repeat("d", 64)+".bin")
+	if err := os.MkdirAll(filepath.Dir(orphan), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(orphan, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(orphan, old, old); err != nil {
+		t.Fatal(err)
+	}
+	// ttl=1h：过期，应删除并计数；ttl=24h：未过期，应保留。
+	if _, files, err := s.CollectTTL(ctx, time.Now(), time.Hour); err != nil || files != 1 {
+		t.Fatalf("ttl=1h: files=%d err=%v", files, err)
+	}
+	fresh := filepath.Join(dir, "evidence", "blobs", strings.Repeat("e", 64)+".bin")
+	if err := os.WriteFile(fresh, []byte("y"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, files, err := s.CollectTTL(ctx, time.Now(), 24*time.Hour); err != nil || files != 0 {
+		t.Fatalf("ttl=24h: files=%d err=%v (fresh file must survive)", files, err)
 	}
 }

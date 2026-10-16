@@ -272,7 +272,11 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "请求格式错误")
 		return
 	}
+	if loginThrottled(w, r, req.Username) {
+		return
+	}
 	if req.Username != "ARTEX" {
+		loginNoteFail(r, req.Username)
 		writeErr(w, 401, "用户名或密码错误")
 		return
 	}
@@ -286,9 +290,11 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
+		loginNoteFail(r, req.Username)
 		writeErr(w, 401, "用户名或密码错误")
 		return
 	}
+	loginNoteSuccess(r, req.Username)
 	tok, err := signJWT(s.jwtKey)
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
