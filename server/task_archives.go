@@ -389,6 +389,7 @@ func (s *Server) loadRestoredTask(taskID int64) {
 	}
 	if !isTerminalStatus(lifecycle.Status) {
 		s.engine.startDeadlineCoordinator(s.ctx, restored)
+		s.engine.startCostCoordinator(s.ctx, restored)
 	}
 }
 

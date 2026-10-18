@@ -158,6 +158,13 @@ func (s *logSinkT) add(l LogLine) {
 	}
 }
 
+// currentSeq returns the sink's latest sequence number (0 when nothing logged).
+func (s *logSinkT) currentSeq() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.seq
+}
+
 // recent returns ring lines with Seq > since (capped to limit), and the latest seq.
 func (s *logSinkT) recent(since int64, limit int) (lines []LogLine, cursor int64) {
 	s.mu.Lock()

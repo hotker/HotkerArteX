@@ -153,6 +153,9 @@ type Traffic struct {
 	// default: PRAGMA incremental_vacuum is a silent no-op there, so deletions
 	// reclaim nothing until an explicit full compaction converts the file.
 	incrementalVacuum bool
+	// caCheckAt (unix seconds) gates re-hardening the CA key file: go-mitmproxy
+	// creates it lazily on first MITM, so Open() alone cannot set its perms.
+	caCheckAt atomic.Int64
 	// reclaiming keeps a single background reclamation in flight. Concurrent ones
 	// would only contend for wmu, never finish sooner.
 	reclaiming atomic.Bool
@@ -179,6 +182,7 @@ func Open(dir, addr string) (*Traffic, error) {
 			return nil, err
 		}
 	}
+	hardenCAFiles(dir)
 	// busy_timeout is a per-connection setting, so it belongs in the DSN rather
 	// than in a one-off Exec: the pool opens connections on demand, and an Exec
 	// only configures whichever one happened to serve it — leaving every other
@@ -229,6 +233,36 @@ func Open(dir, addr string) (*Traffic, error) {
 	p.AddAddon(&sink{t: t})
 	t.proxy = p
 	return t, nil
+}
+
+// hardenCAFiles tightens permissions on the MITM CA pair, which go-mitmproxy
+// creates with default umask permissions on first use: mitmproxy-ca.pem holds
+// the CA *private key* (whoever has it can forge TLS for any domain), so it is
+// 0600 owner-only, while the two public certs stay 0644 (they are meant to be
+// distributed). Safe to call when nothing exists yet.
+func hardenCAFiles(dir string) {
+	caDir := filepath.Join(dir, "_ca")
+	_ = os.Chmod(filepath.Join(caDir, "mitmproxy-ca.pem"), 0o600)
+	_ = os.Chmod(filepath.Join(caDir, "mitmproxy-ca-cert.pem"), 0o644)
+	_ = os.Chmod(filepath.Join(caDir, "mitmproxy-ca-cert.cer"), 0o644)
+}
+
+// recheckCAHardening re-applies the CA permissions at most once per 30s. The CA
+// key file is created lazily by go-mitmproxy on the first intercepted TLS
+// handshake, so Open() alone cannot cover it; the 30s gate keeps the steady
+// state of record() free of any stat/chmod calls.
+func (t *Traffic) recheckCAHardening() {
+	now := time.Now().Unix()
+	for {
+		last := t.caCheckAt.Load()
+		if now-last < 30 {
+			return
+		}
+		if t.caCheckAt.CompareAndSwap(last, now) {
+			hardenCAFiles(t.dir)
+			return
+		}
+	}
 }
 
 // initIndex applies the schema on a single pinned connection. Pinning is what
@@ -434,6 +468,7 @@ func proxyCausedErr(err error) bool {
 // full-text index. Nothing is written to a per-request directory — only bodies
 // above maxInlineBody spill to the content-addressed blob store.
 func (t *Traffic) record(f *mproxy.Flow) {
+	t.recheckCAHardening()
 	// The write lock covers blob + index writes, so DeleteHost (and its blob GC)
 	// can run under the same lock without racing a concurrent record.
 	t.wmu.Lock()

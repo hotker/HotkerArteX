@@ -228,6 +228,49 @@ func TestNoFailoverOnCancel(t *testing.T) {
 	}
 }
 
+// The Complete path must not treat a non-failover error (4xx, cancellation) as a
+// success: resetting the breaker on it would wipe the accumulated evidence of a
+// broken profile. Stream's non-failover branch only passes on genuine success.
+func TestCompleteNonFailoverDoesNotResetBreaker(t *testing.T) {
+	reg := NewRegistry(nil, nil)
+	// Accumulate transient failures that nearly trip the breaker.
+	reg.Trip(1, "429", false)
+	if st := reg.Get(1); st.Fails != 1 {
+		t.Fatalf("setup: Fails = %d, want 1", st.Fails)
+	}
+
+	// A 400 on the Complete path is non-failover and non-success.
+	a := failProv("a", 400)
+	p := New([]*Member{member(1, "a", 10, a)}, reg)
+	if _, _, _, err := p.Complete(context.Background(), llm.CompletionRequest{}); err == nil {
+		t.Fatal("400 should surface as an error")
+	}
+	if st := reg.Get(1); st.Fails != 1 {
+		t.Fatalf("non-failover Complete error reset the breaker: Fails = %d, want 1", st.Fails)
+	}
+
+	// Same for cancellation: ctx.Err() != nil alone makes shouldFailover false,
+	// so whatever the provider returns must not touch health either.
+	cctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, _, err := p.Complete(cctx, llm.CompletionRequest{}); err == nil {
+		t.Fatal("cancelled Complete should surface an error")
+	}
+	if st := reg.Get(1); st.Fails != 1 {
+		t.Fatalf("cancelled Complete call reset the breaker: Fails = %d, want 1", st.Fails)
+	}
+
+	// A genuine success still clears it.
+	ok := okProv("ok", "x")
+	p3 := New([]*Member{member(1, "ok", 10, ok)}, reg)
+	if _, _, _, err := p3.Complete(context.Background(), llm.CompletionRequest{}); err != nil {
+		t.Fatalf("Complete success: %v", err)
+	}
+	if st := reg.Get(1); st.Fails != 0 {
+		t.Fatalf("success did not clear the breaker: Fails = %d, want 0", st.Fails)
+	}
+}
+
 func TestShouldFailoverByStatus(t *testing.T) {
 	cases := []struct {
 		status int

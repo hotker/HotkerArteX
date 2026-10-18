@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -19,7 +20,10 @@ import (
 const (
 	jwtKeyFilename = "jwt.key"
 	authPassKey    = "auth.password_hash"
-	jwtTTL         = 7 * 24 * time.Hour
+	// authTokenGenKey persists the token generation. Bumping it (on password
+	// change) revokes every token signed under the previous generation.
+	authTokenGenKey = "auth.token_gen"
+	jwtTTL          = 7 * 24 * time.Hour
 	keyChars       = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 	// 下限与 setup 页的前端校验一致——校验只放在前端等于没放，直接打 API 就能
@@ -83,24 +87,68 @@ func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
 	return buf, nil
 }
 
-// signJWT issues a 7-day HS256 token for user ARTEX.
-func signJWT(key []byte) (string, error) {
-	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-		Subject:   "ARTEX",
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(jwtTTL)),
-		IssuedAt:  jwt.NewNumericDate(time.Now()),
-	}).SignedString(key)
+// signJWT issues a generation-0 7-day HS256 token for user ARTEX (no generation
+// claim). Kept as the one-arg form for tests and as the fresh-install path; the
+// server signs new tokens with the current generation via signJWTGen.
+func signJWT(key []byte) (string, error) { return signJWTGen(key, 0) }
+
+// authClaims is the JWT payload. Gen carries the token generation (see
+// auth.token_gen); it is omitted for gen==0 so fresh-install tokens look
+// identical to the legacy (pre-generation) ones.
+type authClaims struct {
+	jwt.RegisteredClaims
+	Gen string `json:"gen,omitempty"`
 }
 
-// verifyJWT returns true when tokenStr is a valid, non-expired HS256 token.
-func verifyJWT(tokenStr string, key []byte) bool {
+// signJWTGen issues a 7-day HS256 token stamped with gen (the current token
+// generation, see auth.token_gen). gen==0 — a fresh install that has never
+// rotated — is omitted, so such tokens look exactly like the legacy
+// (pre-generation) ones and nothing downstream needs to change.
+func signJWTGen(key []byte, gen int64) (string, error) {
+	claims := authClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "ARTEX",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(jwtTTL)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	}
+	if gen > 0 {
+		claims.Gen = strconv.FormatInt(gen, 10)
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(key)
+}
+
+// verifyJWT returns true when tokenStr is a valid, non-expired HS256 token whose
+// embedded generation matches currentGen. A token with no generation claim (every
+// pre-generation token, and all tokens from a fresh install) is treated as
+// generation 0 — valid until the first password change bumps the generation,
+// after which it (and everything else signed before) is revoked.
+func verifyJWT(tokenStr string, key []byte, currentGen int64) bool {
 	t, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method")
 		}
 		return key, nil
 	})
-	return err == nil && t.Valid
+	if err != nil || !t.Valid {
+		return false
+	}
+	claims, ok := t.Claims.(jwt.MapClaims)
+	if !ok {
+		return false
+	}
+	var tokenGen int64 // 0 when the claim is absent (legacy / fresh-install token)
+	switch v := claims["gen"].(type) {
+	case string:
+		tokenGen, _ = strconv.ParseInt(v, 10, 64)
+	case float64: // some decoders yield numbers
+		tokenGen = int64(v)
+	case int64:
+		tokenGen = v
+	case int:
+		tokenGen = int64(v)
+	}
+	return tokenGen == currentGen
 }
 
 // extractToken reads the JWT from Authorization: Bearer header,
@@ -129,7 +177,7 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			writeErr(w, 401, "未授权")
 			return
 		}
-		if !verifyJWT(tok, s.jwtKey) {
+		if !verifyJWT(tok, s.jwtKey, s.tokenGen.Load()) {
 			writeErr(w, 401, "token 无效或已过期")
 			return
 		}
@@ -197,7 +245,7 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码已设置")
 		return
 	}
-	tok, err := signJWT(s.jwtKey)
+	tok, err := signJWTGen(s.jwtKey, s.tokenGen.Load())
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
 		return
@@ -207,13 +255,16 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/auth/change-password — changes the admin password. Requires a valid
 // token (this route is under /api/auth/* which requireAuth exempts, so the token
-// is validated here) AND the current password.
+// is validated here) AND the current password. Changing the password also bumps
+// the token generation, which revokes every token signed under the previous
+// generation (other tabs / devices holding a stale token are logged out); the
+// response carries a fresh token for the caller's own session so it stays logged in.
 func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
 		return
 	}
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	if !verifyJWT(extractToken(r), s.jwtKey, s.tokenGen.Load()) {
 		writeErr(w, 401, "未授权")
 		return
 	}
@@ -255,7 +306,26 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "保存失败: "+err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true})
+	// Bump the token generation so every token signed under the previous
+	// generation is revoked (other tabs / devices are logged out). Persist FIRST
+	// so a restart keeps the bump; on a persist failure roll the in-memory value
+	// back so memory and the database agree (stale tokens stay valid, but the
+	// password change still held — the rarer of the two bad outcomes).
+	newGen := s.tokenGen.Add(1)
+	if err := pg.SetSetting(authTokenGenKey, strconv.FormatInt(newGen, 10)); err != nil {
+		s.tokenGen.Add(-1)
+		log.Printf("[auth] 令牌世代持久化失败，旧 token 暂不失效: %v", err)
+		writeJSON(w, 200, map[string]any{"ok": true})
+		return
+	}
+	// Hand the caller a token stamped with the new generation so its own session
+	// stays logged in without re-login.
+	tok, err := signJWTGen(s.jwtKey, newGen)
+	if err != nil {
+		writeErr(w, 500, "token 生成失败")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "token": tok})
 }
 
 // POST /api/auth/login — validates username/password and returns a JWT.
@@ -295,7 +365,7 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	loginNoteSuccess(r, req.Username)
-	tok, err := signJWT(s.jwtKey)
+	tok, err := signJWTGen(s.jwtKey, s.tokenGen.Load())
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
 		return

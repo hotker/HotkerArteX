@@ -2,7 +2,7 @@
 
 import * as React from "react";
 
-import { CpuIcon, FlaskConicalIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon } from "lucide-react";
+import { CpuIcon, FlaskConicalIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon, WalletIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -38,6 +38,9 @@ export default function SystemSettingsPage() {
   const [pyInterp, setPyInterp] = React.useState("");
   const [workers, setWorkers] = React.useState("3");
   const [savingWorkers, setSavingWorkers] = React.useState(false);
+  // 成本熔断：单任务 LLM token 预算。"" = 不限（后端存 0）。
+  const [costBudget, setCostBudget] = React.useState("");
+  const [savingCostBudget, setSavingCostBudget] = React.useState(false);
   // 操作约束注入范围(默认都开)。
   const [injectPlanner, setInjectPlanner] = React.useState(true);
   const [injectWorker, setInjectWorker] = React.useState(true);
@@ -57,6 +60,8 @@ export default function SystemSettingsPage() {
     setGlobalProxyInput(s.global_proxy ?? "");
     setPyInterp(s.python_interpreter ?? "");
     setWorkers(String(s.workers ?? 3));
+    // 0/缺省回显为空 = 不限。
+    setCostBudget(s.task_llm_budget_tokens ? String(s.task_llm_budget_tokens) : "");
     setInjectPlanner(s.constraints_inject_planner !== false);
     setInjectWorker(s.constraints_inject_worker !== false);
     setNoaCompaction(!!s.noa_compaction);
@@ -77,6 +82,24 @@ export default function SystemSettingsPage() {
       })
       .catch((e) => toast.error("保存失败：" + (e as Error).message))
       .finally(() => setSavingWorkers(false));
+  };
+
+  const saveCostBudget = () => {
+    const raw = costBudget.trim();
+    const n = raw === "" ? 0 : Number(raw);
+    if (!Number.isInteger(n) || n < 0) {
+      toast.error("预算需为 0（不限）或正整数 token 数");
+      return;
+    }
+    setSavingCostBudget(true);
+    api
+      .setSettings({ task_llm_budget_tokens: n })
+      .then((s) => {
+        apply(s);
+        toast.success(n > 0 ? "已保存单任务 token 预算（对之后的判定即时生效）" : "已取消单任务 token 预算限制");
+      })
+      .catch((e) => toast.error("保存失败：" + (e as Error).message))
+      .finally(() => setSavingCostBudget(false));
   };
 
   const savePython = () => {
@@ -671,6 +694,38 @@ export default function SystemSettingsPage() {
                 onChange={(e) => setWorkers(e.target.value)}
               />
               <Button onClick={saveWorkers} disabled={!loaded || savingWorkers}>
+                保存
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <WalletIcon className="size-4" />
+              单任务 LLM token 预算（成本熔断）
+            </CardTitle>
+            <CardDescription>
+              给单个任务的 LLM token 消耗设上限（<b>生命周期累计</b>，含缓存命中）。任务累计达到该值即被
+              有序收尾（终态标记为超时），需要调高预算后复活才能继续；留空或 0 = 不限。修改后
+              <b>对之后的判定即时生效</b>，无需重启。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3">
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={0}
+                step={1000}
+                className="w-40 font-mono text-sm"
+                placeholder="0（不限）"
+                value={costBudget}
+                disabled={!loaded || savingCostBudget}
+                onChange={(e) => setCostBudget(e.target.value)}
+              />
+              <span className="text-xs text-muted-foreground">tokens</span>
+              <Button onClick={saveCostBudget} disabled={!loaded || savingCostBudget}>
                 保存
               </Button>
             </div>

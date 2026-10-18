@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
@@ -50,6 +51,11 @@ type Server struct {
 
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
+	// tokenGen is the current JWT generation, mirrored in memory from the
+	// auth.token_gen setting (loaded at startup). Each token embeds the gen it was
+	// signed under; bumping it on password change revokes every older token. 0 is
+	// the fresh-install generation, and no-generation (legacy) tokens are read as 0.
+	tokenGen atomic.Int64
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -181,6 +187,15 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// Wire DB-stored prompt templates into the agents (新版方案 §3.3 / §5a). With no
 	// override row, agents keep their built-in defaults — behavior is unchanged.
 	if m.pg != nil {
+		// Restore the JWT token generation (set at startup, BEFORE the HTTP server
+		// listens, so no request can validate against a stale in-memory value). A
+		// missing/blank value means the password has never been changed since this
+		// feature landed — generation stays 0 and all existing tokens remain valid.
+		if v, ok, _ := m.pg.GetSetting(authTokenGenKey); ok && v != "" {
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+				s.tokenGen.Store(n)
+			}
+		}
 		agent.SetPromptOverride(func(key string) (string, bool) {
 			a, err := m.pg.GetAgentByKey(key)
 			if err != nil || a == nil {
@@ -241,6 +256,17 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// seeded browser MCP on first run). Async so it never blocks startup.
 		go s.discoverEmptyMCPsOnStartup()
 		logSink.SetDB(ctx, m.pg) // restore last 100 log rows and enable async persistence
+		// Settle approval rows left 'pending' by the previous process: their
+		// blocking worker (an in-process channel) is gone, so nobody can answer
+		// them and they would pin the approvals page forever. Runs BEFORE the
+		// HTTP server listens and task runtimes are restored, so nothing in this
+		// process has created a row yet — cutoff = now separates last-process
+		// rows (settled) from any future ones (left to their live waiter).
+		if ids, err := m.pg.StalePendingIntercepts(time.Now()); err != nil {
+			log.Printf("[intercept] 清理残留审批失败: %v", err)
+		} else if len(ids) > 0 {
+			log.Printf("[intercept] 重启后清理 %d 条无等待者的残留审批(标记为已拒绝)", len(ids))
+		}
 	}
 	// precedence: persisted DB config > env.
 	if cfg, ok := s.loadLLMConfig(); ok {
@@ -283,8 +309,10 @@ func (s *Server) restoreTaskRuntimes() {
 		}
 		// 任务级超时:为每个未终态、带 timeout 的任务起 deadline 协调器,独立于 planner/worker
 		// loop——非活跃任务重启后也能在到点后被收尾(deadline 已过则立即走收尾时序)。
+		// 成本预算熔断同批起:重启后累计 token 已落库,已超预算的任务会被立即收尾。
 		if !isTerminalStatus(lifecycle.Status) {
 			s.engine.startDeadlineCoordinator(s.ctx, t)
+			s.engine.startCostCoordinator(s.ctx, t)
 		}
 	}
 	// Restore every task that had already been admitted before shutdown. Starting
@@ -804,6 +832,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/audit", s.getAudit)
 	mux.HandleFunc("POST /api/gc", s.gc)
 	mux.HandleFunc("GET /api/traffic", s.getTraffic)
+	mux.HandleFunc("GET /api/traffic/ca-cert", s.getTrafficCACert)
 	mux.HandleFunc("GET /api/traffic/hosts", s.getTrafficHosts)
 	mux.HandleFunc("DELETE /api/traffic", s.deleteTraffic)
 	mux.HandleFunc("DELETE /api/traffic/hosts", s.deleteTrafficHosts)
@@ -955,7 +984,9 @@ func (s *Server) Handler() http.Handler {
 	// /api/* goes through CORS + JWT; everything else is served by the embedded
 	// frontend (public — auth is enforced client-side and on the API). With the
 	// no-embed build the webui handler just 404s (run `next dev` separately).
-	api := cors(s.requireAuth(mux))
+	// audit sits INSIDE requireAuth so it only logs authenticated mutating calls
+	// (who did what, with the outcome) — see audit.go.
+	api := cors(s.requireAuth(s.audit(mux)))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.Handle("/", s.webuiHandler())
@@ -2944,7 +2975,9 @@ func (s *Server) getLogsHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 // streamLogs is the live SSE tail of the backend log: replays history after
-// ?since=<seq>, then pushes each new line.
+// ?since=<seq>, then pushes each new line. Every event carries an id: line so
+// the browser's auto-reconnect resumes via Last-Event-ID instead of re-replaying
+// the whole ring (same recovery contract as streamActivity).
 func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -2952,6 +2985,17 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	since := int64(atoiDefault(r.URL.Query().Get("since"), 0))
+	if le := r.Header.Get("Last-Event-ID"); le != "" {
+		if n, err := strconv.ParseInt(le, 10, 64); err == nil {
+			// Log seq is process-local: after a server restart the counter starts
+			// over, so an old Last-Event-ID is not comparable with the current one.
+			// Honor the header only within the same process lifetime; otherwise fall
+			// back to a full ring replay (the client dedupes by seq / db_id anyway).
+			if n <= logSink.currentSeq() {
+				since = n
+			}
+		}
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -2961,7 +3005,7 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 	defer unsub()
 	send := func(l LogLine) {
 		b, _ := json.Marshal(l)
-		fmt.Fprintf(w, "data: %s\n\n", b)
+		fmt.Fprintf(w, "id: %d\ndata: %s\n\n", l.Seq, b)
 		flusher.Flush()
 	}
 	lines, cursor := logSink.recent(since, 1000)
@@ -3151,6 +3195,29 @@ func (s *Server) getTraffic(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// getTrafficCACert serves the MITM CA *public certificate* for download. This is
+// the only sanctioned way to obtain the cert: the workspace manager hides the
+// whole traffic/ tree (including the CA private key, which must never leave the
+// box), so trusting the proxy on a client means fetching it from here instead.
+func (s *Server) getTrafficCACert(w http.ResponseWriter, r *http.Request) {
+	tr := s.m.Traffic()
+	if tr == nil {
+		writeErr(w, 404, "流量录制未启用")
+		return
+	}
+	certPath := tr.CACertPath()
+	data, err := os.ReadFile(certPath)
+	if err != nil {
+		// The CA is created lazily on the first intercepted TLS handshake; until
+		// then there is no cert to serve.
+		writeErr(w, 404, "CA 证书尚未生成（还没有被拦截过的 HTTPS 流量）")
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-pem-file")
+	w.Header().Set("Content-Disposition", `attachment; filename="artex-ca.pem"`)
+	_, _ = w.Write(data)
+}
+
 // getTrafficHosts returns distinct recorded hosts with counts, for the page's
 // target picker (pick a host → filter the list, then delete it).
 func (s *Server) getTrafficHosts(w http.ResponseWriter, r *http.Request) {
@@ -3338,7 +3405,26 @@ func (s *Server) settingsPayload() map[string]any {
 		"notify_enabled":             s.m.pg.GetBool(settingNotifyEnabled, true),
 		"notify_public_base_url":     notifyPublicBaseURL(s.m.pg),
 		"notify_digest_interval_min": notifyDigestIntervalMin(s.m.pg),
+		// 单任务 LLM token 预算(0 = 不限):成本熔断的上限,对之后启动/复活的判定生效。
+		"task_llm_budget_tokens": taskLLMBudgetFromSetting(s.m.pg),
 	}
+}
+
+// taskLLMBudgetFromSetting 回显单任务 LLM token 预算(0 = 不限)。回显 0 而不是
+// 缺省值:UI 据此区分「未设置(不限)」与「设了某个值」。
+func taskLLMBudgetFromSetting(pg *db.DB) int {
+	if pg == nil {
+		return 0
+	}
+	v, ok, _ := pg.GetSetting(settingTaskLLMBudgetTokens)
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 // notifyPublicBaseURL 读推送回链用的外部地址。
@@ -3410,6 +3496,9 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		NotifyEnabled    *bool   `json:"notify_enabled"`
 		NotifyBaseURL    *string `json:"notify_public_base_url"`
 		NotifyDigestMins *int    `json:"notify_digest_interval_min"`
+		// 单任务 LLM token 预算(成本熔断上限)。null=不改;0=不限;>0=超此值收尾该任务。
+		// 成本协调器每轮读一次,改完对之后的判定即时生效,无需重启。
+		TaskLLMBudget *int64 `json:"task_llm_budget_tokens"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -3461,6 +3550,18 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.m.pg.SetSetting(settingNotifyDigestMinutes, strconv.Itoa(*req.NotifyDigestMins)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.TaskLLMBudget != nil {
+		// 0 = 不限(成本熔断停用);>0 = 单任务累计 token 上限。负值拒绝。
+		// 成本协调器每轮读一次,写库后对之后的判定即时生效,无需重启。
+		if *req.TaskLLMBudget < 0 {
+			writeErr(w, 400, "单任务 LLM token 预算不能为负")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingTaskLLMBudgetTokens, strconv.FormatInt(*req.TaskLLMBudget, 10)); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -3865,6 +3966,7 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	findings, _ := t.Store.ListByKind(db.KindFinding, 1000) // 纯漏洞（事实是独立的 KindFact，不进报告）
+	totalFindings, _ := t.Store.CountByKind(db.KindFinding)
 	counts := map[string]int{}
 	for _, ty := range []string{"root_domain", "ip", "subdomain", "app", "service", "endpoint"} {
 		ns, _ := s.m.Assets().QueryByType(ty, 100000, 0)
@@ -3874,7 +3976,7 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 	}
 	md := report.Markdown(report.Input{
 		Title: t.Description, Goal: t.Goal, GeneratedAt: time.Now(),
-		AssetCounts: counts, Findings: findings,
+		AssetCounts: counts, Findings: findings, TotalFindings: totalFindings,
 	})
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 	w.WriteHeader(200)

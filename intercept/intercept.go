@@ -146,6 +146,43 @@ var defaultEnabledTools = []string{
 	"Write", "Edit", "MultiEdit",
 }
 
+// forcedTools are platform self-service tools that MUST enter the intercept rule
+// system no matter what the enabled-tools setting says. They let the agent reshape
+// its own capabilities (register an MCP server, add a custom command/script tool,
+// delete global assets) — a channel that, if ungated, the model could open by
+// itself to sidestep review (data exfil, destructive calls). The user can still
+// add a higher-priority allow rule for a specific one; they cannot remove it from
+// the gate by emptying the tool list.
+var forcedTools = map[string]bool{
+	"create_skill":        true,
+	"update_skill_file":   true,
+	"create_custom_tool":  true,
+	"update_custom_tool":  true,
+	"create_mcp":          true,
+	"update_mcp":          true,
+	"delete_assets_by_host": true,
+}
+
+// forcedToolPrefixes are tool-name prefixes that always enter the rule system.
+// MCP tools are named mcp__<server>__<tool> and arrive through servers the agent
+// (or a user) may register at runtime, so a static whitelist can never enumerate
+// them — the prefix gate is the only way to keep every one of them under review.
+var forcedToolPrefixes = []string{"mcp__"}
+
+// IsForcedTool reports whether a tool is hard-gated into the rule system
+// independent of the user's enabled-tools list (see forcedTools).
+func IsForcedTool(name string) bool {
+	if forcedTools[name] {
+		return true
+	}
+	for _, p := range forcedToolPrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // New creates an Interceptor backed by d. The rule cache is lazy-loaded on
 // first use.
 func New(d *db.DB) *Interceptor {
@@ -229,8 +266,12 @@ func (i *Interceptor) rules() ([]compiledRule, error) {
 
 // IsToolEnabled returns true if the named tool is in the intercept-enabled set
 // (i.e. it should enter the rule-matching path). Uses the same double-check lock
-// pattern as rules().
+// pattern as rules(). Forced tools (see IsForcedTool) always return true regardless
+// of the enabled list, so they can never be excluded from the gate.
 func (i *Interceptor) IsToolEnabled(name string) bool {
+	if IsForcedTool(name) {
+		return true
+	}
 	i.mu.RLock()
 	if i.enabledTools != nil {
 		v := i.enabledTools[name]
@@ -313,7 +354,11 @@ const (
 // Judge default values.
 const (
 	defaultJudgeTimeoutSecs      = 15
-	defaultJudgeFailAction       = "allow"
+	// Fail-open is dangerous for a pentest tool: when the judge model is down,
+	// every unreviewed high-risk call would sail through unattended. Defaulting
+	// to "ask" routes those calls to a human approval (with its own timeout
+	// policy) instead, so the approval gate never silently vanishes.
+	defaultJudgeFailAction       = "ask"
 	defaultJudgeAskTimeoutSecs   = 300
 	defaultJudgeAskTimeoutAction = "deny"
 )

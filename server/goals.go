@@ -247,7 +247,9 @@ func (s *Server) startAdmittedTask(t *Task, mode string) {
 	// Run returns early for an already-started task. Explicitly ensure a timeout
 	// coordinator exists after resume; resetTimeoutRevival cleared the completed
 	// coordinator's marker and the next real call will stamp a fresh deadline.
+	// 成本协调器同批重建(复活路径同理清过 costCoordStarted 标记)。
 	s.engine.startDeadlineCoordinator(s.ctx, t)
+	s.engine.startCostCoordinator(s.ctx, t)
 }
 
 func (s *Server) reconcileConcurrency() {

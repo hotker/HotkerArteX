@@ -6,10 +6,25 @@ const isExport = process.env.NEXT_EXPORT === "1";
 // Vercel demo：整站走 mock，无后端，无需 /api 反代。
 const isMock = process.env.NEXT_PUBLIC_MOCK === "1";
 
+// 生产/静态导出构建（非 mock）把重型的 mock handler 换成一个会抛错的桩，
+// 让 6.7k 行的 mock/handler.ts + mock/data.ts 整体退出模块图，不再进 web/out。
+// 动态 import 不够：output:"export" 下 Turbopack 会无条件把动态导入的 chunk
+// 也导出到 out/，死分支照样把演示数据打进 bundle。模块级替换才是构建期剔除。
+// mock demo（Vercel）不设 NEXT_EXPORT、且 isMock=true，走真实 handler，不受影响。
+const turbopackOpts = {
+  root: fileURLToPath(new URL(".", import.meta.url)),
+};
+if (!isMock) {
+  turbopackOpts.resolveAlias = {
+    // 值须相对项目根（web/），不能用绝对路径——Turbopack 会把绝对值误当
+    // server-relative import，拼成 "./<绝对路径>" 而解析失败。
+    "@/lib/mock/handler": "./src/lib/mock/handler.stub.ts",
+  };
+}
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  // 避免父目录的 lockfile 影响根目录推断及资源路径生成。
-  turbopack: { root: fileURLToPath(new URL(".", import.meta.url)) },
+  turbopack: turbopackOpts,
   reactCompiler: true,
   // 允许从局域网 IP 访问 dev 资源（HMR），按需增删。
   // dev 阶段放开任意 IPv4 来源访问 /_next/* 与 HMR（局域网 IP 变动也不受影响）。

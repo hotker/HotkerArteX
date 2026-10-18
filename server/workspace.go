@@ -25,6 +25,29 @@ const (
 	maxWorkspaceUpload = 512 << 20 // 512 MiB per upload request
 )
 
+// sensitiveWorkspaceTrees are system files that live under the shared work dir
+// but must never be exposed through the workspace manager, because they are
+// not agent artifacts: the traffic tree holds the MITM CA *private key*
+// (mitmproxy-ca.pem — holding it forges TLS for any domain) plus a plaintext
+// capture index, the evidence tree holds raw target data, and jwt.key is the
+// session signing key. They get dedicated APIs instead (e.g. /api/traffic/ca-cert).
+var sensitiveWorkspaceTrees = []string{"traffic", "evidence", "jwt.key", "jwt.key.migrated"}
+
+// isSensitiveWorkspacePath reports whether a workspace-relative path (or the
+// top-level entry under a requested directory) falls inside a protected tree.
+func isSensitiveWorkspacePath(rel string) bool {
+	top := strings.TrimPrefix(strings.TrimSpace(rel), "/")
+	if i := strings.IndexByte(top, '/'); i >= 0 {
+		top = top[:i]
+	}
+	for _, s := range sensitiveWorkspaceTrees {
+		if top == s {
+			return true
+		}
+	}
+	return false
+}
+
 // wsResolve maps a user-supplied relative path to an absolute path INSIDE the work
 // dir. It returns ok=false if the path would escape the root. filepath.Clean on a
 // rooted copy collapses any ".." so nothing can climb above the root.
@@ -37,6 +60,17 @@ func (s *Server) wsResolve(rel string) (string, bool) {
 		return "", false
 	}
 	return abs, true
+}
+
+// wsGuard refuses operations on protected system paths (see
+// sensitiveWorkspaceTrees): the MITM CA private key, the traffic index, raw
+// evidence and jwt.key must not be reachable from the workspace manager.
+func (s *Server) wsGuard(w http.ResponseWriter, abs string) bool {
+	if isSensitiveWorkspacePath(s.wsRel(abs)) {
+		writeErr(w, 403, "该路径为系统保留文件，无法通过工作区访问")
+		return false
+	}
+	return true
 }
 
 // wsRel renders an absolute path back as a workspace-relative path (forward slashes).
@@ -64,6 +98,9 @@ func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
+	if !s.wsGuard(w, abs) {
+		return
+	}
 	fi, err := os.Stat(abs)
 	if err != nil {
 		writeErr(w, 404, "路径不存在")
@@ -80,6 +117,11 @@ func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]wsEntry, 0, len(ents))
 	for _, e := range ents {
+		// Hide protected system trees (traffic/ CA key, evidence/, jwt.key) from
+		// the browser; per-handler gates refuse anything deeper inside them.
+		if isSensitiveWorkspacePath(s.wsRel(filepath.Join(abs, e.Name()))) {
+			continue
+		}
 		info, err := e.Info()
 		if err != nil {
 			continue
@@ -116,6 +158,9 @@ func (s *Server) wsRead(w http.ResponseWriter, r *http.Request) {
 	abs, ok := s.wsResolve(r.URL.Query().Get("path"))
 	if !ok {
 		writeErr(w, 400, "非法路径")
+		return
+	}
+	if !s.wsGuard(w, abs) {
 		return
 	}
 	fi, err := os.Stat(abs)
@@ -158,6 +203,9 @@ func (s *Server) wsWrite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
+	if !s.wsGuard(w, abs) {
+		return
+	}
 	if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
 		writeErr(w, 400, "目标是目录")
 		return
@@ -188,6 +236,9 @@ func (s *Server) wsMkdir(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
+	if !s.wsGuard(w, abs) {
+		return
+	}
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -206,6 +257,9 @@ func (s *Server) wsDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	if abs == filepath.Clean(s.m.dir) {
 		writeErr(w, 400, "不能删除工作区根目录")
+		return
+	}
+	if !s.wsGuard(w, abs) {
 		return
 	}
 	if _, err := os.Stat(abs); err != nil {
@@ -227,6 +281,9 @@ func (s *Server) wsDownload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
+	if !s.wsGuard(w, abs) {
+		return
+	}
 	fi, err := os.Stat(abs)
 	if err != nil || fi.IsDir() {
 		writeErr(w, 404, "文件不存在")
@@ -243,6 +300,9 @@ func (s *Server) wsUpload(w http.ResponseWriter, r *http.Request) {
 	dirAbs, ok := s.wsResolve(r.URL.Query().Get("path"))
 	if !ok {
 		writeErr(w, 400, "非法路径")
+		return
+	}
+	if !s.wsGuard(w, dirAbs) {
 		return
 	}
 	if fi, err := os.Stat(dirAbs); err != nil || !fi.IsDir() {

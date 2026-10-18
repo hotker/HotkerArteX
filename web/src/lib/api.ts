@@ -5,7 +5,10 @@
 
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
-import { mockHandle } from "@/lib/mock/handler";
+// 注意：不要静态 import "@/lib/mock/handler"（连带 ~6.7k 行的 mock/data.ts）。
+// handler 仅在 MOCK 构建（Vercel demo）里用到，且在 http() 调用点动态 import，
+// 这样生产（MOCK=false）构建会把整个 mock 模块 dead-code-eliminate 掉，
+// 不把带假漏洞利用命令的演示数据打进生产 bundle。
 import type {
   ActiveFindingRetest,
   Activity,
@@ -112,7 +115,12 @@ function getToken(): string | null {
 }
 
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
-  if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
+  if (MOCK) {
+    // 动态 import：仅在 MOCK 构建才实际执行，生产构建（MOCK=false 被内联折叠）
+    // 会把整条分支连同 handler 模块一并剔除，不进 bundle。
+    const { mockHandle } = await import("@/lib/mock/handler");
+    return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
+  }
   const token = getToken();
   const r = await fetch(`/api${path}`, {
     ...init,
@@ -163,28 +171,8 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
 //
 // Override either default with NEXT_PUBLIC_SSE_BASE (set it to "" to force same-origin).
 // Token is appended as ?token= because SSE can't carry cookies cross-origin.
-// mockReport returns a canned Markdown report for the demo.
-function mockReport(_task?: string): string {
-  return `# ARTEX 渗透测试报告 — Acme Corp
-
-## 概览
-- 范围：acme.com（含 www / admin / api / shop / vpn 子域）
-- 已确认发现：6 项（高危 3 · 中危 3 · 低危 2）
-- 引擎模式：exploring
-
-## 关键发现
-1. **[高] 后台默认口令** admin.acme.com admin/admin123 → 可完全接管后台。
-2. **[高] SQL 注入** www.acme.com/search?q= → 可读取 acme_prod 库。
-3. **[高] IDOR** api.acme.com/v1/orders?id= → 可越权读取他人订单（含手机号/地址）。
-4. **[中] 反射型 XSS**、**暴露 .git 源码**、**登录无速率限制**。
-
-## 建议
-- 后台强制改密 + 启用 MFA、封禁默认口令。
-- search 接口参数化查询、输出编码。
-- API 增加对象级授权校验（IDOR）、更换强 JWT 密钥。
-
-> （demo）本报告由 mock 数据生成，仅用于界面演示。`;
-}
+// 演示用 Markdown 报告（mockReport）已迁入 lib/mock/handler.ts 并随之被
+// resolveAlias 在生产构建中剔除；report() 的 mock 分支通过动态 import 调用它。
 
 export function sseUrl(path: string): string {
   const base =
@@ -240,8 +228,9 @@ export const api = {
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),
   login: (username: string, password: string) => post<{ token: string }>("/auth/login", { username, password }),
   initPassword: (password: string) => post<{ token: string }>("/auth/init", { password }),
+  // 改密码同时提升令牌世代，吊销所有旧 token；响应带回一个新 token 供当前会话续用。
   changePassword: (oldPassword: string, newPassword: string) =>
-    post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
+    post<{ ok: boolean; token?: string }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
 
   // ---- tasks ----
   tasks: () =>
@@ -864,7 +853,13 @@ export const api = {
   },
   notifyRetryDelivery: (id: number) => post<{ ok: boolean }>(`/notify/deliveries/${id}/retry`),
   report: async (task?: string) => {
-    if (MOCK) return mockReport(task);
+    if (MOCK) {
+      // 动态 import：生产构建（MOCK=false 内联折叠）会把整条分支连同 handler
+      // 模块剔除；非 mock 构建里 handler 又被 resolveAlias 换成会抛错的桩，
+      // 因此 demo 报告内容不会进生产 bundle。
+      const { mockReport } = await import("@/lib/mock/handler");
+      return mockReport(task);
+    }
     const token = getToken();
     const r = await fetch(`/api/report${tq(task)}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},

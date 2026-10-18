@@ -107,6 +107,27 @@ ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC, model`, taskID)
 	return out, rows.Err()
 }
 
+// TokenTotalByTask returns the total tokens a task has consumed across the
+// always-on llm_usage ledger: input + output + cache_read + cache_write. This is
+// the "total tokens moved" figure the cost budget fuse caps on — counting cache
+// hits too, since a long context that re-reads a megabyte of cache is real spend
+// even when it bills less than fresh input. taskID is the task registry id (the
+// same value llmrec attaches via WithTaskID). Sargable on idx_llm_usage_task, so
+// the cost coordinator can poll it every ~30s per active task without a full scan.
+// A task with no metered calls returns 0.
+func (d *DB) TokenTotalByTask(taskID string) (int64, error) {
+	var total int64
+	err := d.QueryRow(`
+SELECT COALESCE(SUM(input_tokens) + SUM(output_tokens)
+                + SUM(cache_read)   + SUM(cache_write), 0)
+FROM llm_usage
+WHERE task_id = $1`, taskID).Scan(&total)
+	if err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
 // ProfileUsage aggregates the whole ledger's token spend for one LLM profile
 // (global, all tasks). Powers the dashboard's per-profile token card (new source).
 type ProfileUsage struct {

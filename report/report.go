@@ -19,6 +19,10 @@ type Input struct {
 	GeneratedAt time.Time
 	AssetCounts map[string]int
 	Findings    []*db.Node
+	// TotalFindings is the true count of findings for the task. When it exceeds
+	// len(Findings) the report was truncated and says so instead of quietly
+	// presenting a partial list as complete.
+	TotalFindings int
 }
 
 type findingView struct {
@@ -54,7 +58,13 @@ func Markdown(in Input) string {
 
 	// summary
 	fmt.Fprintf(&b, "## 摘要\n\n")
-	fmt.Fprintf(&b, "- 确认发现：**%d** 个\n", len(in.Findings))
+	if in.TotalFindings > len(in.Findings) {
+		// ListByKind is capped: say so loudly, never present a partial list as complete.
+		fmt.Fprintf(&b, "- 确认发现：**%d** 个（本报告仅含最新 **%d** 个，其余 %d 个未列出）\n",
+			in.TotalFindings, len(in.Findings), in.TotalFindings-len(in.Findings))
+	} else {
+		fmt.Fprintf(&b, "- 确认发现：**%d** 个\n", len(in.Findings))
+	}
 	fmt.Fprintf(&b, "- 资产：")
 	var types []string
 	for t := range in.AssetCounts {

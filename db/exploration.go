@@ -796,6 +796,15 @@ func (s *ExplorationStore) countByKindFiltered(kind, q string) (int, error) {
 	return n, err
 }
 
+// CountByKind counts this exploration's nodes of one kind (any state), for
+// callers that page/cap ListByKind and must say how much they didn't include.
+func (s *ExplorationStore) CountByKind(kind string) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM exploration_nodes
+WHERE exploration_id=$1 AND kind=$2`, s.expID, kind).Scan(&n)
+	return n, err
+}
+
 // CountFinishedIntents counts this exploration's intents in a terminal explored
 // state (done/blocked/exhausted) — graph_overview's done_intents_total, so the planner
 // knows recent_done_intents (capped at a recent window) is a truncated view and

@@ -279,6 +279,9 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.seedDefaultInterceptRulesV3(); err != nil {
 		return fmt.Errorf("seed intercept rules v3: %w", err)
 	}
+	if err := d.seedDefaultInterceptRulesV4(); err != nil {
+		return fmt.Errorf("seed intercept rules v4: %w", err)
+	}
 	if err := d.seedDefaultAssetInterceptRules(); err != nil {
 		return fmt.Errorf("seed asset intercept rules: %w", err)
 	}
@@ -614,4 +617,37 @@ WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
 		return fmt.Errorf("rule %q: %w", name, err)
 	}
 	return d.SetSetting("intercept_default_rules_v3", "done")
+}
+
+// seedDefaultInterceptRulesV4 requires human approval for the forced self-service
+// tools (see intercept.IsForcedTool). IsToolEnabled force-gates these tools into
+// the rule system, but without this rule a forced tool with no matching rule and
+// the judge disabled would be allowed by default — so the gate needs a default
+// ask. Deliberately action='ask' (not deny): the agent still needs these tools to
+// do its job, and a user who trusts one can add a higher-priority allow rule. The
+// mcp__ prefix keeps every present-and-future MCP tool under review, since MCP
+// servers (and their tools) can be registered at runtime.
+func (d *DB) seedDefaultInterceptRulesV4() error {
+	if v, _, _ := d.GetSetting("intercept_default_rules_v4"); v == "done" {
+		return nil
+	}
+	rules := []struct {
+		name    string
+		pattern string
+	}{
+		{"[内置] 平台自服务工具需审批",
+			`^(create_skill|update_skill_file|create_custom_tool|update_custom_tool|create_mcp|update_mcp|delete_assets_by_host)$`},
+		{"[内置] MCP 工具需审批", `^mcp__`},
+	}
+	for _, r := range rules {
+		if _, err := d.Exec(`
+INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
+SELECT $1, true, 10, 'tool_name', 'regex', $2, 'ask', $3, true, 300, 'deny'
+WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
+			r.name, r.pattern,
+			"该工具会改变 agent 自身能力（注册 MCP/自定义工具、修改技能、删除全局资产），需人工审批；信任后可添加更高优先级的允许规则放行"); err != nil {
+			return fmt.Errorf("rule %q: %w", r.name, err)
+		}
+	}
+	return d.SetSetting("intercept_default_rules_v4", "done")
 }

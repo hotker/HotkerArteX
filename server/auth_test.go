@@ -62,6 +62,49 @@ func TestAuthInitFailsClosedWhenDataSourceUnavailable(t *testing.T) {
 	}
 }
 
+// Token generation is the revocation mechanism: a token signed under gen N is
+// valid only while the current generation is N. Bumping the generation (on
+// password change) must revoke every previously-signed token, while a no-gen
+// (legacy / fresh-install) token stays valid until the first bump.
+func TestJWTGenerationRevocation(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+
+	// A legacy token (gen 0) is valid while the current generation is 0.
+	legacy, err := signJWT(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verifyJWT(legacy, key, 0) {
+		t.Fatal("legacy token should validate against gen 0")
+	}
+	// The first password change bumps to gen 1 → the legacy token is revoked.
+	if verifyJWT(legacy, key, 1) {
+		t.Fatal("legacy token must be revoked after the generation bump")
+	}
+
+	// A gen-1 token is valid at gen 1, revoked at gen 2.
+	gen1, err := signJWTGen(key, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verifyJWT(gen1, key, 1) {
+		t.Fatal("gen-1 token should validate against gen 1")
+	}
+	if verifyJWT(gen1, key, 2) {
+		t.Fatal("gen-1 token must be revoked after another bump")
+	}
+
+	// A gen-1 token must also fail against gen 0 (no downgrade).
+	if verifyJWT(gen1, key, 0) {
+		t.Fatal("gen-1 token must not validate against gen 0")
+	}
+
+	// Wrong key still fails regardless of generation.
+	if verifyJWT(gen1, []byte("0123456789abcdef0123456789abcdeg"), 1) {
+		t.Fatal("token signed with a different key must not validate")
+	}
+}
+
 func TestValidatePassword(t *testing.T) {
 	for _, tc := range []struct {
 		name, pw string

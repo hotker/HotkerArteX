@@ -71,6 +71,38 @@ func (d *DB) GetInterceptDetail(id int64) (*InterceptDetail, error) {
 	return &out, nil
 }
 
+// StalePendingIntercepts settles pending rows created before `cutoff` — i.e. by
+// a previous process, whose blocking worker (an in-process channel) is gone, so
+// those rows can never be answered or timed out and would sit in the approvals
+// list forever. Rows created at/after cutoff belong to this process and have a
+// live waiter, so they are left alone. Settled rows are recorded as denied with
+// an explicit "服务重启" reason (never as "allowed": an approval that no one
+// gave must not be replayed as consent). Returns the settled row IDs.
+func (d *DB) StalePendingIntercepts(cutoff time.Time) ([]int64, error) {
+	var ids []int64
+	rows, err := d.Query(`SELECT id FROM intercept_pending WHERE status='pending' AND created_at < $1`, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		if _, err := d.ResolveIntercept(id, "denied", "deny", "服务重启，等待的审批已失效（该调用未执行）"); err != nil {
+			return ids, err
+		}
+	}
+	return ids, nil
+}
+
 // ResolveIntercept atomically settles a pending request. A timeout cannot
 // overwrite a human decision and repeat decisions cannot rewrite history.
 func (d *DB) ResolveIntercept(id int64, status, action, reason string) (bool, error) {

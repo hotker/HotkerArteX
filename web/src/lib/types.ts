@@ -947,6 +947,9 @@ export interface Settings {
   notify_enabled?: boolean; // 推送总开关，默认开；用于维护期一键止血
   notify_public_base_url?: string; // 漏洞详情回链的外部访问地址；空=消息不带回链
   notify_digest_interval_min?: number; // 汇总模式周期（分钟），默认 30
+  // 成本熔断：单任务 LLM token 预算（生命周期累计上限）。0/缺省 = 不限。
+  // 任务累计消耗达到该值即被收尾（终态 timeout），需调高预算后复活才能继续。
+  task_llm_budget_tokens?: number;
 }
 
 // ---- 漏洞 IM 推送 ----

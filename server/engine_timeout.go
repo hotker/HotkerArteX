@@ -89,6 +89,10 @@ func (e *Engine) resetTimeoutRevival(taskID string) {
 	e.deadline.Delete(taskID)
 	e.stamped.Delete(taskID)
 	e.coordStarted.Delete(taskID)
+	// 成本协调器同批清:成本熔断落的是 timeout 终态,复活(timeout→running)走到这里,
+	// 清掉标记后 startAdmittedTask 里的 startCostCoordinator 才能按(可能已调高的)
+	// 预算重新起协调器。
+	e.costCoordStarted.Delete(taskID)
 }
 
 // stampFirstRun records first_run_at + deadline_at on the FIRST real run (LLM ready)
