@@ -36,7 +36,11 @@ func TestCaptureApprovalLifecycle(t *testing.T) {
 	if err := ic.SetEnabledTools([]string{"ApprovalAuditProbe"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := ic.SetJudgeConfig(intercept.JudgeConfig{Enabled: true, AskTimeoutSeconds: 1, AskTimeoutAction: "allow"}); err != nil {
+	// FailAction 显式钉成 allow:本表验证的是 capture→审批→执行→审计行的流转,
+	// 不依赖「裁判失败默认动作」的全局默认(现为 fail-closed 的 ask,见
+	// intercept.defaultJudgeFailAction)。若留空走默认,ask 会因无人应答而超时,
+	// model_fallback 子用例的期望(allowed/allow)就会漂移。
+	if err := ic.SetJudgeConfig(intercept.JudgeConfig{Enabled: true, FailAction: "allow", AskTimeoutSeconds: 1, AskTimeoutAction: "allow"}); err != nil {
 		t.Fatal(err)
 	}
 
