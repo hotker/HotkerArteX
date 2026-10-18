@@ -1216,13 +1216,27 @@ func (s *ExplorationStore) AppendActivity(a Activity) (int64, error) {
 	if len(metadata) == 0 {
 		metadata = json.RawMessage(`{}`)
 	}
-	var id int64
-	err := s.db.QueryRow(`
+	// 死锁（40P01）重试。这条 activity INSERT 是单行写入，本身不会与别的事务成环，
+	// 但当另一个事务正在跑全量 schema DDL（如多实例部署时第二个实例启动的
+	// db.Open，或 CI 里某包启动期 DDL 与本包测试 DML 撞在一起）时，DDL 的
+	// AccessExclusiveLock 与本 INSERT 的 RowShareLock 交叉等待，PG 会把本 INSERT
+	// 选作「牺牲品」回滚（40P01）。被牺牲的单语句由 PG 保证可安全重放，所以按
+	// 固定退避重跑即可。复用 schema 迁移那套 isPostgresDeadlock /
+	// schemaDeadlockRetryDelays，不另造轮子；正常路径无额外开销。
+	args := []any{s.expID, a.NodeID, utf8Clean(a.Worker), utf8Clean(a.Kind), utf8Clean(a.Tool), utf8Clean(a.ToolUseID), a.IsError, utf8Clean(a.Summary), utf8Clean(a.Detail),
+		metadata, a.InputTokens, a.OutputTokens, a.CacheReadTokens, a.CacheWriteTokens, a.MainSeg}
+	const stmt = `
 INSERT INTO activity(exploration_id, node_id, worker, kind, tool, tool_use_id, is_error, summary, detail, metadata, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, main_seg)
 VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),$7,NULLIF($8,''),NULLIF($9,''),$10,$11,$12,$13,$14,$15)
-RETURNING id`, s.expID, a.NodeID, utf8Clean(a.Worker), utf8Clean(a.Kind), utf8Clean(a.Tool), utf8Clean(a.ToolUseID), a.IsError, utf8Clean(a.Summary), utf8Clean(a.Detail),
-		metadata, a.InputTokens, a.OutputTokens, a.CacheReadTokens, a.CacheWriteTokens, a.MainSeg).Scan(&id)
-	return id, err
+RETURNING id`
+	var id int64
+	for attempt := 0; ; attempt++ {
+		err := s.db.QueryRow(stmt, args...).Scan(&id)
+		if err == nil || !isPostgresDeadlock(err) || attempt >= len(schemaDeadlockRetryDelays) {
+			return id, err
+		}
+		time.Sleep(schemaDeadlockRetryDelays[attempt])
+	}
 }
 
 // ExplorationDiag probes, at the moment of an activity FK violation (23503), why the
