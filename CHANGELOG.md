@@ -4,7 +4,18 @@
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-10-22
+
 ### 安全
+
+#### 新增的功能
+
+- **安全响应头**：所有响应补 `Content-Security-Policy`（`default-src 'self'`、`object-src 'none'`、`frame-ancestors 'none'`，只放开静态导出必需的 `script/style 'unsafe-inline'`）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 与 `Permissions-Policy`。此前管理台可被任意站点 iframe 套住做点击劫持（审批/决策按钮），下载响应里的反射字符串也可能被嗅探成 HTML。跨源部署 SSE 时用 `ARTEX_CSP_CONNECT_EXTRA` 追加 `connect-src`。
+- **agent 不得直读敏感数据目录**：新增 `guard.SetProtectedPaths`，启动时装入抓包目录（含 MITM CA **私钥**与明文索引）、证据 blob 目录与 JWT 签名密钥，工具调用时按绝对路径、相对路径、`..` 逃逸、符号链接与 basename 多重匹配拒绝。工作区 API 层原本已有同样的门（`sensitiveWorkspaceTrees`），但 agent 的 CWD 就在数据目录里，`cat ../../traffic/_ca/mitmproxy-ca.pem` 完全绕过 API——拿到该私钥即可伪造任意已拦截域名的 TLS，拿到 `jwt.key` 即可伪造管理员会话。
+- **MCP 传输补拨号守卫与同源校验**：MCP 服务器由 UI 配置且每个请求都带配置的 Authorization 头，等于一条可被指定目标的外连通道。现拨号时拒绝链路本地/未指定/组播地址（含 `169.254.169.254`，回环与 RFC1918 仍放行），旧版 SSE 服务端在 `data:` 行里声明的 POST 端点必须与所选服务器同源，否则后续每个携带凭据的请求都会发往别的主机。
+- **token 只允许出现在 SSE 路由的查询串**：EventSource 无法设置请求头，所以日志流、更新流、活动流与旁问事件流仍接受 `?token=`；其余路由只认 `Authorization: Bearer`。此前任意接口都接受查询串 token，它会进入代理日志、浏览器历史与 Referer，且有效期长达 7 天。
+- **traffic 工具按任务隔离**：抓包索引是进程级的，此前任何绑定 traffic 工具的 agent 都能读到**所有任务**的抓包（含别的项目泄露的凭据与 token）。现每个 run 携带 `capture.Scope`，`traffic_search` / `traffic_get` / `traffic_blob` 三处设卡。范围 = 任务声明的测试范围（root_domain/subdomain 按后缀、ip/cidr 按网段、company 展开）∪ 资产主机；`HostsForTask` 改为复用 `scopeTargetCTE`，把「在范围内但由别的任务先发现」的资产也纳入。空范围拒绝一切读取（而非放行），读范围失败时失败关闭；非任务 run（chat/Auto）保持不限制。blob 按引用它的 exchange 判定，孤儿 blob 拒绝。
+- **登录防爆破**：同一「来源 IP + 用户名」在 15 分钟窗口内连续失败 5 次后锁定 15 分钟（慢速爆破也会被前几次失败拖进锁定窗口），登录成功即清零；锁定与每次失败都会写后端日志（「日志」页可见），此前登录失败无任何记录。另加一道全局兜底：全进程 5 分钟窗口内失败达 20 次即整体冷却，用来拦住轮换来源 IP、让每个 per-IP 计数永远到不了阈值的爆破。
 
 #### 修复的问题
 
@@ -13,11 +24,6 @@
 - **默认监听地址改为回环**：`-addr` 默认从 `:8787`（所有网卡）改为 `127.0.0.1:8787`。裸机安装不再默认把控制台暴露给同网段；显式传 `:8787`/`0.0.0.0` 时启动日志打印安全提示。Docker 镜像的 `CMD` 已显式传 `:8787`，容器映射不受影响；`dev.sh`、README 同步。
 - **收紧 CORS**：`/api` 此前对任意 Origin 回显 `Access-Control-Allow-Origin: *`，现在只在 Origin 指向本服务（同源）时才回显。前端是内嵌同源静态导出，合法流量不受影响。
 - **工作区文件操作审计**：`/api/workspace` 的写入/新建目录/删除/上传成功后写一条 `[ws]` 审计日志（含来源 IP、路径、字节数）；读取/下载不记，保持日志信噪比。
-
-#### 新增的功能
-
-- **traffic 工具按任务隔离**：抓包索引是进程级的，此前任何绑定 traffic 工具的 agent 都能读到**所有任务**的抓包（含别的项目泄露的凭据与 token）。现每个 run 携带 `capture.Scope`，`traffic_search` / `traffic_get` / `traffic_blob` 三处设卡。范围 = 任务声明的测试范围（root_domain/subdomain 按后缀、ip/cidr 按网段、company 展开）∪ 资产主机；`HostsForTask` 改为复用 `scopeTargetCTE`，把「在范围内但由别的任务先发现」的资产也纳入。空范围拒绝一切读取（而非放行），读范围失败时失败关闭；非任务 run（chat/Auto）保持不限制。blob 按引用它的 exchange 判定，孤儿 blob 拒绝。
-- **登录防爆破**：同一「来源 IP + 用户名」在 15 分钟窗口内连续失败 5 次后锁定 15 分钟（慢速爆破也会被前几次失败拖进锁定窗口），登录成功即清零；锁定与每次失败都会写后端日志（「日志」页可见），此前登录失败无任何记录。
 
 ### 修复的问题
 
@@ -28,6 +34,27 @@
 - **恢复 graph_overview 的 scope 字段**：「精简态势概览」重构误删了 coverage 块里的 `scope`（任务圈定的目标范围根资产，company 行会展开 company_scope/keywords），导致 planner 每轮看不到授权范围边界，且既有测试自删除起一直红。现已恢复。
 - **修复测试间 goroutine 泄漏**：server 测试构造的 Server 之前用 `context.Background()` 且从不取消，restoreTaskRuntimes 恢复的任务循环会跨测试存活、往已清理的 TempDir 写文件（"directory not empty" flaky）。新增 `Server.Stop()`/`Engine.StopAll()`，测试统一走 `newTestServer` 在 t.Cleanup 里排空。
 - **修复跨包测试串扰**：`llmrec`/`config` 测试包此前不参与 PG advisory lock 互斥，与其他包并发跑 `go test ./...` 时会被别人的 schema 迁移/清理踩到（"relation llm_usage does not exist"、死锁 flake）。已补上与 db/server/agent/evidence 相同的 TestMain 锁。
+- **日志推送向已关闭的 channel 写入导致进程 panic**：`logSink.add` 解锁后才向订阅者 fan-out，而 `unsubscribe` 在另一把临界区里关闭 channel，两者可交错——浏览器关标签页的瞬间后端可能在 `log.Printf` 里 panic。改为在持锁期间完成非阻塞发送，删除与关闭也在同一把锁内，与 `Broadcaster.Publish` 一致。
+- **触发队列无上限**：调度器为每个任务/agent 事件都可能触发一次会话，而并发上限 `maxParallel=0` 在 UI 上表示「不限」——一次事件风暴要么为每条触发拉起一个 goroutine，要么把内存队列涨到进程被杀。现并发硬上限 32、每 agent 队列上限 256，超限丢弃最旧的触发（调度器下一轮会按水位线重新推导同一变化）。
+- **抓包 CA 私钥在首次抓包前可被其他本机账户读取**：SDK 首次生成 CA 用的是 `os.Create`（0666 减 umask，通常 0644），而收紧权限的代码只在第一次抓包之后才跑。现改为在创建处立即收紧（CA 目录 0700、私钥 0600、两张公开证书 0644），且 chmod 失败会写日志而不是被 `_ =` 吞掉。
+- **工作区敏感路径的大小写绕过**：APFS/NTFS 上 `Traffic/_ca/mitmproxy-ca.pem` 会解析到真实文件，而精确匹配与 `EvalSymlinks` 都不做大小写归一。现补一条读目录比对的检查（`wsSensitiveReal`），按文件系统实际存储的拼写匹配。
+- **拦截规则漏掉两个执行入口**：`Monitor`（后台拉起任意 shell 命令）与 `ExecuteExtraTool`（所有延迟工具的调用包装，含全部 MCP 工具与延迟的自定义命令/脚本工具）此前不经过规则系统。现两者都纳入受控集合，且读取规则失败时按「受控」处理（安全控件只能失败关闭）。
+- **删除后仍会重建 inflight 计数**：`decInflight`/只读轮询路径会为已删除任务无条件 `LoadOrStore`，每轮询一次就留下一个零值条目。现区分「写路径创建」与「只读取值」（`inflightValue`），`decInflight` 也不再创建。
+- **任务删除/关闭时分离的压缩 goroutine 可能写到已销毁的库**：planner 的冷节点压缩是脱离任务生命周期的，删除任务或停机时可能在已关闭的连接池上写 digest 节点。新增 `Compactor.Stop`（有界等待）与 `stopCompactor`，在 bundle 被丢弃时调用。
+
+### 性能与稳定性
+
+- **后台标签页不再空转轮询**：前端有六处轮询（任务列表、会话、概览、日志角标、流量页等，间隔 2–5s），标签页切到后台后浏览器只把它们降频到约每分钟一次，请求照发。新增 `visibleInterval`：页面不可见时完全跳过，切回可见时立即补一次再恢复节奏，顺带吞掉异步回调的 rejection（`setInterval` 会把它变成 unhandled rejection 告警）。
+- **概览页的漏洞统计改用服务端聚合**：此前把整表漏洞拉下来在客户端数，现走 `/api/exploration/findings/stats`。
+- **`/api/stats` 不再每 5 秒物化整棵探索图**：该接口原本调 `ListByKind(intent, 100000)` / `ListByKind(goal, 10000)` 再在 Go 里数个数——每个打开的面板、每 5 秒把长任务的完整节点行（含 payload JSONB）拉一遍然后丢掉。新增 `StatsCounters` 用一条按 `(exploration_id, kind)` 聚合的查询返回同样三个数字。
+- **漏洞列表的流量计数改为一次聚合**：`findingTrafficCountJoin` 取代每行一次的相关子查询（发现页会轮询，导出与详情同样受影响）。
+- **目标达成触发改用水位线**：原先每分钟四次把「历史上所有已达成目标」全读一遍，再用持久化的已触发 id 集合过滤；现按 `updated_at` 水位线增量拉取，并补 `idx_expnodes_goal_met` 部分索引。用 `updated_at` 而非 node id 是因为目标节点是提前创建、事后标记达成的，id 不单调。
+- **补三处缺失索引**：`findings(node_id)`（报告与状态更新的写路径都按它反查）、`findings(vulnclass)`（统计页与筛选项的 DISTINCT，此前每 5 秒全表扫）、`intercept_pending(task_id)` 的 pending 部分索引（会话页高频轮询）。
+- **会话页的审批列表设上限**：`ListTaskIntercepts` 此前无上限，审批历史很长的任务每几秒返回数 MB；现截断到 500 条，需要全量时走分页接口。
+- **归档快照设语句超时**：快照在 repeatable-read 下读约 20 张表并持有 schema advisory lock，一个大任务（或卡在 VACUUM/DDL 后面的锁等待）可以无限期占住锁与连接、阻塞第二个实例的启动迁移。现每语句 60s 上限。
+- **归档导出改为单次 join + 流式写盘**：原先每行一次查询、且把每个 blob 再复制进内存，主机抓包上千条时又慢又吃内存；现 blob 直接流式拷贝，并在拷贝前把连接还回池。
+- **流式响应只保留前 1 MiB**：代理对 SSE 与超过 5 MiB 的响应走无缓冲流式路径，body 理论上无上限。现只捕获头部 1 MiB，真实字节数仍由 `req_len`/`resp_len` 记录。
+- **`AppendActivity` 补死锁重试**：多实例部署或 CI 中 DDL 与本 INSERT 交叉等待时 PG 会把它选作牺牲品（40P01）。单语句被牺牲后 PG 保证可安全重放，按固定退避重跑，复用 schema 迁移那套判定。
 
 ### 测试基础设施
 
@@ -927,7 +954,8 @@
 - [@Autumn-27](https://github.com/Autumn-27)
 - [@neouks](https://github.com/neouks)
 
-[Unreleased]: https://github.com/Autumn-27/ARTEX/compare/v0.3.10...HEAD
+[Unreleased]: https://github.com/hotker/HotkerArteX/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/hotker/HotkerArteX/compare/v2.2.0...v2.3.0
 [0.3.10]: https://github.com/Autumn-27/ARTEX/compare/v0.3.9...v0.3.10
 [0.3.9]: https://github.com/Autumn-27/ARTEX/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/Autumn-27/ARTEX/compare/v0.3.7...v0.3.8
