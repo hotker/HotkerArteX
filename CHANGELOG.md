@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-10-22
+
 ### 变更
 
 - **默认监听地址恢复为 `:8787`（所有网卡）**：2.3.0 把 `-addr` 默认改成了 `127.0.0.1:8787`，但裸机安装与真机联调都需要同网段直接访问控制台，回环默认把这类用法全挡了。现默认值改回 `:8787`，启动日志保留一条 `[security]` 提示说明暴露范围；只想本机访问时显式传 `-addr 127.0.0.1:8787`。Docker 镜像 `CMD` 与 `dev.sh` 本来就显式传 `:8787`，行为不变。
@@ -958,7 +960,8 @@
 - [@Autumn-27](https://github.com/Autumn-27)
 - [@neouks](https://github.com/neouks)
 
-[Unreleased]: https://github.com/hotker/HotkerArteX/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/hotker/HotkerArteX/compare/v2.3.1...HEAD
+[2.3.1]: https://github.com/hotker/HotkerArteX/compare/v2.3.0...v2.3.1
 [2.3.0]: https://github.com/hotker/HotkerArteX/compare/v2.2.0...v2.3.0
 [0.3.10]: https://github.com/Autumn-27/ARTEX/compare/v0.3.9...v0.3.10
 [0.3.9]: https://github.com/Autumn-27/ARTEX/compare/v0.3.8...v0.3.9
