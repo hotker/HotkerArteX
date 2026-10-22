@@ -10,8 +10,10 @@ func TestInheritedActivityReadsRequireTerminalIntent(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
-
+	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
+	// plain `defer d.Close()` fires before them — the row-deleting cleanups below would
+	// then run against a closed pool and silently leave test rows in the shared DB.
+	t.Cleanup(func() { d.Close() })
 	expID, err := d.CreateExploration("source activity boundary", "source activity boundary")
 	if err != nil {
 		t.Fatal(err)
@@ -93,8 +95,10 @@ func TestExplorationDirectSourceReadView(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
-
+	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
+	// plain `defer d.Close()` fires before them — the row-deleting cleanups below would
+	// then run against a closed pool and silently leave test rows in the shared DB.
+	t.Cleanup(func() { d.Close() })
 	grand, err := d.CreateTask("grand source", "grand goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -315,8 +319,10 @@ func TestTaskAssetContextUsesDirectSourceScopeAndAnchors(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
-
+	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
+	// plain `defer d.Close()` fires before them — the row-deleting cleanups below would
+	// then run against a closed pool and silently leave test rows in the shared DB.
+	t.Cleanup(func() { d.Close() })
 	grand, err := d.CreateTask("grand assets", "grand goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)

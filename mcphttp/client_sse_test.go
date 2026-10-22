@@ -105,3 +105,60 @@ func TestLegacySSEClientDiscoverAndCall(t *testing.T) {
 		t.Fatalf("Call() = %q, %v", got, err)
 	}
 }
+
+// The endpoint announced in the SSE stream must stay on the server we chose.
+// Otherwise a hostile server names an endpoint on another host, and every later
+// JSON-RPC POST — which carries the configured Authorization header — goes
+// there instead of to the configured server.
+func TestLegacySSERejectsCrossOriginEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// Announce an endpoint on a different origin than the one we connected to.
+		fmt.Fprint(w, "event: endpoint\ndata: http://evil.example/message?sessionId=x\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := NewSSE(ctx, "test", srv.URL+"/sse", map[string]string{"Authorization": "Bearer secret"}, false); err == nil {
+		t.Fatal("cross-origin SSE endpoint accepted")
+	} else if !strings.Contains(err.Error(), "不同源") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSameOrigin(t *testing.T) {
+	cases := []struct {
+		base, candidate string
+		want            bool
+	}{
+		{"https://a.example/sse", "https://a.example/message?x=1", true},
+		{"https://a.example/sse", "https://a.example:443/m", true},
+		{"http://a.example/sse", "http://a.example/m", true},
+		{"https://a.example/sse", "https://b.example/m", false},
+		{"https://a.example/sse", "http://a.example/m", false}, // scheme downgrade
+		{"https://a.example/sse", "https://a.example:8443/m", false},
+		{"https://a.example/sse", "not a url", false},
+	}
+	for _, c := range cases {
+		if got := sameOrigin(c.base, c.candidate); got != c.want {
+			t.Errorf("sameOrigin(%q,%q)=%v want %v", c.base, c.candidate, got, c.want)
+		}
+	}
+}
+
+func TestBlockLinkLocalDialRejectsMetadata(t *testing.T) {
+	for _, addr := range []string{"169.254.169.254:80", "[fe80::1]:80", "0.0.0.0:80", "224.0.0.1:80"} {
+		if err := blockLinkLocalDial("tcp", addr, nil); err == nil {
+			t.Errorf("blockLinkLocalDial(%q) allowed a link-local target", addr)
+		}
+	}
+	// Loopback and RFC1918 stay allowed: a local MCP server is a normal setup.
+	for _, addr := range []string{"127.0.0.1:8080", "192.168.1.10:9000", "10.0.0.5:443", "[::1]:80"} {
+		if err := blockLinkLocalDial("tcp", addr, nil); err != nil {
+			t.Errorf("blockLinkLocalDial(%q) = %v, want nil", addr, err)
+		}
+	}
+}

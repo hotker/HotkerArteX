@@ -142,7 +142,7 @@ func (i *Interceptor) SetReviewer(r Reviewer) {
 // rule system when no intercept_enabled_tools setting has been saved.
 var defaultEnabledTools = []string{
 	"Bash", "WebFetch", "web_search",
-	"shell_open", "shell_send",
+	"shell_open", "shell_send", "Monitor",
 	"Write", "Edit", "MultiEdit",
 }
 
@@ -153,14 +153,23 @@ var defaultEnabledTools = []string{
 // itself to sidestep review (data exfil, destructive calls). The user can still
 // add a higher-priority allow rule for a specific one; they cannot remove it from
 // the gate by emptying the tool list.
+//
+// Monitor and ExecuteExtraTool belong here for the same reason from the other
+// direction: both execute something the gate would otherwise never see. Monitor
+// spawns an arbitrary shell command in the background, and ExecuteExtraTool is
+// the wrapper every deferred tool (all MCP tools, deferred custom command/script
+// tools) is invoked through — the guard unwraps it in PreToolUse, so the outer
+// name must reach the rule system too.
 var forcedTools = map[string]bool{
-	"create_skill":        true,
-	"update_skill_file":   true,
-	"create_custom_tool":  true,
-	"update_custom_tool":  true,
-	"create_mcp":          true,
-	"update_mcp":          true,
+	"create_skill":          true,
+	"update_skill_file":     true,
+	"create_custom_tool":    true,
+	"update_custom_tool":    true,
+	"create_mcp":            true,
+	"update_mcp":            true,
 	"delete_assets_by_host": true,
+	"Monitor":               true,
+	"ExecuteExtraTool":      true,
 }
 
 // forcedToolPrefixes are tool-name prefixes that always enter the rule system.
@@ -268,6 +277,11 @@ func (i *Interceptor) rules() ([]compiledRule, error) {
 // (i.e. it should enter the rule-matching path). Uses the same double-check lock
 // pattern as rules(). Forced tools (see IsForcedTool) always return true regardless
 // of the enabled list, so they can never be excluded from the gate.
+//
+// A failure to load the set returns true: this is a safety control, so the only
+// safe reading of "I don't know whether this tool is gated" is "treat it as
+// gated". Returning false would let one transient settings read silently empty
+// the whole gate for the rest of the process's view of the call.
 func (i *Interceptor) IsToolEnabled(name string) bool {
 	if IsForcedTool(name) {
 		return true
@@ -283,7 +297,9 @@ func (i *Interceptor) IsToolEnabled(name string) bool {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.enabledTools == nil {
-		_ = i.loadLocked()
+		if err := i.loadLocked(); err != nil {
+			return true // fail closed: unknown means gated
+		}
 	}
 	return i.enabledTools[name]
 }
@@ -353,7 +369,7 @@ const (
 
 // Judge default values.
 const (
-	defaultJudgeTimeoutSecs      = 15
+	defaultJudgeTimeoutSecs = 15
 	// Fail-open is dangerous for a pentest tool: when the judge model is down,
 	// every unreviewed high-risk call would sail through unattended. Defaulting
 	// to "ask" routes those calls to a human approval (with its own timeout
@@ -550,9 +566,26 @@ func judgeActionLabel(action string) string {
 // Match evaluates the rule list (priority DESC) against a tool call.
 // Returns (Decision, true) for the first matching enabled rule, or
 // (Decision{}, false) if no rule matches.
+//
+// A failure to load the rules is NOT "no rule matched". Treating it that way
+// let one transient database error drop every deny/ask rule for that call, and
+// with the judge off the call then ran unchecked. The gate is a safety control,
+// so an unreadable rule set resolves to an explicit human approval instead.
 func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	rules, err := i.rules()
-	if err != nil || len(rules) == 0 {
+	if err != nil {
+		// Bounded fail-closed: a human can still approve, but an unattended run
+		// must not hang on a database hiccup — the pending request times out to
+		// deny, the same policy as a judge-issued ask.
+		return Decision{
+			Action:         "ask",
+			Message:        "拦截规则加载失败，无法确认该操作是否被禁止，需人工确认",
+			TimeoutEnabled: true,
+			TimeoutSeconds: defaultJudgeAskTimeoutSecs,
+			TimeoutAction:  defaultJudgeAskTimeoutAction,
+		}, true
+	}
+	if len(rules) == 0 {
 		return Decision{}, false
 	}
 	for _, r := range rules {

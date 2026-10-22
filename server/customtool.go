@@ -149,7 +149,7 @@ func (s *Server) pgTestCustomTool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req testToolReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, "无效的请求体")
 		return
 	}
@@ -441,9 +441,20 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 	for k, v := range spec.Headers {
 		req.Header.Set(k, renderTemplate(v, params, identity))
 	}
-	client := &http.Client{Timeout: timeoutOr(spec.TimeoutMs, 30000)}
+	client := &http.Client{Timeout: timeoutOr(spec.TimeoutMs, 30000), CheckRedirect: guardRedirects(5)}
 	if tr := s.httpProxyTransport(spec); tr != nil {
 		client.Transport = tr
+		// Proxied: the dial guard below only reaches the proxy. Check the target
+		// the caller actually named before handing it to the proxy.
+		if u, perr := url.Parse(rawURL); perr == nil {
+			if gerr := refuseLinkLocalTarget(runCtx, u); gerr != nil {
+				return actool.Errorf(gerr.Error()), nil
+			}
+		}
+	} else {
+		// Direct path: the URL comes from the model / tool params, so it must not
+		// reach link-local endpoints such as the cloud metadata service.
+		client.Transport = &http.Transport{DialContext: guardedDialer().DialContext}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -474,7 +485,7 @@ func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
 	if err != nil {
 		return nil
 	}
-	tr := &http.Transport{Proxy: http.ProxyURL(pu)}
+	tr := &http.Transport{Proxy: http.ProxyURL(pu), DialContext: guardedDialer().DialContext}
 	if caFile != "" {
 		if pem, err := os.ReadFile(caFile); err == nil {
 			pool := x509.NewCertPool()
@@ -494,12 +505,53 @@ func identity(s string) string { return s }
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
 // renderTemplate replaces {name} placeholders with each param's rendered value.
+//
+// Substitution is a SINGLE pass over the template: the replacement text is never
+// rescanned. Sequential ReplaceAll (the obvious implementation) would re-expand a
+// value that itself contains a placeholder of a later param, and for a command
+// template that means a value can smuggle quotes through shellQuote and inject a
+// shell command. Params come straight from the model, so this is a
+// prompt-injection-to-RCE path, not a hypothetical.
+//
+// Only `{` immediately followed by a known param name and `}` is a placeholder.
+// Scanning to the next `}` regardless (the obvious single-pass form) breaks JSON
+// templates: in `{"flag":"{flag}"}` the first `{` pairs with the `}` that closes
+// the whole object, so the real placeholder is swallowed into a bogus name and
+// the body goes out unrendered. A brace that does not open a known name is
+// emitted as a literal and scanning resumes right after it.
 func renderTemplate(tmpl string, params map[string]any, quote func(string) string) string {
-	out := tmpl
-	for k, v := range params {
-		out = strings.ReplaceAll(out, "{"+k+"}", quote(valToStr(v)))
+	if len(params) == 0 || !strings.ContainsRune(tmpl, '{') {
+		return tmpl
 	}
-	return out
+	var b strings.Builder
+	b.Grow(len(tmpl))
+	for i := 0; i < len(tmpl); {
+		if tmpl[i] != '{' {
+			b.WriteByte(tmpl[i])
+			i++
+			continue
+		}
+		// Find the longest param name that starts right after this brace and is
+		// followed by '}'. Longest-first keeps names that share a prefix distinct.
+		matched, value := false, ""
+		end := 0
+		for name, v := range params {
+			close := i + 1 + len(name)
+			if close < len(tmpl) && tmpl[i+1:close] == name && tmpl[close] == '}' {
+				if !matched || len(name) > end-i-1 {
+					matched, value, end = true, quote(valToStr(v)), close+1
+				}
+			}
+		}
+		if !matched {
+			b.WriteByte('{') // literal brace; the rest is scanned normally
+			i++
+			continue
+		}
+		b.WriteString(value)
+		i = end
+	}
+	return b.String()
 }
 
 // valToStr renders a param value: scalars as-is, arrays/objects as compact JSON.

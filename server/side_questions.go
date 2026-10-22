@@ -343,7 +343,7 @@ func (s *Server) handleSideQuestions(w http.ResponseWriter, r *http.Request, p s
 		Question string `json:"question"`
 		ClientID string `json:"client_request_id"`
 	}
-	if json.NewDecoder(r.Body).Decode(&in) != nil {
+	if decode(r, &in) != nil {
 		writeErr(w, 400, "bad json")
 		return
 	}

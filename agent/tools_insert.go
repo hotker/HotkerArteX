@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Autumn-27/artex/capture"
 	"github.com/Autumn-27/artex/db"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -73,6 +74,87 @@ func assetInputLabel(item assetInputItem) string {
 func (t *ToolSet) SetAssetStore(as *db.AssetStore, cs *db.CompanyStore) {
 	t.as = as
 	t.cs = cs
+}
+
+// EnableCaptureScope restricts the host traffic tools to this task's own targets.
+// It is called once per run, before the run's ctx is built; attachCaptureScope
+// then puts the set on that ctx.
+//
+// The scope is the union of the task's DECLARED scope rows (root domain / CIDR /
+// subdomain / company assets) and the hosts its assets carry. Both halves matter:
+// declared scope is what the operator authorized (a root_domain admits every
+// subdomain, so a capture of api.example.com is in scope even before that
+// hostname is discovered), while asset hosts cover what the task has actually
+// touched. A task with neither still restricts to nothing — reads for a host it
+// never declared are exactly the cross-task leak this closes.
+func (t *ToolSet) EnableCaptureScope(taskID int64) {
+	if t.as == nil || taskID <= 0 {
+		return
+	}
+	hosts, err := t.as.HostsForTask(taskID)
+	if err != nil {
+		// Fail closed: an unreadable asset table must not silently widen the scope
+		// to the whole process-wide capture index.
+		t.captureScope = &capture.Scope{Reason: "任务资产范围读取失败，暂时无法确认可读范围"}
+		return
+	}
+	scope := capture.Scope{Hosts: make(map[string]bool, len(hosts))}
+	for _, h := range hosts {
+		scope.Hosts[h] = true
+	}
+	scopes, err := t.as.ListTaskScopeWithSources(taskID)
+	if err != nil {
+		t.captureScope = &capture.Scope{Reason: "任务测试范围读取失败，暂时无法确认可读范围"}
+		return
+	}
+	for _, s := range scopes {
+		switch s.Kind {
+		case "root_domain", "subdomain":
+			if d := strings.ToLower(strings.TrimSpace(s.Domain)); d != "" {
+				scope.Domains = append(scope.Domains, d)
+			}
+		case "ip", "cidr":
+			if n := parseNet(s.Net); n != nil {
+				scope.Nets = append(scope.Nets, n)
+			} else if n := parseNet(s.Domain); n != nil {
+				scope.Nets = append(scope.Nets, n)
+			}
+		case "company":
+			// A company scope is expanded by HostsForTask already: scopeTargetCTE
+			// joins every asset whose company_id matches, so each of its hosts is
+			// in the exact set.
+		}
+	}
+	t.captureScope = &scope
+}
+
+// parseNet accepts both "10.0.0.0/8" and a bare IP (treated as a single host).
+func parseNet(raw string) *net.IPNet {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if _, n, err := net.ParseCIDR(raw); err == nil {
+		return n
+	}
+	if ip := net.ParseIP(strings.Trim(raw, "[]")); ip != nil {
+		bits := 128
+		if ip.To4() != nil {
+			bits = 32
+			ip = ip.To4()
+		}
+		return &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}
+	}
+	return nil
+}
+
+// attachCaptureScope puts the run's traffic-read scope on ctx. Returns ctx
+// unchanged when no scope is configured (non-task runs stay unrestricted).
+func (t *ToolSet) attachCaptureScope(ctx context.Context) context.Context {
+	if t.captureScope == nil {
+		return ctx
+	}
+	return capture.WithScope(ctx, *t.captureScope)
 }
 
 // assetInputItem is one element of the insert_assets "assets" array.
@@ -227,15 +309,21 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 			var results []result
 			var errs []errEntry
 
-			// 资产闸门规则一次性载入；读取失败则跳过判定（不阻断插入）。
-			// 拦截规则 = 全局 ∪ 任务级 block；允许规则 = 任务级 allow。
-			blockRules, _ := t.as.ListAssetInterceptRules()
+			// 资产闸门规则一次性载入。读取失败时必须阻断本次插入：闸门是安全控制，
+			// 读不到"哪些资产被禁止"时唯一安全的解释是"可能全被禁止"，放行等于让一次
+			// 数据库抖动把越界资产写进授权范围。
+			blockRules, err := t.as.ListAssetInterceptRules()
+			if err != nil {
+				return actool.Errorf("资产闸门规则读取失败，已拒绝本次写入：" + err.Error()), nil
+			}
 			var allowRules []db.AssetInterceptRule
 			if t.taskID > 0 {
-				if tb, ta, err := t.as.TaskInterceptRulesSplit(t.taskID); err == nil {
-					blockRules = append(blockRules, tb...)
-					allowRules = ta
+				tb, ta, terr := t.as.TaskInterceptRulesSplit(t.taskID)
+				if terr != nil {
+					return actool.Errorf("任务级资产闸门规则读取失败，已拒绝本次写入：" + terr.Error()), nil
 				}
+				blockRules = append(blockRules, tb...)
+				allowRules = ta
 			}
 
 			for i, item := range a.Assets {

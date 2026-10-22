@@ -6,21 +6,36 @@
 
 ### 安全
 
-#### 新增的功能
-
-- **登录防爆破**：同一「来源 IP + 用户名」在 15 分钟窗口内连续失败 5 次后锁定 15 分钟（慢速爆破也会被前几次失败拖进锁定窗口），登录成功即清零；锁定与每次失败都会写后端日志（「日志」页可见），此前登录失败无任何记录。
-
 #### 修复的问题
 
+- **自定义 HTTP 工具的代理路径可被引到链路本地地址**：拨号守卫只覆盖直连——走代理时客户端连的是代理，目标由代理解析，守卫看不到。现补两道：`guardRedirects` 把每一跳钉死在调用方指定的 scheme+host:port（跨主机、换端口、降级到 http 全部拒绝），代理分支在交给代理前用 `refuseLinkLocalTarget` 解析目标并拒绝链路本地/未指定/组播（含 169.254.169.254）。回环与 RFC1918 仍按设计放行。
+- **LLM 提供商探测端点回显上游响应体**：`/api/llm/models` 在非 200 时把上游 body 原样带回。该接口允许任意已登录用户指定 `base_url`，等于一条「认证用户可读任意内网服务响应」的 SSRF 读原语。现只提取 `error.message`/`error.code`/顶层 `message`，其余回「（响应体非 JSON，已省略）」，并截到 300 字符。
+- **默认监听地址改为回环**：`-addr` 默认从 `:8787`（所有网卡）改为 `127.0.0.1:8787`。裸机安装不再默认把控制台暴露给同网段；显式传 `:8787`/`0.0.0.0` 时启动日志打印安全提示。Docker 镜像的 `CMD` 已显式传 `:8787`，容器映射不受影响；`dev.sh`、README 同步。
 - **收紧 CORS**：`/api` 此前对任意 Origin 回显 `Access-Control-Allow-Origin: *`，现在只在 Origin 指向本服务（同源）时才回显。前端是内嵌同源静态导出，合法流量不受影响。
 - **工作区文件操作审计**：`/api/workspace` 的写入/新建目录/删除/上传成功后写一条 `[ws]` 审计日志（含来源 IP、路径、字节数）；读取/下载不记，保持日志信噪比。
 
+#### 新增的功能
+
+- **traffic 工具按任务隔离**：抓包索引是进程级的，此前任何绑定 traffic 工具的 agent 都能读到**所有任务**的抓包（含别的项目泄露的凭据与 token）。现每个 run 携带 `capture.Scope`，`traffic_search` / `traffic_get` / `traffic_blob` 三处设卡。范围 = 任务声明的测试范围（root_domain/subdomain 按后缀、ip/cidr 按网段、company 展开）∪ 资产主机；`HostsForTask` 改为复用 `scopeTargetCTE`，把「在范围内但由别的任务先发现」的资产也纳入。空范围拒绝一切读取（而非放行），读范围失败时失败关闭；非任务 run（chat/Auto）保持不限制。blob 按引用它的 exchange 判定，孤儿 blob 拒绝。
+- **登录防爆破**：同一「来源 IP + 用户名」在 15 分钟窗口内连续失败 5 次后锁定 15 分钟（慢速爆破也会被前几次失败拖进锁定窗口），登录成功即清零；锁定与每次失败都会写后端日志（「日志」页可见），此前登录失败无任何记录。
+
 ### 修复的问题
 
+- **`concMu` 不再横跨数据库 I/O**：任务准入、FIFO 晋升、不可用任务停靠、暂停四条生命周期路径此前都在持有 `concMu` 的情况下做 PG 往返，一个慢查询会阻塞所有任务的准入。现统一为「锁内决策 + 锁外提交」，用 `promoting`（按任务认领）与 `admitting`（槽位预留）保持账目正确；删除与生命周期的互斥改由引擎的任务操作准入 + `inflight==0` 保证。删除失败补偿里的 `GetTask` 也移到加锁之前。
+- **前端 401 后 SSE 不再永久僵死**：EventSource 读不到状态码，token 过期/被吊销与网络抖动表现一致，旧代码只把「在线」指示灯关掉、浏览器继续用一个死凭据重试。现 `watchSSE` 在 onerror 时先关流，再用**需要鉴权**的 `/api/stats` 探测：401 → 清凭据跳登录；可达 → 重开；不可达 → 也重开。四个 SSE 消费方（任务会话、日志、旁问、更新进度）全部改为可重入的 `open()`。
+- **自定义工具模板渲染吃掉 JSON 花括号**：单遍扫描把 JSON 对象的 `{` 和占位符的 `}` 配成一对，`{"flag":"{flag}"}` 原样发出。现只有「紧邻已知参数名 + `}`」才算占位符，否则 `{` 按字面输出并继续扫描，最长名优先。
 - **修复 agent 运行时钩子的数据竞争**：`PromptOverride`/`ToolAugment`/`ToolResolve`/`Wrapup*`/`FindingTrafficBindingEnabled` 等包级钩子变量此前是裸函数变量——server 装配时写入、planner/worker goroutine 每轮读取，race detector 已抓到实锤（新 Server 构造与在跑 planner 循环并发）。现全部改为 `sync/atomic.Pointer` + Set/Get 对，`go test -race` 全量归零。
 - **恢复 graph_overview 的 scope 字段**：「精简态势概览」重构误删了 coverage 块里的 `scope`（任务圈定的目标范围根资产，company 行会展开 company_scope/keywords），导致 planner 每轮看不到授权范围边界，且既有测试自删除起一直红。现已恢复。
 - **修复测试间 goroutine 泄漏**：server 测试构造的 Server 之前用 `context.Background()` 且从不取消，restoreTaskRuntimes 恢复的任务循环会跨测试存活、往已清理的 TempDir 写文件（"directory not empty" flaky）。新增 `Server.Stop()`/`Engine.StopAll()`，测试统一走 `newTestServer` 在 t.Cleanup 里排空。
 - **修复跨包测试串扰**：`llmrec`/`config` 测试包此前不参与 PG advisory lock 互斥，与其他包并发跑 `go test ./...` 时会被别人的 schema 迁移/清理踩到（"relation llm_usage does not exist"、死锁 flake）。已补上与 db/server/agent/evidence 相同的 TestMain 锁。
+
+### 测试基础设施
+
+#### 修复的问题
+
+- **测试清理语句跑在已关闭的连接上**：`t.Cleanup` 在 `defer` **之后**执行，而大量用例写成 `defer d.Close()` + `t.Cleanup(func(){ d.Exec("DELETE ...") })`，于是删除全部落在已关闭的连接池上、错误又被 `_ =` 吞掉，数据永久留在共享库。后果是同一库跑第二遍时出现 `duplicate key llm_profiles_name_key`、以及残留的 `198.51.100.0/24` scope 抢走新资产的归属（`company_id = 27, want 79`，看起来像并发 bug）。全仓 32 处统一改为先注册 `t.Cleanup(func(){ d.Close() })`，靠 LIFO 让关闭最后执行。
+- **只删主行、漏掉副作用行**：`UpsertHTTPService`/`UpsertEndpoint` 会经 `linkHostAssets` 顺带写入 root_domain + subdomain，测试只删返回的 id 就留下残行。改用 `DeleteTaskCascade(id, true, false)` 或按域名整片清扫。故意关库模拟失败的用例（`TestTaskLLMResolutionReportsDatabaseFailure`）改用独立连接清理。
+- **新增 `HostsForTask` 覆盖**：`db/assets_hosts_test.go` 验证「资产主机 ∪ 声明范围」的并集语义——本任务发现的 domain/ip/URL-hostname 可见，别的任务发现但落在本任务 root_domain 范围内的可见，范围外不可见，完整 URL 不以 URL 形式混入（traffic 索引按 `URL.Hostname()` 键控）。
 
 ### 新增的功能
 

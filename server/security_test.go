@@ -84,13 +84,52 @@ func TestClientIP(t *testing.T) {
 	if got := clientIP(r); got != "10.0.0.7" {
 		t.Fatalf("RemoteAddr: got %q", got)
 	}
+	// XFF is client-controlled, so it is ignored unless a reverse proxy is
+	// explicitly trusted: honouring it by default lets an attacker step the
+	// throttle key with every request and never trip the lock.
 	r.Header.Set("X-Forwarded-For", "203.0.113.9, 10.0.0.1")
+	if got := clientIP(r); got != "10.0.0.7" {
+		t.Fatalf("untrusted XFF must be ignored: got %q", got)
+	}
+	t.Setenv(trustedProxyEnv, "1")
 	if got := clientIP(r); got != "203.0.113.9" {
-		t.Fatalf("XFF: got %q", got)
+		t.Fatalf("trusted XFF: got %q", got)
 	}
 	r.Header.Set("X-Forwarded-For", "")
 	if got := clientIP(r); got != "10.0.0.7" {
 		t.Fatalf("empty XFF fallback: got %q", got)
+	}
+}
+
+// Rotating the source IP (spoofed XFF, a botnet, or just retries from different
+// addresses) must not make password guessing free: the global failure budget
+// throttles the endpoint regardless of which key the attempts land on.
+func TestLoginLimiterGlobalCooldown(t *testing.T) {
+	resetLoginLimiter()
+	loginLim.globalFailures = nil
+	t.Cleanup(func() {
+		resetLoginLimiter()
+		loginLim.globalFailures = nil
+	})
+	for i := 0; i < maxGlobalLoginFails; i++ {
+		loginLim.noteGlobalFail()
+	}
+	w := httptest.NewRecorder()
+	if !loginThrottled(w, reqWithAddr("198.51.100.1:1111"), "ARTEX") {
+		t.Fatal("expected global cooldown to throttle a fresh source")
+	}
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("want 429, got %d", w.Code)
+	}
+	if wait := loginLim.globalCooldown(); wait <= 0 {
+		t.Fatalf("globalCooldown = %v, want > 0", wait)
+	}
+	// A single failure must not trip it (a human mistyping once is normal).
+	resetLoginLimiter()
+	loginLim.globalFailures = nil
+	loginLim.noteGlobalFail()
+	if wait := loginLim.globalCooldown(); wait != 0 {
+		t.Fatalf("one failure triggered the global cooldown (%v)", wait)
 	}
 }
 

@@ -100,22 +100,46 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 	out := taskControlResult{ID: t.ID}
 	switch action {
 	case "pause":
+		// Decision under concMu, commit outside it: ApplyTaskPause is a database
+		// round trip and holding the admission lock across it stalled every other
+		// task's admission. `promoting` claims the task for the commit's duration,
+		// which is what the lock provided; the engine operation admission keeps
+		// delete from observing quiescence mid-write.
 		s.concMu.Lock()
-		defer s.concMu.Unlock()
 		current, exists := s.m.Task(t.ID)
 		if !exists || current != t || s.engine.IsDeleting(t.ID) {
+			s.concMu.Unlock()
 			return out, fmt.Errorf("任务正在删除，无法控制")
+		}
+		if s.promoting[t.ID] {
+			s.concMu.Unlock()
+			return out, errTaskLifecycleBusy
 		}
 		if !s.engine.beginTaskOperation(t.ID) {
+			s.concMu.Unlock()
 			return out, fmt.Errorf("任务正在删除，无法控制")
 		}
-		defer s.engine.decInflight(t.ID)
 		lifecycle := t.lifecycleSnapshot()
 		if isTerminalStatus(lifecycle.Status) {
+			s.engine.decInflight(t.ID)
+			s.concMu.Unlock()
 			return out, fmt.Errorf("终态任务不能执行暂停")
 		}
 		if lifecycle.Paused {
+			s.engine.decInflight(t.ID)
+			s.concMu.Unlock()
 			return out, fmt.Errorf("任务已经暂停")
+		}
+		if s.promoting == nil {
+			s.promoting = map[string]bool{}
+		}
+		s.promoting[t.ID] = true
+		s.concMu.Unlock()
+		release := func() {
+			s.concMu.Lock()
+			delete(s.promoting, t.ID)
+			s.concMu.Unlock()
+			s.engine.decInflight(t.ID)
 		}
 		wasQueued := lifecycle.Queued
 		wasEnginePaused := s.engine.IsPaused(t.ID)
@@ -127,6 +151,7 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 			if !wasEnginePaused && !wasQueued {
 				s.engine.Resume(t)
 			}
+			release()
 			return out, err
 		}
 		// Main Agent is independently cancellable. Only cancel its current turn
@@ -134,6 +159,7 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 		// compensated and does not lose an otherwise valid conversation turn.
 		s.cancelTaskChat(t.ID, agent.AbortChatPausedWithTask)
 		out.Paused, out.Status = true, "paused"
+		release()
 		go s.reconcileConcurrency()
 	case "resume":
 		queued, err := s.admitPausedTask(t)
@@ -249,7 +275,7 @@ func (s *Server) controlTasksBatch(w http.ResponseWriter, r *http.Request) {
 		TaskIDs []string `json:"task_ids"`
 		Action  string   `json:"action"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}

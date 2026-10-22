@@ -85,6 +85,7 @@ type taskLifecycleState struct {
 	Queued        bool
 	QueuedAt      int64
 	QueueMode     string
+	ParentRef     string
 	CompletedAt   int64
 	FirstRunAt    int64
 	DeadlineAt    int64
@@ -112,6 +113,7 @@ func (t *Task) lifecycleSnapshotLocked() taskLifecycleState {
 		Queued:        t.Queued,
 		QueuedAt:      t.QueuedAt,
 		QueueMode:     t.QueueMode,
+		ParentRef:     t.ParentRef,
 		CompletedAt:   t.CompletedAt,
 		FirstRunAt:    t.FirstRunAt,
 		DeadlineAt:    t.DeadlineAt,
@@ -136,6 +138,7 @@ func (t *Task) updateLifecycle(update func(*taskLifecycleState)) {
 	t.Queued = state.Queued
 	t.QueuedAt = state.QueuedAt
 	t.QueueMode = state.QueueMode
+	t.ParentRef = state.ParentRef
 	t.CompletedAt = state.CompletedAt
 	t.FirstRunAt = state.FirstRunAt
 	t.DeadlineAt = state.DeadlineAt
@@ -1755,6 +1758,25 @@ func (t *Task) Notify() {
 	}
 }
 
+// maxPendingTriggers bounds the queued trigger events for one task. Events are
+// only consumed by a planning round, and a paused or terminal task never runs
+// one, so without a bound every hint/finding produced while it sits idle would be
+// retained for the life of the process and then replayed in full into the next
+// prompt. The newest events are the ones a planner can still act on, so the queue
+// keeps those and drops the oldest. Draining is deliberately NOT done on the
+// terminal/paused paths: a set_goals or add_hint that revives a finished task must
+// still surface exactly once, which is why those events outlive the early return.
+const maxPendingTriggers = 64
+
+// pushTriggerLocked appends one trigger event under trigMu, dropping the oldest
+// when the queue is over its bound. Callers must hold trigMu.
+func (t *Task) pushTriggerLocked(ev agent.TriggerEvent) {
+	t.pendingTriggers = append(t.pendingTriggers, ev)
+	if over := len(t.pendingTriggers) - maxPendingTriggers; over > 0 {
+		t.pendingTriggers = append([]agent.TriggerEvent(nil), t.pendingTriggers[over:]...)
+	}
+}
+
 // NotifyDone is Notify plus a hint: a worker just finished intentID and that is
 // what triggered this wake-up. The planner reads the accumulated triggers next
 // round so it can spell out which intent finished (+ its output). Events pile up
@@ -1762,7 +1784,7 @@ func (t *Task) Notify() {
 func (t *Task) NotifyDone(intentID int64) {
 	if intentID > 0 {
 		t.trigMu.Lock()
-		t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "done", IntentID: intentID})
+		t.pushTriggerLocked(agent.TriggerEvent{Kind: "done", IntentID: intentID})
 		t.trigMu.Unlock()
 	}
 	t.Notify()
@@ -1772,7 +1794,7 @@ func (t *Task) NotifyDone(intentID int64) {
 // then wakes the planner — so the round spells out which intent found what.
 func (t *Task) NotifyFinding(intentID int64, summary string) {
 	t.trigMu.Lock()
-	t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "finding", IntentID: intentID, Detail: summary})
+	t.pushTriggerLocked(agent.TriggerEvent{Kind: "finding", IntentID: intentID, Detail: summary})
 	t.trigMu.Unlock()
 	t.Notify()
 }
@@ -1788,7 +1810,7 @@ func (t *Task) NotifyGoal(texts []string) {
 		return
 	}
 	t.trigMu.Lock()
-	t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "goal", Goals: texts})
+	t.pushTriggerLocked(agent.TriggerEvent{Kind: "goal", Goals: texts})
 	t.trigMu.Unlock()
 	t.Notify()
 }
@@ -1803,7 +1825,7 @@ func (t *Task) NotifyHint(texts []string) {
 		return
 	}
 	t.trigMu.Lock()
-	t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "hint", Hints: texts})
+	t.pushTriggerLocked(agent.TriggerEvent{Kind: "hint", Hints: texts})
 	t.trigMu.Unlock()
 	t.Notify()
 }
@@ -1817,7 +1839,7 @@ func (t *Task) NotifyGoalDeleted(text string) {
 		return
 	}
 	t.trigMu.Lock()
-	t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "goal_deleted", Detail: text})
+	t.pushTriggerLocked(agent.TriggerEvent{Kind: "goal_deleted", Detail: text})
 	t.trigMu.Unlock()
 	t.Notify()
 }
@@ -1831,7 +1853,7 @@ func (t *Task) NotifyGoalEdited(oldText, newText string) {
 		return
 	}
 	t.trigMu.Lock()
-	t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "goal_edited", OldGoal: oldText, NewGoal: newText})
+	t.pushTriggerLocked(agent.TriggerEvent{Kind: "goal_edited", OldGoal: oldText, NewGoal: newText})
 	t.trigMu.Unlock()
 	t.Notify()
 }
@@ -1844,7 +1866,7 @@ func (t *Task) NotifyGoalEdited(oldText, newText string) {
 func (t *Task) NotifyCancelled(intentID int64, summary, reason string) {
 	if intentID > 0 {
 		t.trigMu.Lock()
-		t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "cancelled", IntentID: intentID, Summary: summary, Detail: reason})
+		t.pushTriggerLocked(agent.TriggerEvent{Kind: "cancelled", IntentID: intentID, Summary: summary, Detail: reason})
 		t.trigMu.Unlock()
 	}
 	t.Notify()

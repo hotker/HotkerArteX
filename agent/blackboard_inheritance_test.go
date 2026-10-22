@@ -27,8 +27,10 @@ func callReadJSON(t *testing.T, tool actool.CoreTool, input string) any {
 
 func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 	d := testDB(t)
-	defer d.Close()
-
+	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
+	// plain `defer d.Close()` fires before them — the row-deleting cleanups below would
+	// then run against a closed pool and silently leave test rows in the shared DB.
+	t.Cleanup(func() { d.Close() })
 	companies := d.Companies()
 	companyID, _, err := companies.UpsertCompany(fmt.Sprintf("overview-scope-%d", time.Now().UnixNano()), "")
 	if err != nil {
@@ -185,8 +187,10 @@ func companiesName(t *testing.T, companies *db.CompanyStore, companyID int64) st
 
 func TestBlackboardToolsReadDirectSources(t *testing.T) {
 	d := testDB(t)
-	defer d.Close()
-
+	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
+	// plain `defer d.Close()` fires before them — the row-deleting cleanups below would
+	// then run against a closed pool and silently leave test rows in the shared DB.
+	t.Cleanup(func() { d.Close() })
 	grand, err := d.CreateTask("grand", "grand goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -369,8 +373,10 @@ func TestBlackboardToolsReadDirectSources(t *testing.T) {
 // model which ids it deferred, after de-duplicating and dropping invalid ids.
 func TestGetWorkerTraceStepIDsDegradeGracefully(t *testing.T) {
 	d := testDB(t)
-	defer d.Close()
-
+	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
+	// plain `defer d.Close()` fires before them — the row-deleting cleanups below would
+	// then run against a closed pool and silently leave test rows in the shared DB.
+	t.Cleanup(func() { d.Close() })
 	task, err := d.CreateTask("trace-cap", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)

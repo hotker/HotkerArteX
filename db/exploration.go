@@ -827,6 +827,24 @@ WHERE exploration_id=$1 AND kind='intent' AND state='open'`, s.expID).Scan(&n)
 	return n, err
 }
 
+// StatsCounters returns the three counters GET /api/stats needs on every poll:
+// running intents (in-flight workers), total goals and met goals.
+//
+// It exists because that endpoint used to call ListByKind(intent, 100000) and
+// ListByKind(goal, 10000) and then count in Go — materializing the full node
+// rows (payload JSONB included) of a long task every 5 seconds, per open
+// dashboard, only to throw them away. One aggregate query over
+// (exploration_id, kind) returns the same numbers without the transfer.
+func (s *ExplorationStore) StatsCounters() (runningIntents, goalsTotal, goalsMet int, err error) {
+	err = s.db.QueryRow(`SELECT
+		COUNT(*) FILTER (WHERE kind='intent' AND state='running'),
+		COUNT(*) FILTER (WHERE kind='goal'),
+		COUNT(*) FILTER (WHERE kind='goal' AND state='met')
+	FROM exploration_nodes WHERE exploration_id=$1`, s.expID).
+		Scan(&runningIntents, &goalsTotal, &goalsMet)
+	return runningIntents, goalsTotal, goalsMet, err
+}
+
 // GetNode returns one node of this exploration by id (nil, nil if not found).
 func (s *ExplorationStore) GetNode(id int64) (*Node, error) {
 	n, err := scanNode(s.db.QueryRow(`SELECT `+nodeCols+` FROM exploration_nodes WHERE id=$1 AND exploration_id=$2`, id, s.expID))
@@ -1293,16 +1311,33 @@ func (d *DB) TokenTotalsAll() (map[int64]TokenUsage, error) {
 }
 
 // LastActivityAll returns the unix time of the most recent activity per
-// exploration (exploration_id → max created_at epoch), one query for all tasks.
-// Persisted (unlike Engine.LastActivity's in-memory map), so it survives restarts
-// and gives终态任务 a stable "ran until" time for computing run duration.
-func (d *DB) LastActivityAll() (map[int64]int64, error) {
-	rows, err := d.Query(`SELECT exploration_id, EXTRACT(EPOCH FROM MAX(created_at))::bigint FROM activity GROUP BY exploration_id`)
+// exploration, for the given explorations only. Persisted (unlike
+// Engine.LastActivity's in-memory map), so it survives restarts and gives
+// 终态任务 a stable "ran until" time for computing run duration.
+//
+// The exploration ids are required because this used to be an unbounded
+// `GROUP BY exploration_id` over the whole activity table — the fastest-growing
+// table in the schema — and it runs inside the orchestrator's list_tasks tool,
+// i.e. many times a minute. An explicit id set keeps it on idx_act_latest
+// instead of re-aggregating the complete history on every call.
+func (d *DB) LastActivityAll(explorationIDs []int64) (map[int64]int64, error) {
+	out := map[int64]int64{}
+	if len(explorationIDs) == 0 {
+		return out, nil
+	}
+	rows, err := d.Query(`
+		SELECT e.exploration_id, EXTRACT(EPOCH FROM latest.created_at)::bigint
+		FROM unnest($1::bigint[]) AS e(exploration_id)
+		JOIN LATERAL (
+			SELECT created_at FROM activity
+			WHERE exploration_id = e.exploration_id
+			ORDER BY created_at DESC
+			LIMIT 1
+		) latest ON true`, explorationIDs)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[int64]int64{}
 	for rows.Next() {
 		var eid, ts int64
 		if err := rows.Scan(&eid, &ts); err != nil {

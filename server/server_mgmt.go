@@ -78,7 +78,25 @@ func pathInt(r *http.Request, name string) (int64, bool) {
 	return n, err == nil
 }
 
-func decode(r *http.Request, v any) error { return json.NewDecoder(r.Body).Decode(v) }
+// maxJSONBodyBytes is the default request-body ceiling for JSON endpoints that
+// decode through decode(). The largest legitimate payload is a workspace text
+// file (viewable/editable up to maxWorkspaceRead = 2 MiB as JSON-escaped
+// content), so 8 MiB leaves generous headroom while stopping an unauthenticated
+// or buggy client from making the server buffer gigabytes: without a limit the
+// JSON decoder keeps reading (and allocating) whatever the client sends, and the
+// only backstop is the OS. Handlers with a tighter budget (metadata, categories,
+// …) still wrap the body themselves first; their smaller limit wins.
+const maxJSONBodyBytes = 8 << 20
+
+// decode parses a JSON request body with that ceiling applied.
+func decode(r *http.Request, v any) error {
+	if r.Body != nil {
+		// A nil ResponseWriter is allowed: MaxBytesReader only uses it to ask
+		// net/http to drop the connection early, and skips that when nil.
+		r.Body = http.MaxBytesReader(nil, r.Body, maxJSONBodyBytes)
+	}
+	return json.NewDecoder(r.Body).Decode(v)
+}
 
 // ---------- tasks (delete) ----------
 
@@ -109,8 +127,11 @@ func (s *Server) beginTaskDelete(taskID string) bool {
 // paused on an unreadable row is conservative: a later explicit resume can
 // safely recover it without allowing work to escape an uncertain delete.
 func (s *Server) abortTaskDelete(taskID string) {
-	s.concMu.Lock()
-	defer s.concMu.Unlock()
+	// Read the persisted row BEFORE taking concMu: GetTask is a database round
+	// trip, and the lock must not be held across one. The read is only an input to
+	// the barrier decision; AbortDelete itself is idempotent and re-checks the
+	// barrier, so a concurrent lifecycle commit between the read and the lock
+	// cannot resurrect a task that no longer exists.
 	keepPaused := true
 	if id, err := strconv.ParseInt(taskID, 10, 64); err == nil && s.m != nil && s.m.pg != nil {
 		if persisted, getErr := s.m.pg.GetTask(id); getErr == nil && persisted != nil {
@@ -127,6 +148,8 @@ func (s *Server) abortTaskDelete(taskID string) {
 			keepPaused = false
 		}
 	}
+	s.concMu.Lock()
+	defer s.concMu.Unlock()
 	s.engine.AbortDelete(taskID, keepPaused)
 }
 
@@ -173,9 +196,7 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 			// PostgreSQL is already gone. Complete runtime teardown and return the
 			// auditable counts together with the post-commit cleanup warning.
 			s.engine.StopTask(id)
-			s.taskAgentMu.Lock()
-			delete(s.taskAgents, id)
-			s.taskAgentMu.Unlock()
+			s.dropTaskAgent(id)
 			deleted = true
 			writeCommittedTaskDelete(w, result, err)
 			return
@@ -187,9 +208,7 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 	// resolve it. Now stop and join every task-owned Engine goroutine and clear its
 	// lifecycle maps before releasing the delete barrier.
 	s.engine.StopTask(id)
-	s.taskAgentMu.Lock()
-	delete(s.taskAgents, id)
-	s.taskAgentMu.Unlock()
+	s.dropTaskAgent(id)
 	deleted = true
 	writeJSON(w, 200, result)
 }
@@ -368,7 +387,7 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 		TriggerMergeMode   *string `json:"trigger_merge_mode"`
 		TriggerMaxParallel *int    `json:"trigger_max_parallel"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -2049,19 +2068,34 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build HTTP client with optional proxy.
-	transport := &http.Transport{}
+	// Build HTTP client with optional proxy. The base URL and proxy both come from
+	// the request, so the transport must refuse link-local targets — otherwise
+	// this endpoint is an authenticated SSRF with the response echoed back.
+	transport := &http.Transport{DialContext: guardedDialer().DialContext}
+	proxied := false
 	if p := strings.TrimSpace(req.Proxy); p != "" {
 		if pu, err := url.Parse(p); err == nil {
 			transport.Proxy = http.ProxyURL(pu)
+			proxied = true
 		}
 	}
-	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+	client := &http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: guardRedirects(5)}
 
 	// Try each candidate; return the first that yields a non-empty model list.
 	var lastErr string
 	emptyOK := false
 	for _, c := range candidates {
+		// With a proxy the dial guard only reaches the proxy; the proxy resolves
+		// the target itself, so the link-local check has to happen on the URL the
+		// caller named. Same rule as the custom HTTP tool's proxied branch.
+		if proxied {
+			if u, perr := url.Parse(c.url); perr == nil {
+				if gerr := refuseLinkLocalTarget(r.Context(), u); gerr != nil {
+					lastErr = gerr.Error()
+					continue
+				}
+			}
+		}
 		httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, c.url, nil)
 		if err != nil {
 			lastErr = "构建请求失败: " + err.Error()
@@ -2076,7 +2110,12 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Sprintf("API 返回 %d: %s", resp.StatusCode, string(body[:min(len(body), 512)]))
+			// The response body is upstream-controlled text, and this handler is
+			// reachable by any authenticated user with an arbitrary base_url — so the
+			// body is whatever the endpoint at that URL chose to say, including
+			// another internal service's content. Report the status and the provider's
+			// machine-readable error fields only; never the raw body.
+			lastErr = fmt.Sprintf("API 返回 %d: %s", resp.StatusCode, providerErrorSummary(body))
 			continue
 		}
 		// Both OpenAI and Anthropic return {"data": [{"id": "..."},...]}.
@@ -2109,6 +2148,61 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		lastErr = "未获取到模型列表"
 	}
 	writeJSON(w, 200, map[string]any{"ok": false, "error": lastErr})
+}
+
+// providerErrorSummary extracts the machine-readable error text an LLM provider
+// returns on a failed call, so the UI can show "invalid api key" instead of just
+// a status code. Only known error fields are read (OpenAI's error.message, or a
+// top-level message/error string); an unrecognized body yields the status alone.
+//
+// The raw body is deliberately NOT returned: base_url is caller-supplied, so the
+// response is whatever the endpoint at that URL sent — echoing it back turns this
+// endpoint into a read primitive for any internal HTTP service the dial guard
+// permits (loopback/RFC1918 are allowed by design, see outbound.go).
+func providerErrorSummary(body []byte) string {
+	if len(body) == 0 {
+		return "（无响应体）"
+	}
+	var payload struct {
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return "（响应体非 JSON，已省略）"
+	}
+	var message string
+	if len(payload.Error) > 0 {
+		// OpenAI shape: {"error":{"message":"...","type":"..."}}; some gateways
+		// send a bare string instead.
+		var nested struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		}
+		if json.Unmarshal(payload.Error, &nested) == nil && nested.Message != "" {
+			message = nested.Message
+			if nested.Code != "" {
+				message += " (code=" + nested.Code + ")"
+			}
+		} else {
+			var plain string
+			if json.Unmarshal(payload.Error, &plain) == nil {
+				message = plain
+			}
+		}
+	}
+	if message == "" {
+		message = payload.Message
+	}
+	if message == "" {
+		return "（未提供错误信息）"
+	}
+	// Bounded even though it is a recognized field: a hostile gateway can put a
+	// megabyte in error.message and the UI only needs the first line.
+	if r := []rune(message); len(r) > 300 {
+		message = string(r[:300]) + "…"
+	}
+	return message
 }
 
 // --- prompt template helpers (Go text/template + catalog 白名单) ---

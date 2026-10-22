@@ -10,8 +10,10 @@ import (
 
 func TestAssetUpsertWaitsForCompanyScopeMutation(t *testing.T) {
 	d, assets, companies := testSetup(t)
-	defer d.Close()
-
+	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
+	// plain `defer d.Close()` fires before them — the row-deleting cleanups below would
+	// then run against a closed pool and silently leave test rows in the shared DB.
+	t.Cleanup(func() { d.Close() })
 	stamp := time.Now().UnixNano()
 	domain := fmt.Sprintf("scope-lock-%d.example", stamp)
 	oldCompany, _, err := companies.UpsertCompany(fmt.Sprintf("Scope Lock Old %d", stamp), "")
@@ -90,8 +92,10 @@ func TestAssetUpsertWaitsForCompanyScopeMutation(t *testing.T) {
 
 func TestResolveAndRecomputeUseStableCompanyIDTieBreak(t *testing.T) {
 	d, assets, companies := testSetup(t)
-	defer d.Close()
-
+	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
+	// plain `defer d.Close()` fires before them — the row-deleting cleanups below would
+	// then run against a closed pool and silently leave test rows in the shared DB.
+	t.Cleanup(func() { d.Close() })
 	stamp := time.Now().UnixNano()
 	first, _, err := companies.UpsertCompany(fmt.Sprintf("Tie Break First %d", stamp), "")
 	if err != nil {

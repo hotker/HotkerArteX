@@ -178,7 +178,14 @@ func (s *Server) toolListTasks() actool.CoreTool {
 		"列出所有任务(id/描述/目标/状态/运行时长/父任务/LLM 配置)，编排 agent 用它掌握全局、看哪些任务卡太久、各自用哪个 LLM。运行时长：运行中=创建→现在，终态=创建→最后活动(秒)。llm_profile：任务 planner/worker 用的配置名，(激活配置)=跟随全局激活。",
 		objSchema(map[string]any{}),
 		func(context.Context, json.RawMessage) (actool.Result, error) {
-			lastAct, _ := s.m.PG().LastActivityAll()
+			tasks := s.m.List()
+			expIDs := make([]int64, 0, len(tasks))
+			for _, t := range tasks {
+				if t.ExpID > 0 {
+					expIDs = append(expIDs, t.ExpID)
+				}
+			}
+			lastAct, _ := s.m.PG().LastActivityAll(expIDs)
 			// id -> name to resolve each task's pinned LLM profile.
 			profName := map[int64]string{}
 			if profs, err := s.m.pg.ListProfiles(); err == nil {
@@ -187,7 +194,7 @@ func (s *Server) toolListTasks() actool.CoreTool {
 				}
 			}
 			out := make([]map[string]any, 0)
-			for _, t := range s.m.List() {
+			for _, t := range tasks {
 				status := s.deriveTaskStatus(t)
 				end := lastAct[t.ExpID]
 				if live := s.engine.LastActivity(t.ID); live > end {
@@ -200,8 +207,8 @@ func (s *Server) toolListTasks() actool.CoreTool {
 					dur = end - t.CreatedAt
 				}
 				row := map[string]any{"id": t.ID, "description": t.Description, "goal": t.Goal, "status": status, "run_seconds": dur}
-				if t.ParentRef != "" {
-					row["parent_ref"] = t.ParentRef
+				if ref := t.lifecycleSnapshot().ParentRef; ref != "" {
+					row["parent_ref"] = ref
 				}
 				llmState := t.llmStateSnapshot()
 				if llmState.ProfileID == nil {
@@ -315,7 +322,9 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 				return actool.Errorf(err.Error()), nil
 			}
 			if a.ParentRef != "" {
-				t.ParentRef = a.ParentRef
+				// Guarded like every other lifecycle field: list_tasks reads it from
+				// the same *Task the moment this is published to the manager.
+				t.updateLifecycle(func(st *taskLifecycleState) { st.ParentRef = a.ParentRef })
 				if id, e := strconv.ParseInt(t.ID, 10, 64); e == nil {
 					_ = s.m.PG().SetParentRef(id, a.ParentRef)
 				}

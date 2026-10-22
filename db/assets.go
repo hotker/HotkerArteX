@@ -1153,6 +1153,81 @@ func pageClause(args *[]any, limit, offset int) string {
 	return q
 }
 
+// HostsForTask returns the host names a task may read captured traffic for
+// (domain, IP and the hostname of each URL). Used to scope reads over the
+// process-wide traffic index: an agent may read captures for its own task's
+// targets, not for another engagement's.
+//
+// Two sets are unioned on purpose. task_ids covers what this task discovered.
+// scopeTargetCTE adds assets that BELONG to the task's declared scope but were
+// discovered elsewhere — a company or root_domain scope authorizes the whole
+// company / domain tree, and the capture for api.example.com is in scope even
+// when the task has not run a scan that re-upserted that row under its own id.
+// Declared scope is what the operator authorized; restricting to task_ids alone
+// would hide traffic the operator explicitly allowed.
+//
+// taskID<=0 or no assets yields an empty list, which callers must treat as
+// "nothing in scope" — not as "unrestricted".
+func (s *AssetStore) HostsForTask(taskID int64) ([]string, error) {
+	if taskID <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(`WITH `+scopeTargetCTE+`
+SELECT DISTINCT h FROM (
+  SELECT lower(a.domain) AS h FROM assets a WHERE $1 = ANY(a.task_ids) AND COALESCE(a.domain,'') <> ''
+  UNION
+  SELECT lower(a.ip) FROM assets a WHERE $1 = ANY(a.task_ids) AND COALESCE(a.ip,'') <> ''
+  UNION
+  SELECT lower(a.url) FROM assets a WHERE $1 = ANY(a.task_ids) AND COALESCE(a.url,'') <> ''
+  UNION
+  SELECT lower(a.domain) FROM assets a JOIN target t ON t.id=a.id WHERE COALESCE(a.domain,'') <> ''
+  UNION
+  SELECT lower(a.ip) FROM assets a JOIN target t ON t.id=a.id WHERE COALESCE(a.ip,'') <> ''
+  UNION
+  SELECT lower(a.url) FROM assets a JOIN target t ON t.id=a.id WHERE COALESCE(a.url,'') <> ''
+) hosts WHERE h <> ''`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	seen := map[string]bool{}
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		for _, h := range hostVariants(raw) {
+			if !seen[h] {
+				seen[h] = true
+				out = append(out, h)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// hostVariants normalizes one stored asset value into the host keys the traffic
+// index uses (exchange.host is URL.Hostname(), lowercased). A URL contributes its
+// hostname; a bare value is returned as-is. IPv6 brackets are stripped so
+// "[::1]" and "::1" compare equal.
+func hostVariants(raw string) []string {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" {
+		return nil
+	}
+	if strings.Contains(raw, "://") {
+		if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
+			return []string{strings.ToLower(u.Hostname())}
+		}
+		return nil
+	}
+	return []string{strings.Trim(raw, "[]")}
+}
+
 // QueryByTask returns assets rows that have a given task_id in task_ids.
 func (s *AssetStore) QueryByTask(taskID int64, typ string, limit, offset int) ([]*Asset, error) {
 	q := `SELECT id, type, company_id, array_to_json(task_ids)::text,

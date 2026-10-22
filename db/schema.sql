@@ -241,6 +241,10 @@ END $$;
 CREATE INDEX IF NOT EXISTS idx_expnodes_part     ON exploration_nodes(exploration_id, kind);
 CREATE INDEX IF NOT EXISTS idx_expnodes_frontier ON exploration_nodes(exploration_id, priority DESC)
     WHERE kind='intent' AND state='open';
+-- 调度器每 5 秒按 updated_at 水位线拉「新达成目标」，没有这个部分索引就是全表扫
+-- （目标节点数量随时间累积，成本随历史而不是随新事件增长）。
+CREATE INDEX IF NOT EXISTS idx_expnodes_goal_met ON exploration_nodes(updated_at)
+    WHERE kind='goal' AND state='met';
 DROP TRIGGER IF EXISTS trg_expnodes_upd ON exploration_nodes;
 CREATE TRIGGER trg_expnodes_upd BEFORE UPDATE ON exploration_nodes
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
@@ -1067,6 +1071,8 @@ CREATE TABLE IF NOT EXISTS intercept_pending (
 );
 CREATE INDEX IF NOT EXISTS idx_intercept_pending_status ON intercept_pending(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_intercept_pending_task   ON intercept_pending(task_id, created_at DESC);
+-- Fast “is there anything pending for a task?” checks used by the sessions tab.
+CREATE INDEX IF NOT EXISTS idx_intercept_pending_task_pending ON intercept_pending(task_id, created_at DESC) WHERE status='pending';
 -- 补旧库:reason 列(已发版,加列要带 IF NOT EXISTS)。
 ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT '';
 -- Detail payloads are lazy-loaded; NULL preserves the meaning of legacy history.
@@ -1105,6 +1111,11 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_time ON findings(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, created_at DESC);
+-- node_id 是「按探索节点反查漏洞」的键：FindingIDByNodeID / PopulateFindingTrafficIDs /
+-- SetFindingReportVersionByNodeID / DeleteFinding 都按它查，且全在报告与状态更新的写路径上。
+CREATE INDEX IF NOT EXISTS idx_findings_node ON findings(node_id) WHERE node_id IS NOT NULL;
+-- 统计页与筛选项要对 vulnclass 做 DISTINCT，缺索引时每 5 秒全表扫一次。
+CREATE INDEX IF NOT EXISTS idx_findings_vulnclass ON findings(vulnclass) WHERE vulnclass <> '';
 -- 「按资产」视图靠 asset_ids @> '[<id>]' 反查发现,没有这个 GIN 索引就是全表扫。
 CREATE INDEX IF NOT EXISTS idx_findings_asset_ids ON findings USING GIN(asset_ids jsonb_path_ops);
 

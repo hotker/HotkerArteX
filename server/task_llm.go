@@ -29,6 +29,20 @@ type taskAgentBundle struct {
 	main           *agent.MainAgent
 }
 
+// stopCompactor waits (bounded) for the planner's detached cold-node compaction
+// to finish. Called when the bundle is discarded — task delete, profile rebuild —
+// so a compaction in flight cannot write digest nodes into a store that is being
+// torn down. The planner's compactor goroutine is otherwise the one engine-owned
+// writer that outlives its task.
+func (b *taskAgentBundle) stopCompactor() {
+	if b == nil || b.pl == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	b.pl.StopCompactor(ctx, 10*time.Second)
+}
+
 type llmAuditProfile struct {
 	ID     int64  `json:"id"`
 	Name   string `json:"name"`
@@ -543,10 +557,28 @@ func (s *Server) taskRuntimeAvailable(t *Task, agentKeys ...string) bool {
 	return true
 }
 
+// invalidateTaskAgents drops every cached bundle (a profile edit invalidates all
+// of them). Compactors are stopped outside the lock: each waits on a background
+// goroutine, and holding taskAgentMu across that would stall every task's agent
+// lookup for up to the timeout.
 func (s *Server) invalidateTaskAgents() {
 	s.taskAgentMu.Lock()
+	old := s.taskAgents
 	s.taskAgents = map[string]*taskAgentBundle{}
 	s.taskAgentMu.Unlock()
+	for _, b := range old {
+		b.stopCompactor()
+	}
+}
+
+// dropTaskAgent removes one task's cached bundle and stops its detached
+// compactor. Used wherever a task is deleted or archived.
+func (s *Server) dropTaskAgent(taskID string) {
+	s.taskAgentMu.Lock()
+	bundle := s.taskAgents[taskID]
+	delete(s.taskAgents, taskID)
+	s.taskAgentMu.Unlock()
+	bundle.stopCompactor()
 }
 
 func (s *Server) agentsForTask(t *Task) *taskAgentBundle {

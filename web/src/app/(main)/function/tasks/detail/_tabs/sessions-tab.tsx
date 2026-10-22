@@ -50,9 +50,10 @@ import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSideQuestions } from "@/hooks/use-side-questions";
-import { api, sseUrl } from "@/lib/api";
+import { api, markSSEClosed, sseUrl, watchSSE } from "@/lib/api";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
 import { MOCK } from "@/lib/mock/enabled";
+import { visibleInterval } from "@/lib/polling";
 import { isBtwCommand } from "@/lib/side-questions";
 import { taskAssetSourceLabel, taskAssetTypeLabel } from "@/lib/task-assets";
 import type {
@@ -794,10 +795,10 @@ export function SessionsTab({ taskId }: { taskId: string }) {
           // Polling is best-effort; the next interval retries automatically.
         });
     void load();
-    const t = setInterval(load, 5000);
+    const stop = visibleInterval(load, 5000);
     return () => {
       alive = false;
-      clearInterval(t);
+      stop();
     };
   }, [taskId]);
 
@@ -817,10 +818,10 @@ export function SessionsTab({ taskId }: { taskId: string }) {
         });
     };
     void load();
-    const timer = setInterval(load, 2000);
+    const stop = visibleInterval(load, 2000);
     return () => {
       alive = false;
-      clearInterval(timer);
+      stop();
     };
   }, [taskId]);
 
@@ -836,10 +837,10 @@ export function SessionsTab({ taskId }: { taskId: string }) {
           // Polling is best-effort; the next interval retries automatically.
         });
     void load();
-    const timer = setInterval(load, 10_000);
+    const stop = visibleInterval(load, 10_000);
     return () => {
       alive = false;
-      clearInterval(timer);
+      stop();
     };
   }, [taskId]);
 
@@ -847,18 +848,18 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     let alive = true;
     const load = () =>
       api
-        .interceptTask(taskId)
+        .interceptTaskPending(taskId)
         .then((rows) => {
-          if (alive) setPendingIntercepts(rows.filter((r) => r.status === "pending"));
+          if (alive) setPendingIntercepts(rows);
         })
         .catch(() => {
           // Polling is best-effort; the next interval retries automatically.
         });
     void load();
-    const t = setInterval(load, 5000);
+    const stop = visibleInterval(load, 5000);
     return () => {
       alive = false;
-      clearInterval(t);
+      stop();
     };
   }, [taskId]);
 
@@ -969,69 +970,80 @@ export function SessionsTab({ taskId }: { taskId: string }) {
           };
         });
         // Open the single task SSE from the snapshot cursor.
-        const es = new EventSource(
-          sseUrl(`/api/exploration/activity/stream?task=${encodeURIComponent(taskId)}&since=${snapshotRef.current}`),
-        );
-        esRef.current = es;
-        es.onopen = () => setSseLive(true);
-        es.onerror = () => setSseLive(false); // EventSource auto-reconnects; DB compensates the gap
-        es.onmessage = (e) => {
-          let a: Activity;
-          try {
-            a = JSON.parse(e.data) as Activity;
-          } catch {
-            return; // ignore malformed frame
-          }
-          if ((a.kind === "llm_switch" || a.kind === "llm_failover") && !llmToastSeqRef.current.has(a.seq)) {
-            llmToastSeqRef.current.add(a.seq);
-            const transition = a.metadata?.llm_transition;
-            if (transition?.mode === "exhausted" || a.is_error) {
-              toast.error(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
-            } else if (transition?.mode === "automatic") {
-              toast.success(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
-            } else {
-              toast.info(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
+        //
+        // open() is separate from the boot chain because watchSSE reopens the
+        // stream after a transport drop: a closed stream that is never reopened
+        // leaves the transcript frozen on a page the user is still watching.
+        const open = () => {
+          if (!alive) return;
+          const es = new EventSource(
+            sseUrl(`/api/exploration/activity/stream?task=${encodeURIComponent(taskId)}&since=${snapshotRef.current}`),
+          );
+          esRef.current = es;
+          es.onopen = () => setSseLive(true);
+          // watchSSE decides whether the drop was auth (→ /login) or transport
+          // (→ reopen). A revoked token used to just turn the dot off while
+          // EventSource retried a dead credential forever.
+          watchSSE(es, open, () => setSseLive(false));
+          es.onmessage = (e) => {
+            let a: Activity;
+            try {
+              a = JSON.parse(e.data) as Activity;
+            } catch {
+              return; // ignore malformed frame
             }
-            void api
-              .taskLLMResolution(taskId)
-              .then((value) => {
-                if (alive) setLLMResolutions(value);
-              })
-              .catch(() => {
-                // The periodic resolver poll will retry if this event-triggered refresh fails.
-              });
-          }
-          const k = sessionKeyOf(a);
-          setStore((prev) => {
-            const cur = prev[k] ?? emptyState();
-            const activeK = activeKeyRef.current;
-            // Merge into sessions that are loaded, actively loading, or the current
-            // view (so returning is instant + a frame that lands mid-load isn't lost).
-            // A cold, inactive session also keeps a tiny accounting tail so the
-            // sidebar can add the latest unfinished usage without loading history.
-            if (!cur.loaded && !cur.loading && k !== activeK) {
-              const accountingItems =
-                a.kind === "usage" || a.kind === "result" ? mergeBySeq(cur.items, [a]).slice(-4) : cur.items;
-              return {
-                ...prev,
-                [k]: { ...cur, items: accountingItems, lastTs: a.ts, unread: cur.unread + 1 },
-              };
+            if ((a.kind === "llm_switch" || a.kind === "llm_failover") && !llmToastSeqRef.current.has(a.seq)) {
+              llmToastSeqRef.current.add(a.seq);
+              const transition = a.metadata?.llm_transition;
+              if (transition?.mode === "exhausted" || a.is_error) {
+                toast.error(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
+              } else if (transition?.mode === "automatic") {
+                toast.success(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
+              } else {
+                toast.info(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
+              }
+              void api
+                .taskLLMResolution(taskId)
+                .then((value) => {
+                  if (alive) setLLMResolutions(value);
+                })
+                .catch(() => {
+                  // The periodic resolver poll will retry if this event-triggered refresh fails.
+                });
             }
-            let items = mergeBySeq(cur.items, [a]);
-            // Memory bound: trim oldest when over cap (older re-fetched on scroll-up),
-            // but never while the user is reading this session's history (scrolled up).
-            let hasMore = cur.hasMore;
-            let earliestSeq = cur.earliestSeq;
-            const trimmable = k !== activeK || atBottomRef.current;
-            if (trimmable && items.length > MAX_KEEP) {
-              items = items.slice(items.length - MAX_KEEP);
-              hasMore = true;
-              earliestSeq = items[0].seq;
-            }
-            const unread = k === activeK ? 0 : cur.unread + 1;
-            return { ...prev, [k]: { ...cur, items, lastTs: a.ts, unread, hasMore, earliestSeq } };
-          });
+            const k = sessionKeyOf(a);
+            setStore((prev) => {
+              const cur = prev[k] ?? emptyState();
+              const activeK = activeKeyRef.current;
+              // Merge into sessions that are loaded, actively loading, or the current
+              // view (so returning is instant + a frame that lands mid-load isn't lost).
+              // A cold, inactive session also keeps a tiny accounting tail so the
+              // sidebar can add the latest unfinished usage without loading history.
+              if (!cur.loaded && !cur.loading && k !== activeK) {
+                const accountingItems =
+                  a.kind === "usage" || a.kind === "result" ? mergeBySeq(cur.items, [a]).slice(-4) : cur.items;
+                return {
+                  ...prev,
+                  [k]: { ...cur, items: accountingItems, lastTs: a.ts, unread: cur.unread + 1 },
+                };
+              }
+              let items = mergeBySeq(cur.items, [a]);
+              // Memory bound: trim oldest when over cap (older re-fetched on scroll-up),
+              // but never while the user is reading this session's history (scrolled up).
+              let hasMore = cur.hasMore;
+              let earliestSeq = cur.earliestSeq;
+              const trimmable = k !== activeK || atBottomRef.current;
+              if (trimmable && items.length > MAX_KEEP) {
+                items = items.slice(items.length - MAX_KEEP);
+                hasMore = true;
+                earliestSeq = items[0].seq;
+              }
+              const unread = k === activeK ? 0 : cur.unread + 1;
+              return { ...prev, [k]: { ...cur, items, lastTs: a.ts, unread, hasMore, earliestSeq } };
+            });
+          };
         };
+        open();
       })
       .catch((err) => {
         if (!alive || reqTokenRef.current.mainboot !== token) return;
@@ -1042,6 +1054,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
 
     return () => {
       alive = false;
+      markSSEClosed(esRef.current);
       esRef.current?.close();
       esRef.current = null;
     };
@@ -1059,10 +1072,10 @@ export function SessionsTab({ taskId }: { taskId: string }) {
           // The next poll retries; Worker controls and transcripts remain available.
         });
     void load();
-    const timer = setInterval(load, 5000);
+    const stop = visibleInterval(load, 5000);
     return () => {
       active = false;
-      clearInterval(timer);
+      stop();
     };
   }, [taskId]);
 
@@ -1099,10 +1112,10 @@ export function SessionsTab({ taskId }: { taskId: string }) {
           // Polling is best-effort; the next interval retries automatically.
         });
     void load();
-    const t = setInterval(load, 5000);
+    const stop = visibleInterval(load, 5000);
     return () => {
       active = false;
-      clearInterval(t);
+      stop();
     };
   }, [taskId]);
 

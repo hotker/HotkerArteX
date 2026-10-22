@@ -11,7 +11,8 @@ cleanup() { kill 0 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
 # 后端（普通 go run，不内嵌前端）；并发 work agent 数在「系统设置」里配置。
-go run ./cmd/artex -addr :8787 -proxy 127.0.0.1:8788 &
+# 只绑回环：开发机不需要把控制台暴露给同网段（要联调真机时改成 -addr :8787）。
+go run ./cmd/artex -addr 127.0.0.1:8787 -proxy 127.0.0.1:8788 &
 
 # 前端热更新（Vite/Next dev server，/api 反代到 :8787）。
 ( cd web && npm run dev ) &

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { toast } from "sonner";
 
-import { sseUrl } from "@/lib/api";
+import { markSSEClosed, sseUrl, watchSSE } from "@/lib/api";
 import { isBtwCommand, type SideExchange, type SideHistory, sideAPI } from "@/lib/side-questions";
 
 // crypto.randomUUID 仅在安全上下文可用(https/localhost);经 IP+http 访问时降级。
@@ -128,24 +128,42 @@ export function useSideQuestions(parent: string | null) {
   useEffect(() => {
     if (!runningID) return;
     const version = epoch.current;
-    const stream = new EventSource(sseUrl(`/api/side-questions/${runningID}/events`));
-    stream.addEventListener("snapshot", (event) => {
-      if (version !== epoch.current) return;
-      try {
-        const item = JSON.parse((event as MessageEvent).data) as SideExchange;
-        if (item.id !== runningID) return;
-        setItems((old) => merge(old, [item]));
-        restoreFailedDraft([item]);
-        if (item.status !== "running") stream.close();
-      } catch {
-        setError("旁路数据解析失败，请重新打开面板");
-      }
-    });
-    stream.addEventListener("cleared", () => {
-      stream.close();
-      if (version === epoch.current) setItems([]);
-    });
-    return () => stream.close();
+    // open() is re-entrant: watchSSE calls it back after a transport drop so a
+    // long-running side question keeps streaming. current tracks the live
+    // handle so an intentional close (done / cleared) never triggers a reopen.
+    let current: EventSource | null = null;
+    const open = () => {
+      const stream = new EventSource(sseUrl(`/api/side-questions/${runningID}/events`));
+      current = stream;
+      const stop = () => {
+        markSSEClosed(stream);
+        stream.close();
+        if (current === stream) current = null;
+      };
+      stream.addEventListener("snapshot", (event) => {
+        if (version !== epoch.current) return;
+        try {
+          const item = JSON.parse((event as MessageEvent).data) as SideExchange;
+          if (item.id !== runningID) return;
+          setItems((old) => merge(old, [item]));
+          restoreFailedDraft([item]);
+          if (item.status !== "running") stop();
+        } catch {
+          setError("旁路数据解析失败，请重新打开面板");
+        }
+      });
+      stream.addEventListener("cleared", () => {
+        stop();
+        if (version === epoch.current) setItems([]);
+      });
+      watchSSE(stream, open);
+    };
+    open();
+    return () => {
+      markSSEClosed(current);
+      current?.close();
+      current = null;
+    };
   }, [runningID, streamEpoch, restoreFailedDraft]);
 
   const ask = async (input: string) => {
@@ -172,10 +190,12 @@ export function useSideQuestions(parent: string | null) {
         setError((err as Error).message);
       }
     } finally {
-      if (version === epoch.current) {
-        submitting.current = false;
-        setBusy(false);
-      }
+      // The in-flight lock must always be released, even when the parent changed
+      // while the request was outstanding: `submitting` is what gates the
+      // composer, and leaking it true silently disables sending for the rest of
+      // the page's life. Only the React state writes are epoch-scoped.
+      submitting.current = false;
+      if (version === epoch.current) setBusy(false);
     }
   };
 
@@ -208,8 +228,11 @@ export function useSideQuestions(parent: string | null) {
     } catch (err) {
       if (version === epoch.current) toast.error((err as Error).message);
     } finally {
+      // Same rule as ask(): release the lock unconditionally, scope only the
+      // state writes to the current parent. (clear() itself bumped the epoch, so
+      // the version check passes unless the parent changed underneath it.)
+      submitting.current = false;
       if (version === epoch.current) {
-        submitting.current = false;
         setBusy(false);
         setStreamEpoch((value) => value + 1);
         void load();

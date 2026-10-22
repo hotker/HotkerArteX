@@ -4,6 +4,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,11 @@ const (
 	loginFailWindow = 15 * time.Minute
 	loginLock       = 15 * time.Minute
 	maxLoginFails   = 5
+	// maxGlobalLoginFails / globalLoginCooldown bound brute force that rotates
+	// source IPs (each per-IP key then never reaches maxLoginFails). The ceiling is
+	// far above a human mistyping a password and far below a useful attack rate.
+	maxGlobalLoginFails = 20
+	globalLoginCooldown = 5 * time.Minute
 )
 
 type loginFailEntry struct {
@@ -34,17 +40,76 @@ type loginFailEntry struct {
 type loginLimiter struct {
 	mu    sync.Mutex
 	byKey map[string]*loginFailEntry
+	// maxFails is the per-key failure budget; 0 means maxLoginFails.
+	maxFails int
+	// global is a sliding window of recent failures regardless of source. It is
+	// the backstop for the per-key limiter: keeping the key space populated by
+	// rotating source IPs no longer makes brute force free.
+	globalFailures []time.Time
+}
+
+func (l *loginLimiter) budget() int {
+	if l.maxFails > 0 {
+		return l.maxFails
+	}
+	return maxLoginFails
+}
+
+// globalCooldown reports how long the process should keep refusing login attempts
+// after a burst of failures from many sources. Recovery is automatic and costs an
+// operator at most loginLock when someone is actively attacking.
+func (l *loginLimiter) globalCooldown() time.Duration {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	cut := now.Add(-loginFailWindow)
+	kept := l.globalFailures[:0]
+	for _, t := range l.globalFailures {
+		if t.After(cut) {
+			kept = append(kept, t)
+		}
+	}
+	l.globalFailures = kept
+	if len(l.globalFailures) < maxGlobalLoginFails {
+		return 0
+	}
+	wait := time.Until(l.globalFailures[len(l.globalFailures)-1].Add(globalLoginCooldown))
+	if wait < 0 {
+		return 0
+	}
+	return wait
+}
+
+func (l *loginLimiter) noteGlobalFail() {
+	l.mu.Lock()
+	l.globalFailures = append(l.globalFailures, time.Now())
+	l.mu.Unlock()
 }
 
 var loginLim = &loginLimiter{byKey: map[string]*loginFailEntry{}}
 
-// clientIP 取请求来源 IP：优先 X-Forwarded-For 首段（反代部署），否则 RemoteAddr。
-// 不校验反代可信链——本项目是单管理员工具，XFF 伪造的最坏后果只是把限流打到
-// 别人头上（自 DoS），不会绕过它。
+// trustedProxyEnv opts into honouring X-Forwarded-For. It is off by default
+// because the header is client-supplied: since the throttle key contains the
+// source IP, honouring an unvalidated XFF lets an attacker step the key with
+// every request (X-Forwarded-For: 10.0.0.1, 10.0.0.2, …) and never trip the
+// lock, which turns the 15-minute lockout into no protection at all. Only set
+// this when a reverse proxy in front of ARTEX is what writes the header.
+const trustedProxyEnv = "ARTEX_TRUST_XFF"
+
+func trustForwardedFor() bool {
+	v := strings.TrimSpace(os.Getenv(trustedProxyEnv))
+	return v == "1" || strings.EqualFold(v, "true")
+}
+
+// clientIP 取请求来源 IP。默认只信 RemoteAddr（TCP 对端，无法伪造）；
+// 只有在显式配置了 ARTEX_TRUST_XFF=1（确实部署在反代之后）时才取 X-Forwarded-For
+// 首段，否则伪造 XFF 就能逐个换 key 绕过登录限流。
 func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if first := strings.TrimSpace(strings.Split(xff, ",")[0]); first != "" {
-			return first
+	if trustForwardedFor() {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if first := strings.TrimSpace(strings.Split(xff, ",")[0]); first != "" {
+				return first
+			}
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -92,7 +157,7 @@ func (l *loginLimiter) noteFail(key string) time.Duration {
 	}
 	e.fails++
 	e.lastFail = now
-	if e.fails >= maxLoginFails && e.lockedOut.Before(now) {
+	if e.fails >= l.budget() && e.lockedOut.Before(now) {
 		e.lockedOut = now.Add(loginLock)
 	}
 	until := time.Until(e.lockedOut)
@@ -109,8 +174,49 @@ func (l *loginLimiter) clear(key string) {
 	l.mu.Unlock()
 }
 
+// initLim throttles the first-run password setup separately from login: it runs
+// bcrypt before the "already set" check can fail, so an unauthenticated caller
+// could otherwise burn CPU at will, and whoever reaches the port first wins the
+// installation. Three tries per window in each direction is plenty for a human
+// who mistyped a password; it is not enough to grind bcrypt or to race a real
+// operator meaningfully.
+var initLim = &loginLimiter{byKey: map[string]*loginFailEntry{}, maxFails: maxInitTries}
+
+const maxInitTries = 3
+
+// initThrottled reports whether setup attempts from this source should be refused.
+func initThrottled(w http.ResponseWriter, r *http.Request) bool {
+	key := "init|" + clientIP(r)
+	if until := initLim.lockedUntil(key); !until.IsZero() {
+		secs := int(time.Until(until).Seconds()) + 1
+		log.Printf("[auth] 初始化密码尝试过多 ip=%s 剩余 %ds", clientIP(r), secs)
+		writeErr(w, http.StatusTooManyRequests, "初始化尝试过多，请 "+strconv.Itoa(secs)+" 秒后重试")
+		return true
+	}
+	return false
+}
+
+// initNoteAttempt counts one setup attempt (success or failure) against the source.
+func initNoteAttempt(r *http.Request) {
+	key := "init|" + clientIP(r)
+	if d := initLim.noteFail(key); d > 0 {
+		log.Printf("[auth] 初始化密码连续尝试 %d 次，锁定 %ds", maxInitTries, int(d.Seconds()))
+	}
+}
+
+func initDone(r *http.Request) { initLim.clear("init|" + clientIP(r)) }
+
 // loginThrottled 在登录处理器最前面调用：命中锁定期则直接 429 并返回 true。
 func loginThrottled(w http.ResponseWriter, r *http.Request, username string) bool {
+	// 全局失败预算：per-IP key 只能挡住「同一个来源」的爆破。伪造 XFF（未开
+	// ARTEX_TRUST_XFF 时已无效）或从多个出口 IP 轮换仍能把每个 key 的失败数
+	// 摊薄到阈值以下，所以再加一道与来源无关的总量限制——它不锁定任何人，
+	// 只是在窗口内失败太多时把后续尝试挡在门外，窗口一过自动恢复。
+	if wait := loginLim.globalCooldown(); wait > 0 {
+		log.Printf("[auth] 全局登录失败过多，暂停受理 %.0fs", wait.Seconds())
+		writeErr(w, http.StatusTooManyRequests, "登录尝试过于频繁，请 "+strconv.Itoa(int(wait.Seconds())+1)+" 秒后重试")
+		return true
+	}
 	key := clientIP(r) + "|" + username
 	if until := loginLim.lockedUntil(key); !until.IsZero() {
 		secs := int(time.Until(until).Seconds()) + 1
@@ -123,6 +229,7 @@ func loginThrottled(w http.ResponseWriter, r *http.Request, username string) boo
 
 func loginNoteFail(r *http.Request, username string) {
 	remain := loginLim.noteFail(clientIP(r) + "|" + username)
+	loginLim.noteGlobalFail()
 	log.Printf("[auth] 登录失败 ip=%s user=%q", clientIP(r), username)
 	if remain > 0 {
 		log.Printf("[auth] 登录连续失败 %d 次，锁定 %ds", maxLoginFails, int(remain.Seconds()))

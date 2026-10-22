@@ -64,6 +64,7 @@ import type {
   LLMRetryOverride,
   LLMRetryPolicy,
   LLMTask,
+  LogLine,
   MCPServer,
   MCPTool,
   MissingSkill,
@@ -114,6 +115,37 @@ function getToken(): string | null {
   return localStorage.getItem("artex_token");
 }
 
+// ApiError carries the HTTP status so callers can tell "this record does not
+// exist" (404) from "the request failed" (5xx / network). Rendering a transient
+// failure as "已删除" is worse than an error: it asserts data loss that did not
+// happen and offers no way to retry.
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+// handleUnauthorized drops the stale credential and sends the browser to /login.
+//
+// Shared by the fetch client and the EventSource helpers: an expired or revoked
+// token fails both the same way, and EventSource cannot see the status code — a
+// rejected stream just fires onerror, so the SSE side learns about 401 only by
+// probing a normal request. Without this, a long-lived task page kept a dead
+// stream retrying forever and every poll quietly 401'd while the UI looked live.
+export function handleUnauthorized(): void {
+  if (typeof window === "undefined") return;
+  localStorage.removeItem("artex_token");
+  document.cookie = "artex_token=; path=/; max-age=0";
+  // Already on /login (or a login attempt is in flight): do not reload the page
+  // out from under the user.
+  if (window.location.pathname === "/login") return;
+  window.location.href = "/login";
+}
+
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   if (MOCK) {
     // 动态 import：仅在 MOCK 构建才实际执行，生产构建（MOCK=false 被内联折叠）
@@ -131,12 +163,8 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
     },
   });
   if (r.status === 401) {
-    if (typeof window !== "undefined") {
-      localStorage.removeItem("artex_token");
-      document.cookie = "artex_token=; path=/; max-age=0";
-      window.location.href = "/login";
-    }
-    throw new Error("未授权");
+    handleUnauthorized();
+    throw new ApiError("未授权", 401);
   }
   if (!r.ok) {
     const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
@@ -149,7 +177,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // Keep the status-based fallback for empty or non-JSON error responses.
     }
-    throw new Error(message);
+    throw new ApiError(message, r.status);
   }
   if (r.status === 204) return undefined as T;
   return r.json();
@@ -170,19 +198,136 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
 // to the Go backend on :8787, whose CORS is open.
 //
 // Override either default with NEXT_PUBLIC_SSE_BASE (set it to "" to force same-origin).
-// Token is appended as ?token= because SSE can't carry cookies cross-origin.
+//
+// The token is appended as ?token= ONLY for a cross-origin stream: EventSource
+// carries no Authorization header, and cross-origin it also drops the cookie
+// (withCredentials defaults to false). Same-origin streams need neither — the
+// artex_token cookie is sent automatically — and putting a 7-day admin JWT in the
+// URL is a real leak: it lands in reverse-proxy access logs, browser history and
+// any Referer derived from the URL. Cross-origin is dev-only (`next dev` on
+// :3000 → Go on :8787), where the query fallback is the only option.
 // 演示用 Markdown 报告（mockReport）已迁入 lib/mock/handler.ts 并随之被
 // resolveAlias 在生产构建中剔除；report() 的 mock 分支通过动态 import 调用它。
 
+// isCrossOrigin reports whether an absolute URL points at a different origin
+// than the page. During SSR (no window) there is no cookie jar, so the stream is
+// treated as cross-origin to keep the query fallback available.
+function isCrossOrigin(base: string): boolean {
+  if (typeof window === "undefined") return true;
+  try {
+    return new URL(base).origin !== window.location.origin;
+  } catch {
+    return true; // unparsable base: be conservative and keep the token
+  }
+}
+
 export function sseUrl(path: string): string {
-  const base =
+  const base = apiBase();
+  const crossOrigin = base !== "" && isCrossOrigin(base);
+  const token = crossOrigin ? getToken() : null;
+  const sep = path.includes("?") ? "&" : "?";
+  return token ? `${base}${path}${sep}token=${encodeURIComponent(token)}` : `${base}${path}`;
+}
+
+// watchSSE wires the lifecycle every EventSource in the app needs.
+//
+// EventSource has no way to read the HTTP status: an expired or revoked token
+// (or a password change, which bumps the token generation) is indistinguishable
+// from a network blip — the browser just fires onerror and silently retries
+// forever. The old handlers only flipped a "live" dot off, so a page left open
+// overnight showed a stale transcript and never told the user to log in again.
+//
+// On error this probes an authenticated endpoint (GET /api/stats):
+//   - 401 → the token itself is rejected: clear it and bounce to /login.
+//   - ok  → the server is reachable and this session is fine, so the failure is
+//     transport-level (proxy restart, laptop sleep, backend restart). Close and
+//     reopen the stream so the retry starts from a clean connection instead of
+//     inheriting EventSource's backoff.
+//   - offline → the backend is unreachable; reopen anyway, the token is fine.
+//
+// reopen must create a fresh EventSource, assign it to the caller's ref, and
+// attach its listeners (calling watchSSE again). onError reports why the stream
+// died so the caller can flip its "live" indicator.
+export function watchSSE(
+  es: EventSource,
+  reopen: () => void,
+  onError?: (reason: "auth" | "transport" | "offline") => void,
+): void {
+  let disposed = false;
+  const originalOnError = es.onerror;
+  es.onerror = (event) => {
+    originalOnError?.call(es, event);
+    if (disposed) return;
+    es.close(); // stop EventSource's own retry loop while we decide
+    void probeSession()
+      .then((state) => {
+        if (disposed) return;
+        if (state === "unauthorized") {
+          onError?.("auth");
+          handleUnauthorized();
+          return;
+        }
+        if (state === "ok") {
+          onError?.("transport");
+          reopen();
+          return;
+        }
+        onError?.("offline");
+        reopen(); // backend unreachable: keep trying, the token is fine
+      })
+      .catch(() => {
+        // Probe itself failed (offline). Retry later via reopen, which carries
+        // EventSource's own retry behaviour for the stream.
+        if (!disposed) {
+          onError?.("offline");
+          reopen();
+        }
+      });
+  };
+  // A caller that closes the stream for good should call markSSEClosed.
+  (es as EventSourceWithDispose).__dispose = () => {
+    disposed = true;
+  };
+}
+
+export type AuthProbe = "ok" | "unauthorized" | "offline";
+
+type EventSourceWithDispose = EventSource & { __dispose?: () => void };
+
+// markSSEClosed detaches watchSSE's handler. Call it in the effect cleanup so a
+// deliberate close does not trigger the reconnect probe.
+export function markSSEClosed(es: EventSource | null): void {
+  if (es) (es as EventSourceWithDispose).__dispose?.();
+}
+
+// apiBase is the origin the SSE streams use (empty = same-origin).
+function apiBase(): string {
+  return (
     process.env.NEXT_PUBLIC_SSE_BASE ??
     (process.env.NODE_ENV !== "production" && typeof window !== "undefined"
       ? `${window.location.protocol}//${window.location.hostname}:8787`
-      : "");
+      : "")
+  );
+}
+
+// probeSession asks an authenticated endpoint whether this session still works.
+// /api/auth/status is deliberately NOT used: it is exempt from the JWT check, so
+// it answers 200 even with a dead token and can never report a 401.
+export async function probeSession(): Promise<AuthProbe> {
   const token = getToken();
-  const sep = path.includes("?") ? "&" : "?";
-  return token ? `${base}${path}${sep}token=${encodeURIComponent(token)}` : `${base}${path}`;
+  try {
+    const r = await fetch(`${apiBase()}/api/stats`, {
+      headers: {
+        Accept: "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      credentials: "include",
+    });
+    if (r.status === 401) return "unauthorized";
+    return "ok"; // answered at all: transport is up, session is accepted
+  } catch {
+    return "offline";
+  }
 }
 
 const get = <T>(p: string) => http<T>(p);
@@ -230,7 +375,10 @@ export const api = {
   initPassword: (password: string) => post<{ token: string }>("/auth/init", { password }),
   // 改密码同时提升令牌世代，吊销所有旧 token；响应带回一个新 token 供当前会话续用。
   changePassword: (oldPassword: string, newPassword: string) =>
-    post<{ ok: boolean; token?: string }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
+    post<{ ok: boolean; token?: string }>("/auth/change-password", {
+      old_password: oldPassword,
+      new_password: newPassword,
+    }),
 
   // ---- tasks ----
   tasks: () =>
@@ -799,6 +947,14 @@ export const api = {
   // index handed back to the filesystem. Evidence bound to findings is kept.
   trafficDeleteAll: () => del<{ deleted: number; reclaimed: number }>(`/traffic/all`),
 
+  // ---- backend logs (日志页) ----
+  // Older lines than `before` (0 = newest page). Pages through the shared client
+  // so an expired token redirects to /login like every other request.
+  logsHistory: (before: number, limit = 200) =>
+    get<{ items: LogLine[]; has_more: boolean }>(
+      `/logs/history?limit=${limit}` + (before > 0 ? `&before=${before}` : ""),
+    ),
+
   // ---- app settings (runtime toggles) ----
   settings: () => get<Settings>(`/settings`),
   setSettings: (patch: Partial<Settings>) => put<Settings>(`/settings`, patch),
@@ -814,8 +970,7 @@ export const api = {
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
   // 不塞进扁平的 settings 键值里。
   notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
-  notifyChannels: () =>
-    get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
+  notifyChannels: () => get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
   notifyCreateChannel: (payload: {
     name: string;
     kind: string;
@@ -1225,7 +1380,14 @@ export const api = {
       total: r.total ?? r.items?.length ?? 0,
     })),
   interceptTask: (taskId: string) =>
-    get<{ items: InterceptApprovalRow[] }>(`/intercept/task/${taskId}`).then((r) => arr(r.items)),
+    get<{ items: InterceptApprovalRow[] }>(`/intercept/task/${encodeURIComponent(taskId)}`).then((r) => arr(r.items)),
+  // Pending-only variant for the badge polls: served from the partial
+  // (task_id, created_at) WHERE status='pending' index instead of the whole
+  // approval history.
+  interceptTaskPending: (taskId: string) =>
+    get<{ items: InterceptApprovalRow[] }>(`/intercept/task/${encodeURIComponent(taskId)}?status=pending`).then((r) =>
+      arr(r.items),
+    ),
   interceptTaskPage: (taskId: string, page = 1, size = 20, filter: InterceptApprovalFilter = {}) =>
     get<{ items: InterceptApprovalRow[]; total?: number }>(
       `/intercept/task/${encodeURIComponent(taskId)}?${interceptPageQuery(page, size, filter)}`,

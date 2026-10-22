@@ -650,6 +650,16 @@ func TestTaskLLMResolutionReportsDatabaseFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This test deliberately closes the manager's pool to force a storage error, so
+	// the task cannot be deleted afterwards through m.pg. Delete it over a separate
+	// connection instead, or every run leaves one row behind on the shared DB.
+	dsn, _, _ := db.DSN()
+	if cleaner, err := db.Open(dsn); err == nil {
+		t.Cleanup(func() {
+			_, _ = cleaner.DeleteTaskCascade(mustTaskID(t, task.ID), true, false)
+			_ = cleaner.Close()
+		})
+	}
 	if err := m.pg.Close(); err != nil {
 		t.Fatal(err)
 	}

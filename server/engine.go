@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -167,11 +168,13 @@ type workExecution struct {
 }
 
 // nextPlannerRound returns the next planner round number for a task (1-based).
+// The final planner round and the loop can run concurrently, so the counter is
+// bumped atomically: a read-modify-write on the sync.Map let both goroutines see
+// the same number and emit two "第 N 轮规划" boundaries, which the transcript
+// uses to split rounds.
 func (e *Engine) nextPlannerRound(taskID string) int {
-	v, _ := e.plannerRound.LoadOrStore(taskID, 0)
-	n := v.(int) + 1
-	e.plannerRound.Store(taskID, n)
-	return n
+	v, _ := e.plannerRound.LoadOrStore(taskID, new(int64))
+	return int(atomic.AddInt64(v.(*int64), 1))
 }
 
 // Pause stops a task: marks it paused AND cancels any in-flight planner/worker run
@@ -238,6 +241,15 @@ func (e *Engine) registerTaskRoutines(parent context.Context, taskID string, cou
 func runTaskRoutine(rt *taskRuntime, fn func(context.Context)) {
 	go func() {
 		defer rt.wg.Done()
+		// Every long-lived engine loop goes through here, and none of them may take
+		// the process down: a panic in prompt/graph assembly, a provider adapter or
+		// an emit path would otherwise kill every other task (and the HTTP server)
+		// and, since the same state is replayed on restart, crash-loop the install.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[engine] 任务循环 panic，已隔离: %v\n%s", r, debug.Stack())
+			}
+		}()
 		fn(rt.ctx)
 	}()
 }
@@ -401,8 +413,14 @@ func (e *Engine) BeginLLMCall(taskID string) {
 func (e *Engine) EndLLMCall(taskID string) {
 	if v, ok := e.llmCalls.Load(taskID); ok {
 		p := v.(*int64)
-		if atomic.AddInt64(p, -1) <= 0 {
-			atomic.StoreInt64(p, 0)
+		// Never write a bare 0 here: between this decrement and a Store(0), another
+		// goroutine for the same task can BeginLLMCall, and the store would erase a
+		// live call — making the task look idle so admission hands its concurrency
+		// slot to one more task. The CAS only corrects a genuinely negative value.
+		for n := atomic.AddInt64(p, -1); n < 0; n = atomic.LoadInt64(p) {
+			if atomic.CompareAndSwapInt64(p, n, 0) {
+				return
+			}
 		}
 	}
 }
@@ -1237,6 +1255,14 @@ func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64,
 	release = false // ownership of the admission passes to the goroutine
 	go func() {
 		defer e.decInflight(t.ID)
+		// Not a registered task routine (its lifetime is one turn, not the task's),
+		// so it carries its own panic guard: an abort here must not take the
+		// process down with every other running task.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[engine] task %s 直投意图 panic: %v\n%s", t.ID, r, debug.Stack())
+			}
+		}()
 		e.runIntent(ctx, t, "chat", worker, node, requestID, agentMessage)
 	}()
 	return nil

@@ -11,8 +11,10 @@ func TestListTasksBulkHydratesTaskContext(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
-
+	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
+	// plain `defer d.Close()` fires before them — the row-deleting cleanups below would
+	// then run against a closed pool and silently leave test rows in the shared DB.
+	t.Cleanup(func() { d.Close() })
 	stamp := time.Now().UnixNano()
 	profileID, err := d.SaveProfile(&LLMProfile{
 		Name: fmt.Sprintf("bulk-list-profile-%d", stamp), Format: "openai", Model: "test", APIKey: "test-key",
@@ -72,8 +74,10 @@ func TestTaskListMetricsAll(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
-
+	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
+	// plain `defer d.Close()` fires before them — the row-deleting cleanups below would
+	// then run against a closed pool and silently leave test rows in the shared DB.
+	t.Cleanup(func() { d.Close() })
 	task, err := d.CreateTask("task-list-metrics", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)

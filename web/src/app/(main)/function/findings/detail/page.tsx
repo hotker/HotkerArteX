@@ -21,7 +21,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger } from "@
 import { Separator } from "@/components/ui/separator";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { api } from "@/lib/api";
+import { ApiError, api } from "@/lib/api";
 import { statusMeta } from "@/lib/status";
 import type { Finding, FindingStatus, Severity } from "@/lib/types";
 
@@ -60,6 +60,8 @@ function FindingDetailInner() {
   const contextTaskId = searchParams.get("context_task") ?? "";
   const [finding, setFinding] = React.useState<Finding | null>(null);
   const [loaded, setLoaded] = React.useState(false);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [notFound, setNotFound] = React.useState(false);
   const [tab, setTab] = React.useState("overview");
 
   const load = React.useCallback(() => {
@@ -67,10 +69,22 @@ function FindingDetailInner() {
       setLoaded(true);
       return;
     }
+    setLoaded(false);
+    setLoadError(null);
     api
       .getFinding(id, contextTaskId || undefined)
-      .then((f) => setFinding(f))
-      .catch(() => setFinding(null))
+      .then((f) => {
+        setFinding(f);
+        setLoadError(null);
+      })
+      .catch((e: unknown) => {
+        // Only a 404 means the finding is really gone. A 5xx or a dropped
+        // connection during a backend restart needs an error + retry, not a
+        // "未找到" page that asserts the record was deleted.
+        setFinding(null);
+        setNotFound(e instanceof ApiError && e.status === 404);
+        setLoadError(e instanceof Error ? e.message : "加载失败");
+      })
       .finally(() => setLoaded(true));
   }, [contextTaskId, id]);
   React.useEffect(() => {
@@ -114,8 +128,15 @@ function FindingDetailInner() {
   if (!finding) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-3 p-10 text-center">
-        <p className="text-muted-foreground">{loaded ? `未找到发现 ${id}` : "加载中…"}</p>
-        {loaded && (
+        <p className="text-muted-foreground">
+          {!loaded ? "加载中…" : loadError && !notFound ? `加载失败：${loadError}` : `未找到发现 ${id}`}
+        </p>
+        {loaded && loadError && !notFound && (
+          <Button variant="outline" onClick={() => load()}>
+            重试
+          </Button>
+        )}
+        {loaded && (!loadError || notFound) && (
           <Button asChild variant="outline">
             <Link href="/function/findings">
               <ArrowLeftIcon /> 返回发现列表

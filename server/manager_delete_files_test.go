@@ -17,7 +17,10 @@ func TestSeedAssociatesTargetAssetWithTask(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer m.Close()
+	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
+	// plain `defer m.Close()` fires before them — the cleanups below would then
+	// run against a closed handle and silently leave test rows behind.
+	t.Cleanup(func() { m.Close() })
 	task, err := m.CreateTask("seed ownership", "seed ownership", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)

@@ -34,8 +34,10 @@ func TestAssembleVisibleSkill(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer pg.Close()
-
+	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
+	// plain `defer pg.Close()` fires before them — the cleanups below would then
+	// run against a closed handle and silently leave test rows behind.
+	t.Cleanup(func() { pg.Close() })
 	// Filesystem skill fixture: <skillDir>/t-assemble/SKILL.md. The directory name
 	// (t-assemble) is the visibility key matched against AgentSkillNames.
 	skillDir := t.TempDir()

@@ -12,7 +12,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
+
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -101,10 +101,7 @@ func New(ctx context.Context, server, url string, headers map[string]string, ins
 	if err != nil {
 		return nil, err
 	}
-	hc := &http.Client{Timeout: 120 * time.Second}
-	if insecure {
-		hc.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-	}
+	hc := newHTTPClient(120*time.Second, insecure)
 	c := &Client{
 		server:   server,
 		url:      url,
@@ -126,10 +123,9 @@ func NewSSE(ctx context.Context, server, sseURL string, headers map[string]strin
 	if err != nil {
 		return nil, err
 	}
-	hc := &http.Client{} // the SSE stream is intentionally long-lived.
-	if insecure {
-		hc.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-	}
+	// No client timeout: the SSE stream is intentionally long-lived. The dial
+	// guard still applies.
+	hc := newHTTPClient(0, insecure)
 	streamCtx, cancel := context.WithCancel(context.Background())
 	req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, sseURL, nil)
 	if err != nil {
@@ -156,6 +152,15 @@ func NewSSE(ctx context.Context, server, sseURL string, headers map[string]strin
 		resp.Body.Close()
 		cancel()
 		return nil, err
+	}
+	// The announced endpoint must stay on the server we chose. Otherwise a
+	// hostile (or compromised) server names an endpoint on its own host and every
+	// later JSON-RPC POST — carrying the configured Authorization header — goes
+	// there instead. Same-origin only, like notify's redirect policy.
+	if !sameOrigin(sseURL, endpoint) {
+		resp.Body.Close()
+		cancel()
+		return nil, fmt.Errorf("mcp sse 声明的消息端点 %s 与原服务器 %s 不同源，已拒绝", endpoint, sseURL)
 	}
 	c := &Client{
 		server:       server,

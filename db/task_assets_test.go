@@ -12,8 +12,10 @@ func TestRegisterTaskAssetScopesCreatesAssetsAndPersistsTextScope(t *testing.T) 
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
-
+	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
+	// plain `defer d.Close()` fires before them — the row-deleting cleanups below would
+	// then run against a closed pool and silently leave test rows in the shared DB.
+	t.Cleanup(func() { d.Close() })
 	task, err := d.CreateTask("manual scope registration", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -91,8 +93,10 @@ func TestTaskAssetAttachDetachPreservesGlobalAssetAndAnchors(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
-
+	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
+	// plain `defer d.Close()` fires before them — the row-deleting cleanups below would
+	// then run against a closed pool and silently leave test rows in the shared DB.
+	t.Cleanup(func() { d.Close() })
 	task, err := d.CreateTask("asset editing", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -144,8 +148,10 @@ func TestIntentAssetsIncludesDirectSourceProvenance(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
-
+	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
+	// plain `defer d.Close()` fires before them — the row-deleting cleanups below would
+	// then run against a closed pool and silently leave test rows in the shared DB.
+	t.Cleanup(func() { d.Close() })
 	source, err := d.CreateTask("source assets", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -154,7 +160,12 @@ func TestIntentAssetsIncludesDirectSourceProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(current.ID); _ = d.DeleteTask(source.ID) })
+	// deleteAssets=true: UpsertHTTPService also registers the host as its own
+	// subdomain (linkHostAssets), so the returned id is not the only row created.
+	t.Cleanup(func() {
+		_, _ = d.DeleteTaskCascade(current.ID, true, false)
+		_, _ = d.DeleteTaskCascade(source.ID, true, false)
+	})
 
 	assetID, err := d.Assets().UpsertHTTPService(UpsertHTTPServiceReq{
 		URL: fmt.Sprintf("https://intent-%d.example.test", time.Now().UnixNano()), TaskID: source.ID,

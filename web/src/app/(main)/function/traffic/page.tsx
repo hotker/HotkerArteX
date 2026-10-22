@@ -42,6 +42,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
+import { visibleInterval } from "@/lib/polling";
 import { useStoredSortPreference } from "@/lib/sort-preference";
 import type { TrafficDetail, TrafficExchange, TrafficHost, TrafficResp } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -227,13 +228,13 @@ export default function TrafficPage() {
         });
     };
     load();
-    const t = setInterval(() => {
+    const stop = visibleInterval(() => {
       if (page !== 0) return; // only auto-refresh the newest page
       load();
     }, 5000);
     return () => {
       alive = false;
-      clearInterval(t);
+      stop();
     };
   }, [page, size, hostQ, method, queryQ, bodyQ, pathQ, statusFilter, respMinQ, respMaxQ, sort, reloadTick]);
 
@@ -291,8 +292,10 @@ export default function TrafficPage() {
         setReloadTick((t) => t + 1);
       })
       .catch((e) => {
-        // Keep the confirmation open so the user can retry a failed deletion.
-        if (mode === "all") toast.error(`清空失败：${(e as Error).message}`);
+        // Keep the confirmation open so the user can retry a failed deletion, and
+        // say why it failed for every mode: silently doing nothing reads as a
+        // dead button, and the retry is then blind.
+        toast.error(`${mode === "all" ? "清空" : "删除"}失败：${(e as Error).message}`);
       })
       .finally(() => setDeleting(false));
   };

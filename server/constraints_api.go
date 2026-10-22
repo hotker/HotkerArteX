@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
@@ -62,7 +61,7 @@ func (s *Server) addConstraint(w http.ResponseWriter, r *http.Request) {
 		Text string `json:"text"`
 		Kind string `json:"kind"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, "invalid JSON")
 		return
 	}
@@ -106,7 +105,7 @@ func (s *Server) editConstraint(w http.ResponseWriter, r *http.Request) {
 		Text string `json:"text"`
 		Kind string `json:"kind"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, "invalid JSON")
 		return
 	}

@@ -15,8 +15,10 @@ func TestDeleteTaskTrafficHostsUseOneLockedTransaction(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
-
+	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
+	// plain `defer d.Close()` fires before them — the row-deleting cleanups below would
+	// then run against a closed pool and silently leave test rows in the shared DB.
+	t.Cleanup(func() { d.Close() })
 	t.Run("sharing committed before deletion lock is observed", func(t *testing.T) {
 		first, second, host, rootAssetID := createTaskDeleteRaceFixture(t, d)
 		serviceURL := "https://" + host + "/concurrent-owner"

@@ -159,7 +159,10 @@ VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmPro
 		_, _ = d.Exec(`DELETE FROM skill_usage WHERE task_id=$1 OR exploration_id=$2`, task.ID, task.ExplorationID)
 		_, _ = d.Exec(`DELETE FROM tool_usage WHERE task_id=$1 OR exploration_id=$2`, task.ID, task.ExplorationID)
 		_, _ = d.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID)
-		_ = d.DeleteTask(task.ID)
+		// deleteAssets=true: this test registers an asset under the task (and
+		// linkHostAssets adds its root domain), so a plain DeleteTask would leave
+		// both rows behind with a dangling task id in task_ids.
+		_, _ = d.DeleteTaskCascade(task.ID, true, false)
 		_, _ = d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, llmProfileID)
 		_, _ = d.Exec(`DELETE FROM companies WHERE id=$1`, companyID)
 	}()
@@ -209,7 +212,7 @@ VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmPro
 		t.Fatalf("claim = %+v, %v", claimed, err)
 	}
 	var llmRecords bytes.Buffer
-	snapshot, err := d.SnapshotTaskArchiveWithLLMRecords(task.ID, &llmRecords)
+	snapshot, err := d.SnapshotTaskArchiveWithLLMRecords(t.Context(), task.ID, &llmRecords)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -36,7 +36,8 @@ import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { api } from "@/lib/api";
+import { ApiError, api } from "@/lib/api";
+import { visibleInterval } from "@/lib/polling";
 import type { LLMProfile, Task } from "@/lib/types";
 
 import { AssetsTab } from "./_tabs/assets-tab";
@@ -209,6 +210,8 @@ function TaskDetailInner() {
   const [task, setTask] = React.useState<Task | null>(null);
   const [paused, setPaused] = React.useState(false);
   const [loaded, setLoaded] = React.useState(false);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [notFound, setNotFound] = React.useState(false);
   const [tab, setTab] = React.useState("sessions");
   const [interceptPendingCount, setInterceptPendingCount] = React.useState(0);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
@@ -225,18 +228,18 @@ function TaskDetailInner() {
     let alive = true;
     const load = () =>
       api
-        .interceptTask(id)
+        .interceptTaskPending(id)
         .then((rows) => {
-          if (alive) setInterceptPendingCount(rows.filter((r) => r.status === "pending").length);
+          if (alive) setInterceptPendingCount(rows.length);
         })
         .catch(() => {
           // Polling is best-effort; the next interval retries automatically.
         });
     void load();
-    const t = setInterval(load, 5000);
+    const stop = visibleInterval(load, 5000);
     return () => {
       alive = false;
-      clearInterval(t);
+      stop();
     };
   }, [id]);
 
@@ -247,6 +250,8 @@ function TaskDetailInner() {
     Promise.all([api.task(id), api.stats(id).catch(() => null)])
       .then(([task, s]) => {
         if (taskLoadInFlight.current !== id) return;
+        setLoadError(null);
+        setNotFound(false);
         const base = { ...task };
         const at = s?.active_task;
         if (at) {
@@ -259,8 +264,13 @@ function TaskDetailInner() {
         setTask(base);
         setPaused(at?.paused ?? base.paused ?? false);
       })
-      .catch(() => {
-        // Keep the last rendered task state during a transient poll failure.
+      .catch((e: unknown) => {
+        if (taskLoadInFlight.current !== id) return;
+        // Keep the last rendered task state during a transient poll failure, but
+        // remember why it failed: rendering "已删除" for a 5xx/restart would
+        // assert data loss that did not happen and offer no way to retry.
+        setLoadError(e instanceof Error ? e.message : "加载失败");
+        setNotFound(e instanceof ApiError && e.status === 404);
       })
       .finally(() => {
         if (taskLoadInFlight.current === id) {
@@ -271,8 +281,7 @@ function TaskDetailInner() {
   }, [id]);
   React.useEffect(() => {
     load();
-    const timer = setInterval(load, 5000);
-    return () => clearInterval(timer);
+    return visibleInterval(load, 5000);
   }, [load]);
 
   async function togglePause() {
@@ -303,8 +312,19 @@ function TaskDetailInner() {
   if (!task) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-3 p-10 text-center">
-        <p className="text-muted-foreground">{loaded ? `任务 ${id} 已被删除、归档或不存在` : "加载中…"}</p>
-        {loaded && (
+        <p className="text-muted-foreground">
+          {!loaded
+            ? "加载中…"
+            : loadError && !notFound
+              ? `加载失败：${loadError}`
+              : `任务 ${id} 已被删除、归档或不存在`}
+        </p>
+        {loaded && loadError && !notFound && (
+          <Button variant="outline" onClick={() => load()}>
+            重试
+          </Button>
+        )}
+        {loaded && (!loadError || notFound) && (
           <Button asChild variant="outline">
             <Link href="/function/tasks">
               <ArrowLeftIcon /> 返回任务列表

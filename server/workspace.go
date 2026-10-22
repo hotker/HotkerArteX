@@ -35,14 +35,58 @@ var sensitiveWorkspaceTrees = []string{"traffic", "evidence", "jwt.key", "jwt.ke
 
 // isSensitiveWorkspacePath reports whether a workspace-relative path (or the
 // top-level entry under a requested directory) falls inside a protected tree.
+//
+// The comparison is case-insensitive: on APFS (macOS default) and NTFS the
+// filesystem resolves "Traffic/_ca/mitmproxy-ca.pem" to the real traffic tree,
+// so an exact-match check would hand out the MITM CA private key to anyone able
+// to spell the path differently. EvalSymlinks does not canonicalise case, so the
+// resolved-path guard has the same hole and this check is the last line.
 func isSensitiveWorkspacePath(rel string) bool {
 	top := strings.TrimPrefix(strings.TrimSpace(rel), "/")
 	if i := strings.IndexByte(top, '/'); i >= 0 {
 		top = top[:i]
 	}
 	for _, s := range sensitiveWorkspaceTrees {
-		if top == s {
+		if strings.EqualFold(top, s) {
 			return true
+		}
+	}
+	return false
+}
+
+// wsSensitiveReal reports whether abs, with symlinks resolved, points at one of
+// the protected entries in dir. Unlike the string comparison above it reads the
+// directory, so it matches whatever spelling the filesystem actually stored and
+// catches a differently-cased path reaching the same inode.
+func wsSensitiveReal(dir, abs string) bool {
+	root, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		root = dir
+	}
+	realAbs, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return false // does not exist yet; nothing to serve
+	}
+	rel, err := filepath.Rel(root, realAbs)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return false
+	}
+	top := strings.TrimPrefix(filepath.ToSlash(rel), "/")
+	if i := strings.IndexByte(top, '/'); i >= 0 {
+		top = top[:i]
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.Name() != top {
+			continue
+		}
+		for _, s := range sensitiveWorkspaceTrees {
+			if strings.EqualFold(e.Name(), s) {
+				return true
+			}
 		}
 	}
 	return false
@@ -67,6 +111,89 @@ func (s *Server) wsResolve(rel string) (string, bool) {
 // evidence and jwt.key must not be reachable from the workspace manager.
 func (s *Server) wsGuard(w http.ResponseWriter, abs string) bool {
 	if isSensitiveWorkspacePath(s.wsRel(abs)) {
+		writeErr(w, 403, "该路径为系统保留文件，无法通过工作区访问")
+		return false
+	}
+	return true
+}
+
+// wsRealEscape reports whether abs escapes the work dir *after* resolving
+// symbolic links, and returns the real path (or "" on a stat error). The lexical
+// checks in wsResolve only look at the requested string; a symlink an agent (or
+// anyone with write access to the work dir) drops into it — e.g.
+// `ln -s traffic/_ca/mitmproxy-ca.pem notes.txt` — resolves to a protected file
+// while the requested path itself looks perfectly ordinary. Guarding on the
+// lexical path alone would therefore hand out the MITM CA private key.
+//
+// A target that does not exist yet (write/mkdir/upload destinations) is checked
+// through its deepest existing ancestor, so creating files under a symlinked
+// directory is caught as well.
+func (s *Server) wsReal(abs string) (string, error) {
+	real, err := filepath.EvalSymlinks(abs)
+	if err == nil {
+		return real, nil
+	}
+	// Missing tail (the common case for create): resolve the parent that does
+	// exist and append the rest lexically.
+	parent := filepath.Dir(abs)
+	rest := []string{filepath.Base(abs)}
+	for {
+		realParent, perr := filepath.EvalSymlinks(parent)
+		if perr == nil {
+			parts := append([]string{realParent}, rest...)
+			return filepath.Join(parts...), nil
+		}
+		if parent == filepath.Dir(parent) {
+			return "", err // nothing along the path exists
+		}
+		rest = append([]string{filepath.Base(parent)}, rest...)
+		parent = filepath.Dir(parent)
+	}
+}
+
+// wsRealRel renders the symlink-resolved path as a path relative to the
+// symlink-resolved work dir root. ok=false means abs resolves to somewhere
+// outside the work dir (or along a path that does not exist).
+//
+// Both sides are resolved: m.dir itself may sit under a symlink (macOS
+// /var → /private/var, a bind-mounted Docker volume, ...), so mixing a
+// resolved target with an unresolved base yields "../.." and makes every
+// containment check vacuous.
+func (s *Server) wsRealRel(abs string) (string, bool) {
+	base := filepath.Clean(s.m.dir)
+	realBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		realBase = base
+	}
+	real, err := s.wsReal(abs)
+	if err != nil {
+		return "", false
+	}
+	rel, err := filepath.Rel(realBase, real)
+	if err != nil {
+		return "", false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	if rel == "." {
+		return "", true
+	}
+	return filepath.ToSlash(rel), true
+}
+
+// wsGuardReal is wsGuard over the symlink-resolved path: it refuses any target
+// that really lives inside a protected tree or outside the work dir, no matter
+// how it was reached. Guarding only the requested string is not enough — a
+// symlink dropped into the work dir (by an agent, or by anyone the agent runs
+// code as) turns `notes.txt` into the MITM CA private key.
+func (s *Server) wsGuardReal(w http.ResponseWriter, abs string) bool {
+	rel, ok := s.wsRealRel(abs)
+	if !ok {
+		writeErr(w, 403, "路径解析后超出工作区")
+		return false
+	}
+	if isSensitiveWorkspacePath(rel) || wsSensitiveReal(s.m.dir, abs) {
 		writeErr(w, 403, "该路径为系统保留文件，无法通过工作区访问")
 		return false
 	}
@@ -98,7 +225,7 @@ func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
-	if !s.wsGuard(w, abs) {
+	if !s.wsGuard(w, abs) || !s.wsGuardReal(w, abs) {
 		return
 	}
 	fi, err := os.Stat(abs)
@@ -117,9 +244,13 @@ func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]wsEntry, 0, len(ents))
 	for _, e := range ents {
+		entryAbs := filepath.Join(abs, e.Name())
 		// Hide protected system trees (traffic/ CA key, evidence/, jwt.key) from
-		// the browser; per-handler gates refuse anything deeper inside them.
-		if isSensitiveWorkspacePath(s.wsRel(filepath.Join(abs, e.Name()))) {
+		// the browser; per-handler gates refuse anything deeper inside them. A
+		// symlink pointing into one is hidden too, so the listing never advertises
+		// a path the guards below would refuse anyway.
+		realRel, realOK := s.wsRealRel(entryAbs)
+		if isSensitiveWorkspacePath(s.wsRel(entryAbs)) || (realOK && isSensitiveWorkspacePath(realRel)) || !realOK {
 			continue
 		}
 		info, err := e.Info()
@@ -128,7 +259,7 @@ func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, wsEntry{
 			Name:  e.Name(),
-			Path:  s.wsRel(filepath.Join(abs, e.Name())),
+			Path:  s.wsRel(entryAbs),
 			Dir:   e.IsDir(),
 			Size:  info.Size(),
 			MTime: info.ModTime().UnixMilli(),
@@ -160,7 +291,7 @@ func (s *Server) wsRead(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
-	if !s.wsGuard(w, abs) {
+	if !s.wsGuard(w, abs) || !s.wsGuardReal(w, abs) {
 		return
 	}
 	fi, err := os.Stat(abs)
@@ -203,11 +334,17 @@ func (s *Server) wsWrite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
-	if !s.wsGuard(w, abs) {
+	if !s.wsGuard(w, abs) || !s.wsGuardReal(w, abs) {
 		return
 	}
 	if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
 		writeErr(w, 400, "目标是目录")
+		return
+	}
+	// Writing through a symlink would land on its target (e.g. the CA key);
+	// os.WriteFile follows links, so refuse the link itself as well.
+	if fi, err := os.Lstat(abs); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		writeErr(w, 400, "目标是符号链接，拒绝写入")
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
@@ -236,7 +373,7 @@ func (s *Server) wsMkdir(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
-	if !s.wsGuard(w, abs) {
+	if !s.wsGuard(w, abs) || !s.wsGuardReal(w, abs) {
 		return
 	}
 	if err := os.MkdirAll(abs, 0o755); err != nil {
@@ -259,11 +396,18 @@ func (s *Server) wsDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "不能删除工作区根目录")
 		return
 	}
-	if !s.wsGuard(w, abs) {
+	if !s.wsGuard(w, abs) || !s.wsGuardReal(w, abs) {
 		return
 	}
 	if _, err := os.Stat(abs); err != nil {
 		writeErr(w, 404, "路径不存在")
+		return
+	}
+	// os.RemoveAll removes a symlink itself, not its target, so a link pointing
+	// into a protected tree would be a way to *delete* that tree's entry point —
+	// refuse it for the same reason the read paths refuse to follow it.
+	if fi, err := os.Lstat(abs); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		writeErr(w, 400, "目标是符号链接，拒绝删除")
 		return
 	}
 	if err := os.RemoveAll(abs); err != nil {
@@ -281,12 +425,19 @@ func (s *Server) wsDownload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
-	if !s.wsGuard(w, abs) {
+	if !s.wsGuard(w, abs) || !s.wsGuardReal(w, abs) {
 		return
 	}
 	fi, err := os.Stat(abs)
 	if err != nil || fi.IsDir() {
 		writeErr(w, 404, "文件不存在")
+		return
+	}
+	// Only regular files. An agent has shell access to its work dir and can drop a
+	// FIFO or device node there; http.ServeFile opens the target, so a FIFO with no
+	// writer blocks the handler goroutine (and its connection) forever.
+	if !fi.Mode().IsRegular() {
+		writeErr(w, 400, "只能下载普通文件")
 		return
 	}
 	name := filepath.Base(abs)
@@ -302,7 +453,7 @@ func (s *Server) wsUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
-	if !s.wsGuard(w, dirAbs) {
+	if !s.wsGuard(w, dirAbs) || !s.wsGuardReal(w, dirAbs) {
 		return
 	}
 	if fi, err := os.Stat(dirAbs); err != nil || !fi.IsDir() {
@@ -328,6 +479,16 @@ func (s *Server) wsUpload(w http.ResponseWriter, r *http.Request) {
 		destAbs, okd := s.wsResolve(filepath.Join(s.wsRel(dirAbs), name))
 		if !okd {
 			continue
+		}
+		// The directory itself was checked above, but the destination may be an
+		// existing symlink placed inside it — os.Create would then overwrite the
+		// link target.
+		if !s.wsGuardReal(w, destAbs) {
+			return
+		}
+		if fi, err := os.Lstat(destAbs); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			writeErr(w, 400, "目标文件是符号链接，拒绝覆盖")
+			return
 		}
 		if err := saveUpload(hdr, destAbs); err != nil {
 			writeErr(w, 500, err.Error())

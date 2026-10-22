@@ -22,6 +22,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
@@ -60,7 +61,22 @@ type Server struct {
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
 	// free slots off the same snapshot and over-promote past the limit.
-	concMu sync.Mutex
+	//
+	// It guards in-memory bookkeeping ONLY — no database call may run while it is
+	// held. Admission commits (ApplyTaskAdmission / ApplyTaskPause / EnqueueTask)
+	// are network round trips; keeping them inside the lock meant one slow query
+	// (or one parked row behind a lock) stalled every other task's admission for
+	// its duration, and a scheduler tick could do that N times in a row.
+	//
+	// The slot decision stays atomic across the unlocked write through `admitting`:
+	// a promotion reserves its slot here before releasing the lock, so a concurrent
+	// admission sees the slot as taken even though the winner's UPDATE is still in
+	// flight. Correctness against deletion does not depend on this lock — every
+	// admission path holds an engine task-operation admission across its write, and
+	// delete waits for inflight==0 before removing the row.
+	concMu    sync.Mutex
+	admitting int             // slots reserved by admission commits still in flight
+	promoting map[string]bool // task id -> a lifecycle commit is in flight
 
 	cfgMu     sync.Mutex
 	chatAgent *agent.ChatAgent // conversational runner for the chat page; nil w/o LLM
@@ -156,6 +172,25 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
+	// Give every agent guard the absolute list of files it must never open. The
+	// workspace API already refuses these (see workspace.go), but an agent runs
+	// with its CWD inside the data dir and bypass permissions, so `cat
+	// ../../traffic/_ca/mitmproxy-ca.pem` bypasses that gate entirely: the CA key
+	// forges TLS for any intercepted domain, jwt.key forges an admin session.
+	if abs, err := filepath.Abs(dataDir); err == nil {
+		dataDir = abs
+	}
+	keyAbs := keyDir
+	if abs, err := filepath.Abs(keyDir); err == nil {
+		keyAbs = abs
+	}
+	guard.SetProtectedPaths([]string{
+		filepath.Join(dataDir, "traffic"),  // MITM CA key + capture index + body blobs
+		filepath.Join(dataDir, "evidence"), // raw target request/response bytes
+		filepath.Join(dataDir, jwtKeyFilename),
+		filepath.Join(dataDir, jwtKeyFilename+".migrated"),
+		filepath.Join(keyAbs, jwtKeyFilename),
+	})
 	sctx, cancelCtx := context.WithCancel(ctx)
 	s := &Server{m: m, engine: NewEngine(m), ctx: sctx, cancelCtx: cancelCtx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
@@ -339,6 +374,28 @@ func (s *Server) Stop() {
 		s.cancelCtx = nil
 	}
 	s.engine.StopAll(5 * time.Second)
+	// Detached cold-node compactions are the one writer that is not part of an
+	// engine runtime, so StopAll does not join them. Wait for them here: they hold
+	// the exploration store and the LLM provider, and after Stop the manager (and
+	// the PG pool behind it) is closed.
+	s.taskAgentMu.Lock()
+	bundles := make([]*taskAgentBundle, 0, len(s.taskAgents))
+	for _, b := range s.taskAgents {
+		bundles = append(bundles, b)
+	}
+	s.taskAgents = map[string]*taskAgentBundle{}
+	s.taskAgentMu.Unlock()
+	// In parallel: each stop has its own bounded wait, and a serial loop over N
+	// tasks would multiply that bound by N.
+	var wg sync.WaitGroup
+	for _, b := range bundles {
+		wg.Add(1)
+		go func(b *taskAgentBundle) {
+			defer wg.Done()
+			b.stopCompactor()
+		}(b)
+	}
+	wg.Wait()
 }
 
 // agentMaxTurns returns the configured max_turns for an agent key (0 = unlimited,
@@ -990,7 +1047,9 @@ func (s *Server) Handler() http.Handler {
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.Handle("/", s.webuiHandler())
-	return root
+	// Outermost: the headers must also land on the static export (clickjacking,
+	// MIME sniffing) and on error responses that never reach the API chain.
+	return securityHeaders(root)
 }
 
 // --- handlers ---
@@ -1035,19 +1094,14 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 	out["exploration"] = st
 
 	// per-task running state + heartbeat (distinct from "LLM configured").
-	intents, _ := t.Store.ListByKind(db.KindIntent, 100000)
-	inFlight := 0
-	for _, in := range intents {
-		if in.State == "running" {
-			inFlight++
-		}
-	}
-	goals, _ := t.Store.ListByKind(db.KindGoal, 10000)
-	goalsMet := 0
-	for _, g := range goals {
-		if g.State == "met" {
-			goalsMet++
-		}
+	// One aggregate instead of materializing every intent/goal node: this handler
+	// is polled every 5s by the dashboard and the task detail header, and a long
+	// task can hold thousands of intents whose payloads were never used here.
+	inFlight, goalsTotal, goalsMet := 0, 0, 0
+	if n, total, met, cerr := t.Store.StatsCounters(); cerr != nil {
+		log.Printf("[stats] task %s counters: %v", t.ID, cerr)
+	} else {
+		inFlight, goalsTotal, goalsMet = n, total, met
 	}
 	last := s.engine.LastActivity(t.ID)
 	paused := s.engine.IsPaused(t.ID)
@@ -1078,7 +1132,7 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 		"llm_in_flight": activeCalls,
 		"last_activity": last,
 		"stalled":       stalled,
-		"goals_total":   len(goals),
+		"goals_total":   goalsTotal,
 		"goals_met":     goalsMet,
 	}
 	writeJSON(w, 200, out)
@@ -1145,7 +1199,7 @@ func (s *Server) setActive(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID string `json:"id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -1171,7 +1225,7 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Action string `json:"action"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -1212,7 +1266,7 @@ func (s *Server) controlIntent(w http.ResponseWriter, r *http.Request) {
 		Reason string `json:"reason"` // cancel(删除)时必填:删除原因
 		Mode   string `json:"mode"`   // cancel 专用:soft(默认,假删除)| hard(真删除,级联移除独占子孙)
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
@@ -1368,7 +1422,7 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		ThinkingType    string  `json:"thinking_type"`
 		ReasoningEffort string  `json:"reasoning_effort"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -1427,7 +1481,7 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		Streaming        *bool  `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
 		SessionHeaderKey string `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -1512,7 +1566,7 @@ type createTaskReq struct {
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	var req createTaskReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
@@ -1612,7 +1666,7 @@ func (s *Server) updateTaskLLMProfiles(w http.ResponseWriter, r *http.Request) {
 		LLMProfileIDs      []int64 `json:"llm_profile_ids"`
 		ActiveLLMProfileID *int64  `json:"active_llm_profile_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
@@ -1909,7 +1963,7 @@ func (s *Server) taskScopeAdd(w http.ResponseWriter, r *http.Request) {
 		Value  string `json:"value"`
 		Reason string `json:"reason"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, "invalid JSON")
 		return
 	}
@@ -2318,7 +2372,7 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		Name      *string `json:"name"`
 		VulnClass *string `json:"vulnclass"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
@@ -3271,7 +3325,7 @@ func (s *Server) deleteTrafficHosts(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Hosts []string `json:"hosts"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, "invalid body")
 		return
 	}
@@ -3500,7 +3554,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		// 成本协调器每轮读一次,改完对之后的判定即时生效,无需重启。
 		TaskLLMBudget *int64 `json:"task_llm_budget_tokens"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -3689,7 +3743,7 @@ func (s *Server) testWebSearch(w http.ResponseWriter, r *http.Request) {
 		TavilyKey string `json:"tavily_search_api_key"`
 	}
 	// Empty body is fine — fall back entirely to the saved config below.
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+	if err := decode(r, &req); err != nil && err != io.EOF {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -3794,7 +3848,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		Attachments []chatAttachment `json:"attachments,omitempty"` // 方式1 上传的文件(路径相对任务工作目录)
 		Seg         *int             `json:"seg,omitempty"`         // 目标主会话分段;缺省=最新段
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -3967,12 +4021,13 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 	}
 	findings, _ := t.Store.ListByKind(db.KindFinding, 1000) // 纯漏洞（事实是独立的 KindFact，不进报告）
 	totalFindings, _ := t.Store.CountByKind(db.KindFinding)
-	counts := map[string]int{}
-	for _, ty := range []string{"root_domain", "ip", "subdomain", "app", "service", "endpoint"} {
-		ns, _ := s.m.Assets().QueryByType(ty, 100000, 0)
-		if len(ns) > 0 {
-			counts[ty] = len(ns)
-		}
+	// One GROUP BY instead of six QueryByType(…, 100000, 0) calls: those used to
+	// materialize and scan every row of a type (up to 100k wide asset rows each)
+	// purely to take len(), on a handler that runs every time the report is viewed.
+	counts, err := s.m.Assets().CountsByType()
+	if err != nil {
+		log.Printf("[report] asset counts: %v", err)
+		counts = map[string]int{}
 	}
 	md := report.Markdown(report.Input{
 		Title: t.Description, Goal: t.Goal, GeneratedAt: time.Now(),

@@ -326,10 +326,9 @@ func TestCompanyScopeAttribution(t *testing.T) {
 		d.Close()
 		t.Fatalf("startMax: %v", err)
 	}
-	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM assets WHERE id > $1`, startMax)
-		d.Close()
-	})
+	// Close registered FIRST so it runs LAST (cleanups are LIFO): the deletes below
+	// must still have a live pool.
+	t.Cleanup(func() { d.Close() })
 
 	uniq := startMax + 1
 	root := fmt.Sprintf("scopetest%d.com", uniq)
@@ -338,10 +337,24 @@ func TestCompanyScopeAttribution(t *testing.T) {
 	ipOut := "203.0.113.9"
 	outDomain := fmt.Sprintf("other%d.net", uniq)
 
+	// The company and its scope rows must go too, not just the assets. A leftover
+	// `198.51.100.0/24` scope from a previous run stays active on the shared DB and
+	// wins the insert-time attribution for ipIn, so the new company never gets it —
+	// which reads as a nondeterministic attribution bug, not as leaked rows.
+	var companyID int64
+	t.Cleanup(func() {
+		_, _ = d.Exec(`DELETE FROM assets WHERE id > $1`, startMax)
+		if companyID != 0 {
+			_, _ = d.Exec(`DELETE FROM company_scope WHERE company_id = $1`, companyID)
+			_, _ = d.Exec(`DELETE FROM companies WHERE id = $1`, companyID)
+		}
+	})
+
 	cid, _, err := cs.UpsertCompany(fmt.Sprintf("ScopeCo %d", uniq), "")
 	if err != nil {
 		t.Fatalf("UpsertCompany: %v", err)
 	}
+	companyID = cid
 
 	// a pre-existing asset (inserted BEFORE any scope) — must be back-filled.
 	preID, err := as.UpsertSubdomain(UpsertSubdomainReq{Domain: sub})

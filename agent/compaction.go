@@ -43,6 +43,13 @@ type Compactor struct {
 	mu      sync.Mutex
 	running map[int64]bool
 	lastRun map[int64]time.Time
+
+	// wg tracks the detached compaction goroutines so the owner can wait for
+	// them on shutdown/delete instead of letting them write after the store is
+	// gone. stopped is set once the owner has given up on this compactor; a
+	// late planner round then never starts another run.
+	wg      sync.WaitGroup
+	stopped bool
 }
 
 // NewCompactor builds a compactor. prov/model are used for the §4 body LLM call
@@ -61,12 +68,42 @@ func NewCompactor(prov llm.Provider, model string) *Compactor {
 	}
 }
 
+// Stop prevents new compactions and waits up to timeout for the in-flight ones.
+// A compaction that outlives the task it belongs to would write digest nodes into
+// a deleted exploration (or, on shutdown, into a closed pool); the bounded wait
+// keeps shutdown from hanging on a slow LLM call, which is cancelled by ctx.
+func (c *Compactor) Stop(ctx context.Context, timeout time.Duration) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.stopped = true
+	c.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		log.Printf("[compaction] 后台压缩在 %v 内未结束，放弃等待", timeout)
+	case <-ctx.Done():
+	}
+}
+
 // OnPlannerRound is the single entry the planner calls each wake-up. It bumps the
 // round, maintains the cold stamps synchronously, then (if a threshold is hit and
 // no compaction is running / cooling down) launches a background compaction that
 // outlives this planner round.
 func (c *Compactor) OnPlannerRound(ctx context.Context, ts *db.ExplorationStore) {
 	if c == nil || c.prov == nil || ts == nil {
+		return
+	}
+	c.mu.Lock()
+	stopped := c.stopped
+	c.mu.Unlock()
+	if stopped {
 		return
 	}
 	round, uncompressed, activeDigests, err := c.maintain(ts)
@@ -82,7 +119,9 @@ func (c *Compactor) OnPlannerRound(ctx context.Context, ts *db.ExplorationStore)
 	if !c.tryStart(ts.ID()) {
 		return // already running, or within cooldown —派生态最终一致，下轮再压
 	}
+	c.wg.Add(1)
 	go func() {
+		defer c.wg.Done()
 		defer c.finish(ts.ID())
 		bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.maxDur)
 		defer cancel()
@@ -311,7 +350,7 @@ func (c *Compactor) generationFor(b block, active []*db.Node) int {
 func (c *Compactor) tryStart(expID int64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.running[expID] {
+	if c.stopped || c.running[expID] {
 		return false
 	}
 	if t, ok := c.lastRun[expID]; ok && time.Since(t) < c.cooldown {

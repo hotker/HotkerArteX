@@ -27,6 +27,21 @@ func TestRenderTemplateCommand(t *testing.T) {
 	if strings.Contains(got, "{target}") || strings.Contains(got, "{ports}") {
 		t.Fatalf("placeholders not replaced: %q", got)
 	}
+	// Nested placeholder: a value containing another param's placeholder must be
+	// substituted as data, never re-expanded. With sequential ReplaceAll the
+	// params {"url":"{x}","x":"$(id)"} render to `curl ''$(id)''` on roughly half
+	// of the attempts (Go randomises map order): the injected quotes close the
+	// shell quoting and $(id) runs. One pass must keep the braces as literal text.
+	nested := renderTemplate("curl {url}", map[string]any{
+		"url": "{x}",
+		"x":   "$(id)",
+	}, shellQuote)
+	if nested != "curl '{x}'" {
+		t.Fatalf("nested placeholder was expanded: %q (want %q)", nested, "curl '{x}'")
+	}
+	if strings.Contains(nested, "$(id)") {
+		t.Fatalf("sibling param leaked into the command: %q", nested)
+	}
 }
 
 func TestRenderTemplateHTTP(t *testing.T) {
@@ -34,6 +49,11 @@ func TestRenderTemplateHTTP(t *testing.T) {
 	got := renderTemplate("https://x/submit?flag={flag}", map[string]any{"flag": "CTF{abc}"}, identity)
 	if got != "https://x/submit?flag=CTF{abc}" {
 		t.Fatalf("http render: %q", got)
+	}
+	// HTTP also must not rescanned nested placeholders.
+	got = renderTemplate("POST /api?key={key}", map[string]any{"key": "{secret}"}, identity)
+	if got != "POST /api?key={secret}" {
+		t.Fatalf("http nesting failed: %q", got)
 	}
 }
 
@@ -183,5 +203,20 @@ func TestHTTPToolTruncatesLargeBody(t *testing.T) {
 	out := res.Flatten()
 	if len(out) >= 40000 {
 		t.Fatalf("oversized http body was not truncated: len=%d", len(out))
+	}
+}
+
+// The custom HTTP tool's URL comes from the model, so it must not reach
+// link-local endpoints such as the cloud metadata service.
+func TestGuardLinkLocalDial(t *testing.T) {
+	for _, addr := range []string{"169.254.169.254:80", "[fe80::1]:443", "0.0.0.0:80"} {
+		if err := blockLinkLocalDial("tcp", addr, nil); err == nil {
+			t.Errorf("blockLinkLocalDial(%q) allowed", addr)
+		}
+	}
+	for _, addr := range []string{"127.0.0.1:8788", "192.168.0.2:8080", "10.1.2.3:443"} {
+		if err := blockLinkLocalDial("tcp", addr, nil); err != nil {
+			t.Errorf("blockLinkLocalDial(%q) = %v, want nil", addr, err)
+		}
 	}
 }

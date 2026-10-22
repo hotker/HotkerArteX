@@ -100,12 +100,21 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 	return id, err
 }
 
+// findingTrafficCountJoin aggregates bindings once for the whole result set.
+// Selecting the count as a correlated subquery (… WHERE b.finding_id=f.id) made
+// the planner run one extra index scan per returned row — on every list, export
+// and detail query, including the 发现 page that polls.
+const findingTrafficCountJoin = `
+		LEFT JOIN (SELECT finding_id, count(*) AS c FROM finding_traffic_bindings GROUP BY finding_id) tc
+		       ON tc.finding_id = f.id`
+
 // findingSelectCols is the column list (with task_description join) every finding
-// list query selects, so scanFinding stays in sync across callers.
+// list query selects, so scanFinding stays in sync across callers. Callers must
+// include findingTrafficCountJoin in their FROM clause.
 const findingSelectCols = `f.id, f.task_id, f.node_id, f.vulnclass, COALESCE(f.name, ''), f.severity, f.summary,
 	       f.evidence, f.worker, f.asset_ids, COALESCE(f.status, 'pending'), f.created_at,
 	       COALESCE(t.description, '') AS task_description, f.evidence_version, f.report_evidence_version,
- (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id)`
+	       COALESCE(tc.c, 0)`
 
 // scanFindings materializes rows selected via findingSelectCols.
 func scanFindings(rows interface {
@@ -136,7 +145,7 @@ func (d *DB) ListFindings(limit int) ([]*DBFinding, error) {
 	rows, err := d.Query(`
 		SELECT `+findingSelectCols+`
 		FROM findings f
-		LEFT JOIN tasks t ON f.task_id = t.id
+		LEFT JOIN tasks t ON f.task_id = t.id`+findingTrafficCountJoin+`
 		ORDER BY f.created_at DESC
 		LIMIT $1`, limit)
 	if err != nil {
@@ -265,9 +274,9 @@ func (d *DB) ListFindingsPage(f FindingFilter, page, pageSize int) ([]*DBFinding
 	q := fmt.Sprintf(`
 		SELECT %s
 		FROM findings f
-		LEFT JOIN tasks t ON f.task_id = t.id%s
+		LEFT JOIN tasks t ON f.task_id = t.id%s%s
 		ORDER BY %s
-		LIMIT $%d OFFSET $%d`, findingSelectCols, where, order, len(args)+1, len(args)+2)
+		LIMIT $%d OFFSET $%d`, findingSelectCols, findingTrafficCountJoin, where, order, len(args)+1, len(args)+2)
 	rows, err := d.Query(q, pageArgs...)
 	if err != nil {
 		return nil, 0, err
@@ -483,7 +492,7 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 		}
 		q = `SELECT ` + cols + `
 			FROM findings f
-			LEFT JOIN tasks t ON f.task_id = t.id
+			LEFT JOIN tasks t ON f.task_id = t.id` + findingTrafficCountJoin + `
 			WHERE f.id IN (` + strings.Join(ph, ",") + `)
 			` + order
 	} else {
@@ -494,7 +503,7 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 		where, wargs := scoped.where()
 		q = `SELECT ` + cols + `
 			FROM findings f
-			LEFT JOIN tasks t ON f.task_id = t.id` + where + `
+			LEFT JOIN tasks t ON f.task_id = t.id` + findingTrafficCountJoin + where + `
 			` + order
 		args = wargs
 	}
@@ -635,7 +644,7 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 	var aidsJSON string
 	err := d.QueryRow(`SELECT `+findingSelectCols+`, COALESCE(f.report, '')
 		FROM findings f
-		LEFT JOIN tasks t ON f.task_id = t.id
+		LEFT JOIN tasks t ON f.task_id = t.id`+findingTrafficCountJoin+`
 		WHERE f.id = $1`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
@@ -712,12 +721,24 @@ func (d *DB) SetFindingReportByNodeID(nodeID int64, report string) (int64, error
 // setFindingCol updates one text column on the standalone finding row AND mirrors
 // the new value into the originating exploration node's payload under jsonKey, so the
 // per-task 发现 Tab (which reads the node payload, not this table) stays in sync.
-// Returns rows affected (0 when no finding has that id); the node sync is best-effort.
+// Returns rows affected (0 when no finding has that id).
+//
+// The two writes are one transaction on purpose: the mirror used to run as an
+// independent statement with its error discarded, so a failure left the finding
+// row updated and the node payload stale — the API answered 200 while the task's
+// 发现 Tab kept showing the old value, with no path to reconcile.
 // col and jsonKey MUST be trusted constants (they are interpolated into SQL) — never
 // pass user input.
 func (d *DB) setFindingCol(id int64, col, jsonKey, val string) (int64, error) {
+	ctx := context.Background()
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
 	var nodeID *int64
-	err := d.QueryRow(`UPDATE findings SET `+col+`=$1 WHERE id=$2 RETURNING node_id`, val, id).Scan(&nodeID)
+	err = tx.QueryRowContext(ctx, `UPDATE findings SET `+col+`=$1 WHERE id=$2 RETURNING node_id`, val, id).Scan(&nodeID)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
@@ -725,9 +746,14 @@ func (d *DB) setFindingCol(id int64, col, jsonKey, val string) (int64, error) {
 		return 0, err
 	}
 	if nodeID != nil {
-		_, _ = d.Exec(`UPDATE exploration_nodes
+		if _, err := tx.ExecContext(ctx, `UPDATE exploration_nodes
 			SET payload = jsonb_set(payload, '{`+jsonKey+`}', to_jsonb($1::text))
-			WHERE id = $2`, val, *nodeID)
+			WHERE id = $2`, val, *nodeID); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
 	}
 	return 1, nil
 }

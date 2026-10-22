@@ -2,9 +2,18 @@
 
 import * as React from "react";
 
-import { CpuIcon, FlaskConicalIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon, WalletIcon } from "lucide-react";
+import {
+  CpuIcon,
+  FlaskConicalIcon,
+  KeyboardIcon,
+  RadioTowerIcon,
+  SearchIcon,
+  ShieldAlertIcon,
+  WalletIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -33,6 +42,8 @@ export default function SystemSettingsPage() {
   const [savingGlobalProxy, setSavingGlobalProxy] = React.useState(false);
   const [testing, setTesting] = React.useState(false);
   const [loaded, setLoaded] = React.useState(false);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [retryTick, setRetryTick] = React.useState(0);
   const [saving, setSaving] = React.useState(false);
   const [savingKey, setSavingKey] = React.useState(false);
   const [pyInterp, setPyInterp] = React.useState("");
@@ -122,13 +133,22 @@ export default function SystemSettingsPage() {
       .finally(() => setSaving(false));
   };
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: retryTick is an explicit manual-retry trigger.
   React.useEffect(() => {
+    setLoaded(false);
+    setLoadError(null);
     api
       .settings()
       .then(apply)
-      .catch(() => undefined)
+      .catch((e: unknown) => {
+        // Keep the form locked (loaded stays false) and say why. Enabling the
+        // controls on a failed load would show built-in defaults as if they were
+        // the live configuration; saving then writes those invented values over
+        // the real ones (empty interpreter, workers=3, cleared proxy…).
+        setLoadError(e instanceof Error ? e.message : "加载失败");
+      })
       .finally(() => setLoaded(true));
-  }, [apply]);
+  }, [apply, retryTick]);
 
   const toggleTraffic = (v: boolean) => {
     setTrafficCapture(v); // optimistic
@@ -277,12 +297,28 @@ export default function SystemSettingsPage() {
   // brave-free selected but no key stored and none being entered → tool stays off.
   const braveNeedsKey = webSearch && backend === "brave-free" && !braveKeySet;
 
+  // formLocked keeps every control disabled until the live settings actually
+  // loaded. On a failed load the values on screen are code defaults, not the
+  // server's, so saving them would overwrite real configuration.
+  const formLocked = !loaded || loadError !== null;
+
   return (
     <div className="flex flex-1 flex-col gap-4 md:gap-6">
       <div>
         <h1 className="text-xl font-semibold tracking-tight">系统配置</h1>
         <p className="text-muted-foreground text-sm">全局运行时开关</p>
       </div>
+
+      {loadError && (
+        <Alert variant="destructive">
+          <AlertDescription className="flex items-center justify-between gap-3">
+            <span>配置加载失败：{loadError}。为避免把默认值覆盖到真实配置上，表单已锁定。</span>
+            <Button size="sm" variant="outline" onClick={() => setRetryTick((n) => n + 1)}>
+              重试
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
 
       {/* 多列而非 grid：网络搜索卡片比其余高数倍，且高度随所选后端变化（brave/tavily
           的 key 输入是条件渲染）。grid 会按最高的一张撑满整行、在旁边留下大片空白，
@@ -312,7 +348,7 @@ export default function SystemSettingsPage() {
             <Switch
               id="traffic-capture"
               checked={trafficCapture}
-              disabled={!loaded || saving}
+              disabled={formLocked || saving}
               onCheckedChange={toggleTraffic}
             />
           </CardContent>
@@ -340,7 +376,7 @@ export default function SystemSettingsPage() {
               id="agent-traffic-binding"
               aria-describedby="agent-traffic-binding-description"
               checked={agentTrafficBinding}
-              disabled={!loaded || saving}
+              disabled={formLocked || saving}
               onCheckedChange={toggleAgentTrafficBinding}
             />
           </CardContent>
@@ -374,10 +410,10 @@ export default function SystemSettingsPage() {
                 autoComplete="off"
                 placeholder="socks5://user:pass@host:1080 或 http://host:port（留空=直连）"
                 value={globalProxyInput}
-                disabled={!loaded || savingGlobalProxy}
+                disabled={formLocked || savingGlobalProxy}
                 onChange={(e) => setGlobalProxyInput(e.target.value)}
               />
-              <Button type="button" onClick={saveGlobalProxy} disabled={!loaded || savingGlobalProxy}>
+              <Button type="button" onClick={saveGlobalProxy} disabled={formLocked || savingGlobalProxy}>
                 保存
               </Button>
             </div>
@@ -409,7 +445,7 @@ export default function SystemSettingsPage() {
               <Switch
                 id="inject-planner"
                 checked={injectPlanner}
-                disabled={!loaded}
+                disabled={formLocked}
                 onCheckedChange={toggleInjectPlanner}
               />
             </div>
@@ -420,7 +456,7 @@ export default function SystemSettingsPage() {
               <Switch
                 id="inject-worker"
                 checked={injectWorker}
-                disabled={!loaded}
+                disabled={formLocked}
                 onCheckedChange={toggleInjectWorker}
               />
             </div>
@@ -449,7 +485,7 @@ export default function SystemSettingsPage() {
             <Switch
               id="noa-compaction"
               checked={noaCompaction}
-              disabled={!loaded}
+              disabled={formLocked}
               onCheckedChange={toggleNoaCompaction}
             />
           </CardContent>
@@ -467,8 +503,8 @@ export default function SystemSettingsPage() {
               记录代理，独立于流量捕获。
               <br />
               来源可选 <b>DuckDuckGo（ddgs）</b>（无需 Key）、<b>Brave（免费版）</b>（需填写 Brave API Key）、{" "}
-              <b>Tavily</b>（需填写 Tavily API Key）或 <b>DeepSeek</b>（复用当前 LLM 配置）。总开关关闭时，各
-              Agent 的网络搜索开关不可用。
+              <b>Tavily</b>（需填写 Tavily API Key）或 <b>DeepSeek</b>（复用当前 LLM 配置）。总开关关闭时，各 Agent
+              的网络搜索开关不可用。
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
@@ -479,7 +515,7 @@ export default function SystemSettingsPage() {
               <Switch
                 id="web-search"
                 checked={webSearch}
-                disabled={!loaded || saving}
+                disabled={formLocked || saving}
                 onCheckedChange={(v) => {
                   setWebSearch(v); // optimistic
                   saveWebSearch({ web_search_enabled: v });
@@ -492,7 +528,7 @@ export default function SystemSettingsPage() {
                 <Label className="text-sm font-normal text-muted-foreground">搜索来源</Label>
                 <Select
                   value={backend}
-                  disabled={!loaded || saving}
+                  disabled={formLocked || saving}
                   onValueChange={(v) => {
                     setBackend(v); // optimistic
                     saveWebSearch({ web_search_backend: v });
@@ -543,13 +579,13 @@ export default function SystemSettingsPage() {
                     autoComplete="off"
                     placeholder={braveKeySet ? "已配置（留空则不变）" : "输入 Brave API Key"}
                     value={braveKeyInput}
-                    disabled={!loaded || savingKey}
+                    disabled={formLocked || savingKey}
                     onChange={(e) => setBraveKeyInput(e.target.value)}
                   />
                   <Button
                     type="button"
                     onClick={saveBraveKey}
-                    disabled={!loaded || savingKey || braveKeyInput.trim() === ""}
+                    disabled={formLocked || savingKey || braveKeyInput.trim() === ""}
                   >
                     保存
                   </Button>
@@ -578,13 +614,13 @@ export default function SystemSettingsPage() {
                     autoComplete="off"
                     placeholder={tavilyKeySet ? "已配置（留空则不变）" : "输入 Tavily API Key（tvly-…）"}
                     value={tavilyKeyInput}
-                    disabled={!loaded || savingTavilyKey}
+                    disabled={formLocked || savingTavilyKey}
                     onChange={(e) => setTavilyKeyInput(e.target.value)}
                   />
                   <Button
                     type="button"
                     onClick={saveTavilyKey}
-                    disabled={!loaded || savingTavilyKey || tavilyKeyInput.trim() === ""}
+                    disabled={formLocked || savingTavilyKey || tavilyKeyInput.trim() === ""}
                   >
                     保存
                   </Button>
@@ -609,10 +645,10 @@ export default function SystemSettingsPage() {
                     autoComplete="off"
                     placeholder="http://host:port 或 socks5://host:port（留空=直连）"
                     value={proxyInput}
-                    disabled={!loaded || savingProxy}
+                    disabled={formLocked || savingProxy}
                     onChange={(e) => setProxyInput(e.target.value)}
                   />
-                  <Button type="button" onClick={saveProxy} disabled={!loaded || savingProxy}>
+                  <Button type="button" onClick={saveProxy} disabled={formLocked || savingProxy}>
                     保存
                   </Button>
                 </div>
@@ -631,7 +667,7 @@ export default function SystemSettingsPage() {
                   type="button"
                   variant="outline"
                   onClick={runTest}
-                  disabled={!loaded || testing}
+                  disabled={formLocked || testing}
                   className="shrink-0"
                 >
                   {testing ? "测试中…" : "测试搜索"}
@@ -658,13 +694,13 @@ export default function SystemSettingsPage() {
                 className="font-mono text-sm"
                 placeholder="/usr/bin/python3（留空=自动检测）"
                 value={pyInterp}
-                disabled={!loaded || saving}
+                disabled={formLocked || saving}
                 onChange={(e) => setPyInterp(e.target.value)}
               />
-              <Button variant="outline" onClick={detectPython} disabled={!loaded || saving}>
+              <Button variant="outline" onClick={detectPython} disabled={formLocked || saving}>
                 重新检测
               </Button>
-              <Button onClick={savePython} disabled={!loaded || saving}>
+              <Button onClick={savePython} disabled={formLocked || saving}>
                 保存
               </Button>
             </div>
@@ -690,10 +726,10 @@ export default function SystemSettingsPage() {
                 className="w-32 font-mono text-sm"
                 placeholder="3"
                 value={workers}
-                disabled={!loaded || savingWorkers}
+                disabled={formLocked || savingWorkers}
                 onChange={(e) => setWorkers(e.target.value)}
               />
-              <Button onClick={saveWorkers} disabled={!loaded || savingWorkers}>
+              <Button onClick={saveWorkers} disabled={formLocked || savingWorkers}>
                 保存
               </Button>
             </div>
@@ -721,11 +757,11 @@ export default function SystemSettingsPage() {
                 className="w-40 font-mono text-sm"
                 placeholder="0（不限）"
                 value={costBudget}
-                disabled={!loaded || savingCostBudget}
+                disabled={formLocked || savingCostBudget}
                 onChange={(e) => setCostBudget(e.target.value)}
               />
               <span className="text-xs text-muted-foreground">tokens</span>
-              <Button onClick={saveCostBudget} disabled={!loaded || savingCostBudget}>
+              <Button onClick={saveCostBudget} disabled={formLocked || savingCostBudget}>
                 保存
               </Button>
             </div>

@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -614,15 +614,36 @@ func (s *Server) StartTriggeredRun(agentKey, title, message string, taskID int64
 	cfg := s.readTriggerBehavior(agentKey) // DB read BEFORE the lock (never under queueMu)
 	s.queueMu.Lock()
 	s.triggerCfg[agentKey] = cfg
-	s.triggerQ[agentKey] = append(s.triggerQ[agentKey], triggeredRun{agentKey: agentKey, title: title, message: message, taskID: taskID, taskDesc: taskDesc, taskGoal: taskGoal, mergeable: mergeable})
+	q := append(s.triggerQ[agentKey], triggeredRun{agentKey: agentKey, title: title, message: message, taskID: taskID, taskDesc: taskDesc, taskGoal: taskGoal, mergeable: mergeable})
+	if over := len(q) - maxTriggerQueuePerAgent; over > 0 {
+		// Drop the oldest fires. Each one is a notification that "something
+		// changed"; the scheduler re-derives the same change from its watermarks,
+		// so the newest entries carry the information and the stale ones would
+		// only produce conversations about state that has moved on.
+		log.Printf("[trigger] agent %s 触发队列超过 %d 条，丢弃最旧的 %d 条", agentKey, maxTriggerQueuePerAgent, over)
+		q = append([]triggeredRun(nil), q[over:]...)
+	}
+	s.triggerQ[agentKey] = q
 	s.pumpLocked(agentKey)
 	s.queueMu.Unlock()
 }
 
+// Trigger queue bounds. A fire can arrive for every task/agent event the
+// scheduler observes, and nothing upstream rate-limits them: without a ceiling a
+// burst either spawns one conversation goroutine per fire (maxParallel = 0 means
+// "unlimited" in the UI, which is what a busy install configures) or grows the
+// in-memory queue until the process dies. Both caps are deliberately generous —
+// they only bind in a pathological burst, and dropping the oldest fire is the
+// right loss because the scheduler re-fires from watermarks on its next tick.
+const (
+	maxTriggerParallelHardCap = 32
+	maxTriggerQueuePerAgent   = 256
+)
+
 // pumpLocked launches queued fires for one agent up to its concurrency limit, then
-// returns. Serial → limit 1; parallel → limit = maxParallel (<=0 → unlimited). Each
-// launched run re-pumps on completion (runAndPump) to fill the freed slot. Caller
-// holds queueMu.
+// returns. Serial → limit 1; parallel → limit = maxParallel (<=0 → unlimited, but
+// still bounded by maxTriggerParallelHardCap). Each launched run re-pumps on
+// completion (runAndPump) to fill the freed slot. Caller holds queueMu.
 func (s *Server) pumpLocked(agentKey string) {
 	if s.ctx.Err() != nil {
 		return
@@ -630,8 +651,8 @@ func (s *Server) pumpLocked(agentKey string) {
 	cfg := s.triggerCfg[agentKey]
 	limit := 1
 	if cfg.runMode == "parallel" {
-		if cfg.maxParallel <= 0 {
-			limit = math.MaxInt
+		if cfg.maxParallel <= 0 || cfg.maxParallel > maxTriggerParallelHardCap {
+			limit = maxTriggerParallelHardCap
 		} else {
 			limit = cfg.maxParallel
 		}
@@ -645,18 +666,28 @@ func (s *Server) pumpLocked(agentKey string) {
 
 // runAndPump runs one fire to completion, then decrements the active counter and
 // re-pumps to fill the freed slot (cleaning up the agent's maps when fully idle).
+// The panic guard matters here more than anywhere else: this goroutine runs a
+// full agent conversation, so a panic in prompt assembly or a provider adapter
+// would otherwise take the process down with every task.
 func (s *Server) runAndPump(agentKey string, item triggeredRun) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[trigger] agent %s 触发运行 panic，已隔离: %v\n%s", agentKey, r, debug.Stack())
+		}
+		// The slot must be released even when the run panicked, otherwise the
+		// agent stays at its concurrency limit forever and never fires again.
+		s.queueMu.Lock()
+		s.triggerActive[agentKey]--
+		if s.triggerActive[agentKey] <= 0 && len(s.triggerQ[agentKey]) == 0 {
+			delete(s.triggerActive, agentKey)
+			delete(s.triggerQ, agentKey)
+			delete(s.triggerCfg, agentKey)
+		} else {
+			s.pumpLocked(agentKey)
+		}
+		s.queueMu.Unlock()
+	}()
 	s.runTriggeredRun(item)
-	s.queueMu.Lock()
-	s.triggerActive[agentKey]--
-	if s.triggerActive[agentKey] <= 0 && len(s.triggerQ[agentKey]) == 0 {
-		delete(s.triggerActive, agentKey)
-		delete(s.triggerQ, agentKey)
-		delete(s.triggerCfg, agentKey)
-	} else {
-		s.pumpLocked(agentKey)
-	}
-	s.queueMu.Unlock()
 }
 
 // nextTriggerRun pops the next run from the agent's queue per the merge mode:

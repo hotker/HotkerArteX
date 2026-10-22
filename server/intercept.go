@@ -273,6 +273,17 @@ func (s *Server) interceptListTaskItems(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, 200, map[string]any{"items": items, "total": len(items)})
 		return
 	}
+	// The UI's badge polls this endpoint for pending rows only. Serving that from
+	// the partial index keeps a long approval history off the polling path.
+	if q.Get("page") == "" && q.Get("size") == "" && filter == (db.InterceptApprovalFilter{Status: "pending"}) {
+		items, err := pg.ListPendingInterceptsForTask(taskID)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"items": items, "total": len(items)})
+		return
+	}
 	page, size := interceptPageParams(q)
 	items, total, err := pg.ListTaskInterceptsPage(taskID, page, size, filter)
 	if err != nil {

@@ -160,6 +160,10 @@ type TaskEvent struct {
 	ToolInput  string `json:"tool_input"`  // tool-call only: 入参(JSON 文本)
 	ToolOutput string `json:"tool_output"` // tool-call only: 返回内容
 	ToolIsErr  bool   `json:"tool_is_err"` // tool-call only: 工具返回是否为错误
+	// UpdatedAt is the node's last-update time in unix nanoseconds. Only the met-goal
+	// query fills it: goals are created up front and marked met later, so their id
+	// is not monotonic with the moment they became trigger-worthy.
+	UpdatedAt int64 `json:"-"`
 }
 
 // NewFindingsSince returns findings with node id > lastID across all live tasks,
@@ -267,14 +271,24 @@ ORDER BY r.id`, lastID)
 	return out, rows.Err()
 }
 
-// MetGoals returns all met goals across live tasks (the scheduler filters out the
-// ones it already fired for via the persisted fired-set).
-func (d *DB) MetGoals() ([]TaskEvent, error) {
+// MetGoalsSince returns goals marked met since `since` across live tasks,
+// oldest update first.
+//
+// It used to take no bound at all, so the scheduler's 5-second tick re-read EVERY
+// goal ever marked met — payload included — joined against tasks, on a table with
+// only (exploration_id, kind) indexed. That is a sequential scan whose cost grows
+// with total history rather than with new events, which is exactly what the
+// sibling NewFindingsSince/NewToolCallsSince helpers already avoid.
+//
+// The watermark is updated_at (when the goal became met), not id: goal rows are
+// created up front and marked met later, so a node-id watermark would skip a goal
+// that was reached after a higher-id goal had already fired.
+func (d *DB) MetGoalsSince(since time.Time) ([]TaskEvent, error) {
 	rows, err := d.Query(`
-SELECT n.id, t.id, t.description, t.goal, n.payload
+SELECT n.id, t.id, t.description, t.goal, n.payload, n.updated_at
 FROM exploration_nodes n JOIN tasks t ON t.exploration_id = n.exploration_id
-WHERE n.kind='goal' AND n.state='met' AND t.deleted_at IS NULL
-ORDER BY n.id`)
+WHERE n.kind='goal' AND n.state='met' AND n.updated_at >= $1 AND t.deleted_at IS NULL
+ORDER BY n.updated_at, n.id`, since)
 	if err != nil {
 		return nil, err
 	}
@@ -283,9 +297,11 @@ ORDER BY n.id`)
 	for rows.Next() {
 		var e TaskEvent
 		var payload []byte
-		if err := rows.Scan(&e.NodeID, &e.TaskID, &e.TaskDesc, &e.TaskGoal, &payload); err != nil {
+		var updatedAt time.Time
+		if err := rows.Scan(&e.NodeID, &e.TaskID, &e.TaskDesc, &e.TaskGoal, &payload, &updatedAt); err != nil {
 			return nil, err
 		}
+		e.UpdatedAt = updatedAt.UnixNano()
 		var p struct{ Text, Summary string }
 		_ = json.Unmarshal(payload, &p)
 		if p.Text != "" {

@@ -107,6 +107,10 @@ func (s *Server) admitPausedTask(t *Task) (queued bool, err error) {
 	return s.admitTaskWhen(t, "resume", true)
 }
 
+// errTaskLifecycleBusy means another lifecycle commit (admission, park or pause)
+// already holds this task. It is transient: the caller can retry.
+var errTaskLifecycleBusy = fmt.Errorf("任务生命周期正在变更，请重试")
+
 func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued bool, err error) {
 	if t == nil {
 		return false, fmt.Errorf("task not found")
@@ -114,25 +118,39 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued
 	if mode != "bootstrap" {
 		mode = "resume"
 	}
+	// The whole decision is made under concMu, but the commit is not: admission
+	// writes are database round trips and holding the lock across them stalled
+	// every other task's admission. `promoting` claims this task for the duration
+	// of its commit so a second admission/park/reconcile cannot act on the same
+	// stale lifecycle snapshot, and `admitting` reserves the slot a non-queued
+	// admission is about to occupy so a concurrent promotion cannot take it too.
 	s.concMu.Lock()
-	defer s.concMu.Unlock()
 	// Delete installs its barrier under concMu as well. Re-resolve after acquiring
 	// the lock so a request that captured a task pointer before successful deletion
 	// cannot revive that stale handle after StopTask clears its Engine maps.
 	current, exists := s.m.Task(t.ID)
 	if !exists || current != t || s.engine.IsDeleting(t.ID) {
+		s.concMu.Unlock()
 		return false, fmt.Errorf("task is being deleted")
+	}
+	if s.promoting[t.ID] {
+		s.concMu.Unlock()
+		return false, errTaskLifecycleBusy
 	}
 	if !s.engine.beginTaskOperation(t.ID) {
+		s.concMu.Unlock()
 		return false, fmt.Errorf("task is being deleted")
 	}
-	defer s.engine.decInflight(t.ID)
 	lifecycle := t.lifecycleSnapshot()
 	if requirePaused {
 		if isTerminalStatus(lifecycle.Status) {
+			s.engine.decInflight(t.ID)
+			s.concMu.Unlock()
 			return false, fmt.Errorf("终态任务不能执行继续")
 		}
 		if !lifecycle.Paused {
+			s.engine.decInflight(t.ID)
+			s.concMu.Unlock()
 			return false, fmt.Errorf("仅已暂停的任务可以继续")
 		}
 		mode = s.resumeAdmissionMode(t)
@@ -143,6 +161,7 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued
 	engineWasPaused := s.engine.IsPaused(t.ID)
 	enabled, limit := s.m.ConcurrencyLimit()
 	ready := s.engine.ReadyFor(t)
+	alreadyAdmitted := !wasTerminal && !wasPaused && !wasQueued && s.engine.Started(t.ID) && (!enabled || ready)
 
 	// Work added to a task that is already admitted only needs a wake-up. This
 	// matters when the configured limit was lowered below the current running
@@ -150,28 +169,31 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued
 	// planner/workers are still live. Still compare-and-commit the persisted
 	// status: a concurrent terminal transition must win instead of being silently
 	// reported as a successful follow-up admission.
-	if !wasTerminal && !wasPaused && !wasQueued && s.engine.Started(t.ID) && (!enabled || ready) {
-		if err := s.m.ApplyTaskAdmission(t.ID, lifecycle.Status, lifecycle.Status, false, "resume", false); err != nil {
-			return false, err
-		}
-		s.startAdmittedTask(t, "resume")
-		return false, nil
-	}
-
-	// Preserve the original first-run mode across repeated admissions. Legacy
-	// queued rows have an empty queue_mode, so infer bootstrap from their graph.
-	if wasQueued {
-		switch lifecycle.QueueMode {
-		case "bootstrap":
-			mode = "bootstrap"
-		case "":
-			mode = s.resumeAdmissionMode(t)
+	if !alreadyAdmitted {
+		// Preserve the original first-run mode across repeated admissions. Legacy
+		// queued rows have an empty queue_mode, so infer bootstrap from their graph.
+		if wasQueued {
+			switch lifecycle.QueueMode {
+			case "bootstrap":
+				mode = "bootstrap"
+			case "":
+				mode = s.resumeAdmissionMode(t)
+			}
 		}
 	}
-
-	readyBacklog := enabled && s.hasReadyQueuedTask(t.ID)
-	atCapacity := enabled && s.runningTaskCount(t.ID) >= limit
-	shouldQueue := enabled && (!ready || readyBacklog || atCapacity)
+	// atCapacity counts slots already reserved by admissions whose UPDATE is still
+	// in flight: those tasks are not visible as running yet, so without this two
+	// concurrent admissions could both see limit-1 free and over-admit.
+	inFlight := s.admitting
+	readyBacklog := !alreadyAdmitted && enabled && s.hasReadyQueuedTask(t.ID)
+	atCapacity := !alreadyAdmitted && enabled && s.runningTaskCount(t.ID)+inFlight >= limit
+	shouldQueue := !alreadyAdmitted && enabled && (!ready || readyBacklog || atCapacity)
+	// Reserve the slot this admission is about to occupy, so a concurrent
+	// admission or promotion sees it taken while the UPDATE is still running.
+	reserving := !alreadyAdmitted && !shouldQueue
+	if reserving {
+		s.admitting++
+	}
 
 	// Install the execution barrier before reviving a terminal/paused task. Without
 	// this ordering, its already-running worker loops can claim the newly-opened
@@ -185,16 +207,37 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued
 	if wasTerminal {
 		status = "running"
 	}
+	if s.promoting == nil {
+		s.promoting = map[string]bool{}
+	}
+	s.promoting[t.ID] = true
+	s.concMu.Unlock()
+
+	release := func() {
+		s.concMu.Lock()
+		delete(s.promoting, t.ID)
+		if reserving {
+			s.admitting--
+		}
+		s.concMu.Unlock()
+		s.engine.decInflight(t.ID)
+	}
+
 	if err := s.m.ApplyTaskAdmission(t.ID, lifecycle.Status, status, shouldQueue, mode, wasQueued); err != nil {
 		if !engineWasPaused && !wasPaused && !wasQueued {
 			s.engine.Resume(t)
 		}
+		release()
 		return false, err
 	}
-	if lifecycle.Status == "timeout" && status == "running" {
-		// ApplyTaskAdmission reset this timed-out run's persisted clock. Clear the
+	if wasTerminal && status == "running" {
+		// ApplyTaskAdmission reset the finished run's persisted clock. Clear the
 		// matching Engine gates before either parking it in FIFO or starting work;
 		// otherwise the old settling flag would make every worker skip forever.
+		// This covers every terminal status, not just timeout: a settle that ended
+		// as done (final planner round judged the goal met) or lost the guarded
+		// status CAS leaves settling set exactly the same way, and reviving that
+		// task would otherwise hang it with status=running and nothing running.
 		s.engine.resetTimeoutRevival(t.ID)
 	}
 	if shouldQueue {
@@ -208,9 +251,11 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued
 			}
 			s.engine.emitActivity(t, db.Activity{Worker: "system", Kind: "text", Summary: summary})
 		}
+		release()
 		return true, nil
 	}
 	s.startAdmittedTask(t, mode)
+	release()
 	return false, nil
 }
 
@@ -253,13 +298,16 @@ func (s *Server) startAdmittedTask(t *Task, mode string) {
 }
 
 func (s *Server) reconcileConcurrency() {
-	s.concMu.Lock()
-	defer s.concMu.Unlock()
 	enabled, limit := s.m.ConcurrencyLimit()
 
 	// A task whose provider chain becomes unavailable cannot do useful work and
 	// must not reserve a limited running slot forever. Park it persistently so a
 	// later profile edit/recovery can re-enter through the same FIFO path.
+	//
+	// Each iteration takes the lock on its own instead of holding it across the
+	// whole loop: the write is a round trip, and the only thing the lock protects
+	// here is the decision for one task (re-validate, then park). Holding it for
+	// the whole sweep serialized every admission behind the sum of all writes.
 	if enabled {
 		for _, task := range s.m.List() {
 			lifecycle := task.lifecycleSnapshot()
@@ -267,16 +315,7 @@ func (s *Server) reconcileConcurrency() {
 				isTerminalStatus(lifecycle.Status) || s.engine.ReadyFor(task) || s.engine.ActiveLLMCalls(task.ID) > 0 {
 				continue
 			}
-			mode := s.resumeAdmissionMode(task)
-			s.engine.Pause(task.ID, agent.Causef("llm_unavailable_queued", "LLM 不可用，任务进入等待队列",
-				"任务当前无法解析可运行的 Planner/Worker LLM，已释放并发槽；配置恢复后按队列顺序继续"))
-			if err := s.m.EnqueueTask(task.ID, mode); err != nil {
-				s.engine.Resume(task)
-				log.Printf("[concurrency] task %s 因 LLM 不可用入队失败: %v", task.ID, err)
-				continue
-			}
-			s.engine.emitActivity(task, db.Activity{Worker: "system", Kind: "text",
-				Summary: "已排队：当前没有可运行的 LLM 配置，配置恢复后自动开始"})
+			s.parkUnavailableTask(task, lifecycle)
 		}
 	}
 
@@ -312,40 +351,112 @@ func (s *Server) reconcileConcurrency() {
 		}
 		return queued[i].task.ID < queued[j].task.ID
 	})
-	slots := len(queued)
-	if enabled {
-		slots = limit - s.runningTaskCount("")
-	}
 	for _, entry := range queued {
-		if slots <= 0 {
-			break
+		if !s.promoteQueuedTask(entry.task, entry.lifecycle, enabled, limit) {
+			break // no slot left: keep FIFO order for the next tick
 		}
-		task := entry.task
-		lifecycle := task.lifecycleSnapshot()
-		// Keep FIFO order, but do not consume a concurrency slot for a task
-		// whose explicit chain/global provider is unavailable. It will be retried
-		// after the user configures or resets its LLM chain.
-		if lifecycle.Paused || (enabled && !s.engine.ReadyFor(task)) {
-			continue
-		}
-		mode := lifecycle.QueueMode
-		if mode != "bootstrap" && mode != "resume" {
-			mode = s.resumeAdmissionMode(task)
-		}
-		if mode != "bootstrap" {
-			mode = "resume"
-		}
-		if !s.engine.beginTaskOperation(task.ID) {
-			continue
-		}
-		if err := s.m.ApplyTaskAdmission(task.ID, lifecycle.Status, lifecycle.Status, false, mode, false); err != nil {
-			s.engine.decInflight(task.ID)
-			continue
-		}
-		s.startAdmittedTask(task, mode)
-		s.engine.decInflight(task.ID)
-		slots--
 	}
+}
+
+// parkUnavailableTask enqueues one task whose provider chain cannot run.
+//
+// The decision (and the claim on the task) is made under concMu; the UPDATE runs
+// after the lock is released, like every other lifecycle commit. The `promoting`
+// claim is what keeps it exclusive: no second promotion/park for the same task
+// can start until this one finishes, which is all the lock ever provided here.
+func (s *Server) parkUnavailableTask(task *Task, lifecycle taskLifecycleState) {
+	s.concMu.Lock()
+	// Re-validate against the snapshot taken without the lock.
+	current := task.lifecycleSnapshot()
+	if s.promoting[task.ID] || current.Queued || current.Paused || isTerminalStatus(current.Status) ||
+		s.engine.IsDeleting(task.ID) || s.engine.ReadyFor(task) || s.engine.ActiveLLMCalls(task.ID) > 0 {
+		s.concMu.Unlock()
+		return
+	}
+	if s.promoting == nil {
+		s.promoting = map[string]bool{}
+	}
+	s.promoting[task.ID] = true
+	s.concMu.Unlock()
+
+	done := func() {
+		s.concMu.Lock()
+		delete(s.promoting, task.ID)
+		s.concMu.Unlock()
+	}
+	mode := s.resumeAdmissionMode(task)
+	s.engine.Pause(task.ID, agent.Causef("llm_unavailable_queued", "LLM 不可用，任务进入等待队列",
+		"任务当前无法解析可运行的 Planner/Worker LLM，已释放并发槽；配置恢复后按队列顺序继续"))
+	if err := s.m.EnqueueTask(task.ID, mode); err != nil {
+		s.engine.Resume(task)
+		log.Printf("[concurrency] task %s 因 LLM 不可用入队失败: %v", task.ID, err)
+		done()
+		return
+	}
+	s.engine.emitActivity(task, db.Activity{Worker: "system", Kind: "text",
+		Summary: "已排队：当前没有可运行的 LLM 配置，配置恢复后自动开始"})
+	done()
+}
+
+// promoteQueuedTask admits the head of the FIFO if a slot is free. The slot
+// decision is made and reserved under concMu; the admission commit runs after
+// the lock is released, and the reservation keeps the count honest meanwhile.
+// Returns false when there is no slot (the caller stops scanning).
+func (s *Server) promoteQueuedTask(task *Task, lifecycle taskLifecycleState, enabled bool, limit int) bool {
+	s.concMu.Lock()
+	if lifecycle.Paused || (enabled && !s.engine.ReadyFor(task)) {
+		s.concMu.Unlock()
+		return true // skip this entry, keep scanning
+	}
+	if s.promoting[task.ID] {
+		s.concMu.Unlock()
+		return true // a commit for this task is already in flight
+	}
+	used := s.runningTaskCount("") + s.admitting
+	if enabled && used >= limit {
+		s.concMu.Unlock()
+		return false
+	}
+	// Re-check under the lock: another path may have dequeued it already.
+	if current := task.lifecycleSnapshot(); !current.Queued || isTerminalStatus(current.Status) {
+		s.concMu.Unlock()
+		return true
+	}
+	if s.promoting == nil {
+		s.promoting = map[string]bool{}
+	}
+	s.promoting[task.ID] = true
+	s.admitting++
+	s.concMu.Unlock()
+
+	done := func() {
+		s.concMu.Lock()
+		delete(s.promoting, task.ID)
+		s.admitting--
+		s.concMu.Unlock()
+	}
+
+	mode := lifecycle.QueueMode
+	if mode != "bootstrap" && mode != "resume" {
+		mode = s.resumeAdmissionMode(task)
+	}
+	if mode != "bootstrap" {
+		mode = "resume"
+	}
+	if !s.engine.beginTaskOperation(task.ID) {
+		done()
+		return true
+	}
+	defer s.engine.decInflight(task.ID)
+	if err := s.m.ApplyTaskAdmission(task.ID, lifecycle.Status, lifecycle.Status, false, mode, false); err != nil {
+		done()
+		return true
+	}
+	// The engine now owns the slot as a started task, so the reservation is no
+	// longer needed — but startAdmittedTask runs first so there is no gap.
+	s.startAdmittedTask(task, mode)
+	done()
+	return true
 }
 
 // reviveTask 让一个已停下的任务重新跑起来:把终态(done/failed/timeout)拉回 running、

@@ -27,7 +27,8 @@ type Scheduler struct {
 
 const (
 	schedKeyLastFinding    = "last_finding_id"    // watermark: max finding node id fired for
-	schedKeyFiredGoals     = "fired_goals"        // JSON array of goal node ids already fired
+	schedKeyFiredGoals     = "fired_goals"        // JSON array of goal node ids already fired (legacy, still read)
+	schedKeyLastGoalAt     = "last_goal_at"       // watermark: unix-nanos of the newest met-goal update fired for
 	schedKeyLastTimeout    = "last_timeout_id"    // watermark: max task id fired for task timeout
 	schedKeyLastToolCall   = "last_toolcall_id"   // watermark: max activity id fired for tool call
 	schedKeyLastTaskCreate = "last_taskcreate_id" // watermark: max task id fired for task create
@@ -70,14 +71,17 @@ func (sc *Scheduler) init() {
 		}
 		_ = sc.pg.SetSchedState(schedKeyLastFinding, strconv.FormatInt(maxID, 10))
 	}
-	if sc.mustState(schedKeyFiredGoals) == "" {
+	if sc.mustState(schedKeyFiredGoals) == "" && sc.mustState(schedKeyLastGoalAt) == "" {
+		// First run of the goal trigger: mark everything already met as consumed so
+		// enabling an on_goal_met trigger later does not replay task history.
 		set := map[int64]bool{}
-		if evs, err := sc.pg.MetGoals(); err == nil {
+		if evs, err := sc.pg.MetGoalsSince(time.Unix(0, 0)); err == nil {
 			for _, e := range evs {
 				set[e.NodeID] = true
 			}
 		}
 		sc.saveFiredGoalSet(set)
+		_ = sc.pg.SetSchedState(schedKeyLastGoalAt, strconv.FormatInt(time.Now().UnixNano(), 10))
 	}
 	if sc.mustState(schedKeyLastTimeout) == "" {
 		var maxID int64
@@ -189,7 +193,16 @@ func (sc *Scheduler) fireGoals(triggers []*db.AgentTrigger) {
 			want = append(want, tr)
 		}
 	}
-	events, err := sc.pg.MetGoals()
+	// The watermark is a nanosecond timestamp of the newest met-goal update seen.
+	// It replaces the previous "read every met goal ever, filter against a
+	// persisted id set" shape, which re-scanned the whole table four times a
+	// minute. Goals are created up front and marked met later, so updated_at — not
+	// node id — is the monotonic signal.
+	since := int64(0)
+	if raw := sc.mustState(schedKeyLastGoalAt); raw != "" {
+		since, _ = strconv.ParseInt(raw, 10, 64)
+	}
+	events, err := sc.pg.MetGoalsSince(time.Unix(0, since))
 	if err != nil || len(events) == 0 {
 		return
 	}
@@ -197,7 +210,11 @@ func (sc *Scheduler) fireGoals(triggers []*db.AgentTrigger) {
 	// on_goal_met trigger later doesn't replay every already-met goal.
 	fired := sc.firedGoalSet()
 	changed := false
+	maxAt := since
 	for _, e := range events {
+		if e.UpdatedAt > maxAt {
+			maxAt = e.UpdatedAt
+		}
 		if fired[e.NodeID] {
 			continue
 		}
@@ -213,6 +230,9 @@ func (sc *Scheduler) fireGoals(triggers []*db.AgentTrigger) {
 	}
 	if changed {
 		sc.saveFiredGoalSet(fired)
+	}
+	if maxAt > since {
+		_ = sc.pg.SetSchedState(schedKeyLastGoalAt, strconv.FormatInt(maxAt, 10))
 	}
 }
 

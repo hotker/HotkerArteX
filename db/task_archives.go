@@ -540,25 +540,38 @@ UNION SELECT value::bigint FROM findings finding
 // writes are already quiescent at the server barrier; repeatable-read also keeps
 // the asset and accounting views mutually consistent during serialization.
 func (d *DB) SnapshotTaskArchive(taskID int64) (*TaskArchiveSnapshot, error) {
-	return d.snapshotTaskArchive(taskID, nil)
+	return d.snapshotTaskArchive(context.Background(), taskID, nil)
 }
 
 // SnapshotTaskArchiveWithLLMRecords streams the heavyweight record history to
 // llmRecords while all other task-owned data is read from the same repeatable
 // PostgreSQL snapshot.
-func (d *DB) SnapshotTaskArchiveWithLLMRecords(taskID int64, llmRecords io.Writer) (*TaskArchiveSnapshot, error) {
+func (d *DB) SnapshotTaskArchiveWithLLMRecords(ctx context.Context, taskID int64, llmRecords io.Writer) (*TaskArchiveSnapshot, error) {
 	if llmRecords == nil {
 		return nil, errors.New("nil LLM record archive writer")
 	}
-	return d.snapshotTaskArchive(taskID, llmRecords)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return d.snapshotTaskArchive(ctx, taskID, llmRecords)
 }
 
-func (d *DB) snapshotTaskArchive(taskID int64, llmRecords io.Writer) (*TaskArchiveSnapshot, error) {
-	tx, err := d.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+// archiveSnapshotStatementTimeout bounds each statement of the archive snapshot.
+// The snapshot reads ~20 tables under repeatable-read while holding the schema
+// advisory lock; without a timeout a large task (or a lock wait behind a
+// concurrent VACUUM/DDL) can hold both indefinitely — blocking a second
+// instance's startup migration and pinning a pool connection the whole time.
+const archiveSnapshotStatementTimeout = "60s"
+
+func (d *DB) snapshotTaskArchive(ctx context.Context, taskID int64, llmRecords io.Writer) (*TaskArchiveSnapshot, error) {
+	tx, err := d.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
+	if _, err := tx.ExecContext(ctx, `SET LOCAL statement_timeout = '`+archiveSnapshotStatementTimeout+`'`); err != nil {
+		return nil, err
+	}
 	if err := coordinateWithSchemaMigration(tx); err != nil {
 		return nil, err
 	}

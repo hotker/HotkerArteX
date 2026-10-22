@@ -22,10 +22,10 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { ApprovalExecutionFocus, useApprovalFocus, useApprovalHistory } from "@/components/approval-execution-focus";
 import { MentionTextarea } from "@/components/mention-textarea";
 import { SideQuestionButton, SideQuestionWorkspace } from "@/components/side-question-workspace";
 import { TodoPopover } from "@/components/todo-popover";
-import { ApprovalExecutionFocus, useApprovalFocus, useApprovalHistory } from "@/components/approval-execution-focus";
 import { Transcript } from "@/components/transcript";
 import {
   AlertDialog,
@@ -508,6 +508,8 @@ function ChatView({
   const hasMoreRef = React.useRef(false); // older history remains above the loaded window
   const loadingMoreRef = React.useRef(false); // guard: one scroll-up load at a time
   const [historyLoaded, setHistoryLoaded] = React.useState(false);
+  const [historyError, setHistoryError] = React.useState<string | null>(null);
+  const [historyRetry, setHistoryRetry] = React.useState(0);
   const [hasMore, setHasMore] = React.useState(false); // drives the "load earlier" hint
   const agent = agents.find((a) => a.key === conv.agent_key);
   const currentProfileId = conv.llm_profile_id ?? null;
@@ -539,6 +541,7 @@ function ChatView({
   // page shows it immediately (issue #3: opening/refresh used to load the oldest
   // page, so the completed result was missing until another message advanced the
   // cursor). Older history streams in on scroll-up (loadEarlier below).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: historyRetry is an explicit manual-retry trigger.
   React.useEffect(() => {
     cursorRef.current = 0;
     earliestRef.current = 0;
@@ -546,6 +549,7 @@ function ChatView({
     setHasMore(false);
     setMessages([]);
     setHistoryLoaded(false);
+    setHistoryError(null);
     setRunning(false);
     let live = true;
     api
@@ -560,15 +564,19 @@ function ChatView({
         setRunning((current) => current || r.running);
         setHistoryLoaded(true);
       })
-      .catch(() => {
-        // A source link can retry history through its locator; ordinary chats
-        // retain the existing usable empty state on a transient failure.
-        if (live) setHistoryLoaded(true);
+      .catch((e: unknown) => {
+        // A failed history load must not render as an empty conversation: the
+        // bespoke "开始和「…」对话" copy asserts the thread has no messages, so a
+        // single 500 during a backend restart would look like the history was
+        // wiped. Surface the error and offer a retry instead.
+        if (!live) return;
+        setHistoryError(e instanceof Error ? e.message : "加载失败");
+        setHistoryLoaded(true);
       });
     return () => {
       live = false;
     };
-  }, [conv.id]);
+  }, [conv.id, historyRetry]);
 
   // A trigger or another tab may start a turn while this conversation is open.
   // A false list snapshot must not stop the tail before its final messages load.
@@ -607,14 +615,23 @@ function ChatView({
     };
   }, [running, conv.id, onTitleMaybeChanged]);
 
-  const loadFocusPage = React.useCallback((before: number) => api.conversationHistory(conv.id, before, HISTORY_PAGE), [conv.id]);
+  const loadFocusPage = React.useCallback(
+    (before: number) => api.conversationHistory(conv.id, before, HISTORY_PAGE),
+    [conv.id],
+  );
   const mergeFocusPage = React.useCallback((page: { items: Activity[]; hasMore: boolean }) => {
     setMessages((prev) => mergeActivities(page.items, prev));
     earliestRef.current = page.items[0]?.seq ?? earliestRef.current;
     hasMoreRef.current = page.hasMore;
     setHasMore(page.hasMore);
   }, []);
-  const focusHistory = useApprovalHistory(approvalFocus.state?.source, historyLoaded, messages, loadFocusPage, mergeFocusPage);
+  const focusHistory = useApprovalHistory(
+    approvalFocus.state?.source,
+    historyLoaded,
+    messages,
+    loadFocusPage,
+    mergeFocusPage,
+  );
 
   // ---- transcript auto-scroll (open → bottom; stick to bottom unless scrolled up) ----
   const contentRef = React.useRef<HTMLDivElement | null>(null);
@@ -795,7 +812,18 @@ function ChatView({
       {/* messages */}
       <ScrollArea type="auto" className="min-h-0 min-w-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:block!">
         <div className="min-w-0 max-w-full px-4 py-3" ref={contentRef}>
-          {messages.length === 0 && !running ? (
+          {historyError ? (
+            <div className="flex flex-col items-center gap-3 py-10 text-center text-sm">
+              <p className="text-muted-foreground">聊天记录加载失败：{historyError}</p>
+              <button
+                type="button"
+                className="rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                onClick={() => setHistoryRetry((n) => n + 1)}
+              >
+                重试
+              </button>
+            </div>
+          ) : messages.length === 0 && !running ? (
             <div className="text-muted-foreground py-10 text-center text-sm">
               开始和「{agent?.name ?? conv.agent_key}」对话
             </div>
@@ -804,7 +832,13 @@ function ChatView({
               {hasMore && (
                 <div className="text-muted-foreground/70 pb-2 text-center text-[11px]">向上滚动加载更早的消息…</div>
               )}
-              <Transcript activity={messages} live={running} chat fetchDetail={fetchDetail} focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined} />
+              <Transcript
+                activity={messages}
+                live={running}
+                chat
+                fetchDetail={fetchDetail}
+                focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined}
+              />
             </>
           )}
         </div>
@@ -1050,15 +1084,18 @@ export default function ChatPage() {
   const [selectedId, setSelectedId] = React.useState<number | null>(null);
   const [sourceRequested, setSourceRequested] = React.useState(false);
   const [convsLoaded, setConvsLoaded] = React.useState(false);
-  const selectConversation = React.useCallback((id: number | null) => {
-    if (id !== selectedId) {
-      const url = new URL(window.location.href);
-      url.searchParams.delete("approval");
-      setSourceRequested(false);
-      window.history.replaceState(null, "", url);
-    }
-    setSelectedId(id);
-  }, [selectedId]);
+  const selectConversation = React.useCallback(
+    (id: number | null) => {
+      if (id !== selectedId) {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("approval");
+        setSourceRequested(false);
+        window.history.replaceState(null, "", url);
+      }
+      setSelectedId(id);
+    },
+    [selectedId],
+  );
 
   const [renamingId, setRenamingId] = React.useState<number | null>(null);
   const [renameText, setRenameText] = React.useState("");
@@ -1085,7 +1122,10 @@ export default function ChatPage() {
     const seq = ++conversationListSeq.current;
     try {
       const items = await api.conversations();
-      if (seq === conversationListSeq.current) { setConvs(items); setConvsLoaded(true); }
+      if (seq === conversationListSeq.current) {
+        setConvs(items);
+        setConvsLoaded(true);
+      }
     } catch {
       // Preserve the selected transcript and list on a transient poll failure.
     }

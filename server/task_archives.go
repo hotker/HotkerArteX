@@ -160,7 +160,9 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 		return err
 	}
 	_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "snapshot_database", 20)
-	snapshot, snapshotErr := s.m.pg.SnapshotTaskArchiveWithLLMRecords(job.TaskID, streamFile)
+	// Bounded by the server context so shutdown can abort a large snapshot
+	// instead of waiting for it, and cancelled if the process is stopping.
+	snapshot, snapshotErr := s.m.pg.SnapshotTaskArchiveWithLLMRecords(s.ctx, job.TaskID, streamFile)
 	var syncErr error
 	if snapshotErr == nil {
 		syncErr = streamFile.Sync()
@@ -231,9 +233,7 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 		_ = s.m.pg.AppendTaskArchiveWarning(job.ID, warning)
 	}
 	s.engine.StopTask(taskID)
-	s.taskAgentMu.Lock()
-	delete(s.taskAgents, taskID)
-	s.taskAgentMu.Unlock()
+	s.dropTaskAgent(taskID)
 	s.m.forgetTask(taskID, job.TaskID)
 	return nil
 }

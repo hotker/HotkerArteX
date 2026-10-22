@@ -296,14 +296,41 @@ func (d *DB) ListAllInterceptsPage(page, size int, filter InterceptApprovalFilte
 	return d.listInterceptsPage("", page, size, filter)
 }
 
-// ListTaskIntercepts returns all intercept_pending rows for a specific task (newest first).
+// ListTaskIntercepts returns intercept_pending rows for a specific task (newest
+// first), capped at maxListTaskIntercepts. The cap matters because the sessions
+// tab polls this every few seconds: an uncapped read turns a task with a long
+// approval history into a multi-megabyte response on every poll. Callers that
+// need the full history page through ListTaskInterceptsPage.
+const maxListTaskIntercepts = 500
+
 func (d *DB) ListTaskIntercepts(taskID string) ([]InterceptApprovalRow, error) {
-	rows, err := d.Query(approvalRowSelect+` WHERE ip.task_id=$1 ORDER BY ip.created_at DESC`, taskID)
+	rows, err := d.Query(approvalRowSelect+` WHERE ip.task_id=$1 ORDER BY ip.created_at DESC LIMIT $2`, taskID, maxListTaskIntercepts)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []InterceptApprovalRow
+	for rows.Next() {
+		var r InterceptApprovalRow
+		if err := scanInterceptApprovalRow(rows, &r); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListPendingInterceptsForTask returns only the unresolved approvals of one task.
+// It is what the polling UI needs, and it hits the partial index on
+// (task_id, created_at) WHERE status='pending'.
+func (d *DB) ListPendingInterceptsForTask(taskID string) ([]InterceptApprovalRow, error) {
+	rows, err := d.Query(approvalRowSelect+` WHERE ip.task_id=$1 AND ip.status='pending' ORDER BY ip.created_at DESC LIMIT $2`,
+		taskID, maxListTaskIntercepts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []InterceptApprovalRow{}
 	for rows.Next() {
 		var r InterceptApprovalRow
 		if err := scanInterceptApprovalRow(rows, &r); err != nil {

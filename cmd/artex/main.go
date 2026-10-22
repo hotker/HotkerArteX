@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -50,9 +51,35 @@ func main() {
 	os.Exit(run())
 }
 
+// warnIfPublic logs a loud warning when -addr binds every interface. That is the
+// right setting inside a container (the port mapping needs it) and for a
+// deliberately LAN-exposed install, but it is also how an install ends up
+// reachable from the office network with only the /setup screen in front of it.
+// The banner line alone did not make that visible: it printed ":8787" and looked
+// identical to the old default.
+func warnIfPublic(addr string) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// ":8787" splits cleanly; anything else is passed to the listener verbatim.
+		host = addr
+	}
+	if host != "" && host != "0.0.0.0" && host != "::" {
+		return
+	}
+	log.Printf("[security] -addr %s 监听所有网卡，控制台对同网段可达。仅在容器/反代或确需远程访问时这样启动；"+
+		"本机使用请改用 -addr 127.0.0.1:8787。", addr)
+}
+
 func run() int {
 	var (
-		addr    = flag.String("addr", ":8787", "HTTP listen address")
+		// Default to loopback. The backend holds an unauthenticated-until-setup
+		// admin API, a JWT key and a full capture archive; binding 0.0.0.0 by
+		// default exposed all of it to the local network for anyone who started
+		// the binary and walked away before finishing /setup. Docker and LAN
+		// deployments opt in explicitly (the image passes -addr :8787, which the
+		// port mapping needs) — an operator who wants remote access can pass
+		// ":8787" just as well, but it is now a decision rather than a default.
+		addr    = flag.String("addr", "127.0.0.1:8787", "HTTP listen address (use \":8787\" to bind all interfaces)")
 		dataDir = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
 		proxy   = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
 	)
@@ -117,7 +144,13 @@ func run() int {
 		Addr:              *addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// Without an idle timeout a peer can hold connections open indefinitely
+		// (one goroutine each) after finishing nothing but headers. IdleTimeout
+		// covers keep-alive connections between requests; long requests, uploads
+		// and SSE streams are unaffected because they are not idle.
+		IdleTimeout: 120 * time.Second,
 	}
+	warnIfPublic(*addr)
 
 	go func() {
 		log.Printf("ARTEX %s backend listening on %s (data=%s, workers=%d)", version, *addr, *dataDir, mgr.Workers())
@@ -141,6 +174,13 @@ func run() int {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+	// Stop the engines BEFORE the deferred mgr.Close() runs. The deferred order is
+	// LIFO, so mgr.Close() (registered first) would otherwise close the PostgreSQL
+	// pool while planner/worker loops are still writing: their final intent
+	// state write-backs and activity inserts fail, leaving intents stuck in
+	// 'running' across the restart. Stop cancels the server context and joins the
+	// task runtimes within its own bound.
+	srv.Stop()
 	return code
 }
 

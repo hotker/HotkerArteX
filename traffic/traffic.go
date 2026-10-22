@@ -30,6 +30,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Autumn-27/artex/capture"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -96,6 +97,12 @@ const (
 	// maxIndexBody caps a single body's contribution to the full-text index. Text
 	// is indexed in full below this; binary never reaches the index at all.
 	maxIndexBody = 4 * 1024 * 1024
+	// streamCaptureCap is how much of an unbuffered (streamed) body is kept. The
+	// proxy streams SSE responses and anything above 5 MiB, so the body can be
+	// unbounded; only the head is captured, and req_len/resp_len record the true
+	// byte count. 1 MiB is enough to see an SSE exchange's events or the first
+	// pages of a large download without holding a live stream in memory.
+	streamCaptureCap = 1024 * 1024
 	// minTrigram is the shortest term the trigram tokenizer can match; shorter
 	// queries fall back to metadata LIKE.
 	minTrigram = 3
@@ -214,6 +221,12 @@ func Open(dir, addr string) (*Traffic, error) {
 		db.Close()
 		return nil, err
 	}
+	// NewProxy generates the self-signed CA on first run, and the SDK creates it
+	// with os.Create — i.e. 0666 minus the umask, typically 0644. The re-hardening
+	// in record() only runs after the first capture, so until then the CA *private
+	// key* (which forges TLS for any domain) is world-readable. Tighten it here,
+	// where the file is actually created.
+	hardenCAFiles(dir)
 	// Upstream selection. By default (no global egress proxy set) targets are
 	// dialed DIRECTLY: go-mitmproxy's own default upstream uses
 	// http.ProxyFromEnvironment, so an HTTP_PROXY/HTTPS_PROXY in the environment
@@ -239,12 +252,24 @@ func Open(dir, addr string) (*Traffic, error) {
 // creates with default umask permissions on first use: mitmproxy-ca.pem holds
 // the CA *private key* (whoever has it can forge TLS for any domain), so it is
 // 0600 owner-only, while the two public certs stay 0644 (they are meant to be
-// distributed). Safe to call when nothing exists yet.
+// distributed). Safe to call when nothing exists yet. A chmod failure is
+// reported rather than swallowed: a key left at 0644 is a security regression
+// that must be visible in the log.
 func hardenCAFiles(dir string) {
 	caDir := filepath.Join(dir, "_ca")
-	_ = os.Chmod(filepath.Join(caDir, "mitmproxy-ca.pem"), 0o600)
-	_ = os.Chmod(filepath.Join(caDir, "mitmproxy-ca-cert.pem"), 0o644)
-	_ = os.Chmod(filepath.Join(caDir, "mitmproxy-ca-cert.cer"), 0o644)
+	// The directory itself holds only key material; keep it owner-only so the
+	// key cannot be listed or read by another local account even before chmod.
+	_ = os.Chmod(caDir, 0o700)
+	for name, mode := range map[string]os.FileMode{
+		"mitmproxy-ca.pem":      0o600,
+		"mitmproxy-ca-cert.pem": 0o644,
+		"mitmproxy-ca-cert.cer": 0o644,
+	} {
+		p := filepath.Join(caDir, name)
+		if err := os.Chmod(p, mode); err != nil && !os.IsNotExist(err) {
+			log.Printf("[traffic] CA 权限收紧失败 %s: %v", p, err)
+		}
+	}
 }
 
 // recheckCAHardening re-applies the CA permissions at most once per 30s. The CA
@@ -420,7 +445,8 @@ func (t *Traffic) DB() *sql.DB { return t.db }
 // sink is the go-mitmproxy addon that records completed exchanges.
 type sink struct {
 	mproxy.BaseAddon
-	t *Traffic
+	t       *Traffic
+	pending sync.Map // flow id -> *streamState, only for streamed (unbuffered) flows
 }
 
 func (s *sink) Response(f *mproxy.Flow) {
@@ -428,6 +454,107 @@ func (s *sink) Response(f *mproxy.Flow) {
 		return
 	}
 	s.t.record(f)
+}
+
+// StreamRequestModifier / StreamResponseModifier cover the flows the proxy does
+// NOT buffer: anything above StreamLargeBodies (5 MiB by default) and every SSE
+// response is marked f.Stream, and for those go-mitmproxy never calls Request()
+// or Response(). Without these hooks such exchanges were silently absent from the
+// capture — a large download or a live event stream left no trace at all, which
+// is exactly the traffic an operator most wants to inspect. We tee the stream,
+// keep a bounded head, count the full length, and record when the flow finishes.
+func (s *sink) StreamRequestModifier(f *mproxy.Flow, in io.Reader) io.Reader {
+	if !f.Stream || f.Request == nil || f.WebScoket != nil {
+		return in
+	}
+	state, loaded := s.pending.LoadOrStore(f.Id, &streamState{})
+	st, ok := state.(*streamState)
+	if !ok {
+		return in
+	}
+	st.req = &captureReader{r: in}
+	if !loaded {
+		// The request modifier is the first hook a streamed flow reaches, so it
+		// owns the completion watch. Waiting on Flow.Done (rather than the body
+		// reader's EOF) records exactly once even when the exchange dies before a
+		// response arrives, or when the downstream write fails mid-stream and the
+		// reader is never polled again.
+		go func() {
+			<-f.Done()
+			s.pending.Delete(f.Id)
+			// A stream can outlive Close (shutdown cancels the proxy but a live SSE
+			// connection may still be draining). Recording then would log a spurious
+			// "sql: database is closed" for every open stream.
+			if s.t.stopping() {
+				return
+			}
+			s.recordStream(f, st)
+		}()
+	}
+	return st.req
+}
+
+func (s *sink) StreamResponseModifier(f *mproxy.Flow, in io.Reader) io.Reader {
+	if !f.Stream || f.Request == nil || f.Response == nil || f.WebScoket != nil {
+		return in
+	}
+	state, _ := s.pending.LoadOrStore(f.Id, &streamState{})
+	st, ok := state.(*streamState)
+	if !ok {
+		return in
+	}
+	st.resp = &captureReader{r: in}
+	return st.resp
+}
+
+// streamState is one streamed exchange's captured heads.
+type streamState struct {
+	req  *captureReader
+	resp *captureReader
+	once sync.Once
+}
+
+// captureReader tees a streamed body: it keeps at most streamCaptureCap bytes and
+// counts the rest. Bounded on purpose — an SSE stream or a multi-GB download can
+// run indefinitely, and buffering it whole would exhaust memory.
+type captureReader struct {
+	r     io.Reader
+	mu    sync.Mutex
+	head  []byte
+	total int64
+}
+
+func (c *captureReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n > 0 {
+		c.mu.Lock()
+		c.total += int64(n)
+		if room := streamCaptureCap - len(c.head); room > 0 {
+			if room > n {
+				room = n
+			}
+			c.head = append(c.head, p[:room]...)
+		}
+		c.mu.Unlock()
+	}
+	return n, err
+}
+
+func (c *captureReader) snapshot() ([]byte, int64) {
+	if c == nil {
+		return nil, 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.head, c.total
+}
+
+func (s *sink) recordStream(f *mproxy.Flow, st *streamState) {
+	st.once.Do(func() {
+		reqBody, reqLen := st.req.snapshot()
+		respBody, respLen := st.resp.snapshot()
+		s.t.recordExchange(f, reqBody, respBody, reqLen, respLen)
+	})
 }
 
 // RequestError fires when a request through an established MITM tunnel fails. If
@@ -468,6 +595,22 @@ func proxyCausedErr(err error) bool {
 // full-text index. Nothing is written to a per-request directory — only bodies
 // above maxInlineBody spill to the content-addressed blob store.
 func (t *Traffic) record(f *mproxy.Flow) {
+	t.recordExchange(f, f.Request.Body, f.Response.Body, int64(len(f.Request.Body)), int64(len(f.Response.Body)))
+}
+
+// recordExchange writes one exchange given its (possibly truncated) bodies and
+// their true wire lengths. Buffered flows pass the whole body, so length and
+// slice size agree; streamed flows pass the captured head plus the full count.
+func (t *Traffic) recordExchange(f *mproxy.Flow, reqBody, respBody []byte, reqLen, respLen int64) {
+	if f == nil || f.Request == nil || f.Request.URL == nil {
+		return
+	}
+	// A streamed flow can finish without ever getting a response (the upstream
+	// dial or the TLS handshake failed). There is no exchange to record then —
+	// RequestError has already decided whether the host needs passthrough.
+	if f.Response == nil {
+		return
+	}
 	t.recheckCAHardening()
 	// The write lock covers blob + index writes, so DeleteHost (and its blob GC)
 	// can run under the same lock without racing a concurrent record.
@@ -486,8 +629,8 @@ func (t *Traffic) record(f *mproxy.Flow) {
 	respHead := fmt.Sprintf("HTTP %d\n%s", f.Response.StatusCode, headerLines(f.Response.Header))
 	// Bodies are spilled before the transaction opens: blob writes are filesystem
 	// work and must not sit inside the SQLite write lock.
-	reqB := t.spill(f.Request.Body, f.Request.Header.Get("Content-Type"))
-	respB := t.spill(f.Response.Body, ct)
+	reqB := t.spill(reqBody, f.Request.Header.Get("Content-Type"))
+	respB := t.spill(respBody, ct)
 
 	tx, err := t.db.Begin()
 	if err != nil {
@@ -501,7 +644,7 @@ func (t *Traffic) record(f *mproxy.Flow) {
 	res, err := tx.Exec(`INSERT OR REPLACE INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path)
 VALUES(?,?,?,?,?,?,?,?,?,?,'')`,
 		id, now.Unix(), host, method, tmpl, url, f.Response.StatusCode, ct,
-		len(f.Request.Body), len(f.Response.Body))
+		reqLen, respLen)
 	if err != nil {
 		log.Printf("[traffic] 记录 %s 失败（写索引）：%v", url, err)
 		return
@@ -867,6 +1010,25 @@ type PageQuery struct {
 var sortColumns = map[string]string{"ts": "ts", "status": "status", "resp_len": "resp_len"}
 
 // statusFilter turns a status token into a SQL condition: an exact code ("404")
+// escapeLike escapes the LIKE metacharacters in a user-supplied substring so it
+// matches literally. Without it a filter of "%" matches every row, and — because
+// the delete path feeds the same substring into a LIKE — turns "delete what I
+// filtered" into "delete everything". Callers pair it with ESCAPE '\'.
+func escapeLike(s string) string {
+	if !strings.ContainsAny(s, `\%_`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 4)
+	for _, r := range s {
+		if r == '\\' || r == '%' || r == '_' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // matches that status, an "Nxx" class ("4xx") matches the whole hundreds band.
 // ok is false for an empty or unrecognized token.
 func statusFilter(s string) (cond string, args []any, ok bool) {
@@ -910,13 +1072,13 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 		args = append(args, vs...)
 	}
 	if h := strings.TrimSpace(f.Host); h != "" {
-		add("host LIKE ?", "%"+h+"%")
+		add(`host LIKE ? ESCAPE '\'`, "%"+escapeLike(h)+"%")
 	}
 	if m := strings.TrimSpace(f.Method); m != "" {
 		add("method=?", strings.ToUpper(m))
 	}
 	if p := strings.TrimSpace(f.Path); p != "" {
-		add("url_template LIKE ?", "%"+p+"%")
+		add(`url_template LIKE ? ESCAPE '\'`, "%"+escapeLike(p)+"%")
 	}
 	if cond, sargs, ok := statusFilter(f.Status); ok {
 		add(cond, sargs...)
@@ -928,8 +1090,8 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 		add("resp_len<=?", f.RespMax)
 	}
 	if s := strings.TrimSpace(f.Query); s != "" {
-		like := "%" + s + "%"
-		const meta = "host LIKE ? OR url LIKE ? OR url_template LIKE ? OR method LIKE ? OR content_type LIKE ? OR CAST(status AS TEXT) LIKE ?"
+		like := "%" + escapeLike(s) + "%"
+		const meta = `host LIKE ? ESCAPE '\' OR url LIKE ? ESCAPE '\' OR url_template LIKE ? ESCAPE '\' OR method LIKE ? ESCAPE '\' OR content_type LIKE ? ESCAPE '\' OR CAST(status AS TEXT) LIKE ? ESCAPE '\'`
 		// Metadata match OR full-text match: one search box, widest recall. Terms
 		// too short for trigram silently fall back to metadata only.
 		if cond, arg, ok := t.ftsFilter(s); ok {
@@ -1004,6 +1166,12 @@ FROM exchange_bodies b JOIN exchanges e ON e.id=b.id WHERE b.id=?`, id).
 	if strings.TrimSpace(rel) == "" {
 		return "", "", fmt.Errorf("exchange %s 无正文记录", id)
 	}
+	// rel comes from the recorder today, but a DB-write primitive or an imported
+	// archive could plant "../.." here — refuse anything that is not a local path
+	// under the traffic tree (the same guard readEvidence applies).
+	if !filepath.IsLocal(rel) {
+		return "", "", fmt.Errorf("exchange %s 的正文路径非法", id)
+	}
 	rb, _ := os.ReadFile(filepath.Join(t.dir, rel, "request.http"))
 	pb, _ := os.ReadFile(filepath.Join(t.dir, rel, "response.http"))
 	return string(rb), string(pb), nil
@@ -1063,12 +1231,16 @@ func (t *Traffic) Count() (int, error) {
 // blobs are shared across hosts and so are garbage-collected afterwards rather
 // than deleted by host. Returns rows deleted.
 func (t *Traffic) DeleteHost(host string) (int64, error) {
-	like := "%" + host + "%"
+	// The filter reaches here as a LIKE pattern, so '%' and '_' in the user's
+	// input would widen it: a host filter of "%" turns the "delete what you
+	// filtered" action into "delete everything". Escape both (and the escape
+	// character itself) so the pattern matches the substring literally.
+	like := "%" + escapeLike(host) + "%"
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
 	// Resolved before the rows go away: with a substring match, the index is the
 	// only record of which host directories the filter actually hit.
-	legacy, err := t.hostTrees(`host LIKE ?`, like)
+	legacy, err := t.hostTrees(`host LIKE ? ESCAPE '\'`, like)
 	if err != nil {
 		return 0, err
 	}
@@ -1077,7 +1249,7 @@ func (t *Traffic) DeleteHost(host string) (int64, error) {
 		return 0, err
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
-	n, err := t.deleteWhere(tx, `host LIKE ?`, like)
+	n, err := t.deleteWhere(tx, `host LIKE ? ESCAPE '\'`, like)
 	if err != nil {
 		return 0, err
 	}
@@ -1116,6 +1288,12 @@ func (t *Traffic) DeleteHost(host string) (int64, error) {
 // Returns the number of exchanges deleted and how many bytes of index the
 // compaction handed back.
 func (t *Traffic) DeleteAll() (deleted int64, reclaimed int64, err error) {
+	// The lock is held across the compaction on purpose: VACUUM takes SQLite's
+	// exclusive lock, so a concurrent record() would not run anyway — it would
+	// just fail with SQLITE_BUSY once busy_timeout expires and silently drop the
+	// exchange. Queuing on wmu lets those writes through as soon as the compaction
+	// ends. The compaction is cheap here for the same reason it is scheduled here:
+	// VACUUM costs what it keeps, and this runs on an index just emptied.
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
 	before := t.indexBytes()
@@ -1981,8 +2159,9 @@ func (t *Traffic) query(host, contains, bodyContains string, page, limit int) ([
 		}
 	}
 	if contains != "" {
-		q += ` AND (url LIKE ? OR url_template LIKE ?)`
-		args = append(args, "%"+contains+"%", "%"+contains+"%")
+		q += ` AND (url LIKE ? ESCAPE '\' OR url_template LIKE ? ESCAPE '\')`
+		esc := "%" + escapeLike(contains) + "%"
+		args = append(args, esc, esc)
 	}
 	if b := strings.TrimSpace(bodyContains); b != "" {
 		cond, arg, ok := t.ftsFilter(b)
@@ -2051,11 +2230,51 @@ func normalizeSearchHost(raw string) (host, port string, err error) {
 
 // Tools exposes traffic lookup to work agents so they query already-captured
 // traffic instead of re-curling the same resource (token + dedup win).
+//
+// The tools are process-wide (one recorder, one index), but the READ is scoped to
+// the calling run: capture.Scope rides on the tool context and names the targets
+// that run is allowed to see. Without it, every agent bound to these tools could
+// read every other task's captures — including another engagement's credentials
+// and tokens, which is exactly what a capture archive contains.
+// A run with no attached scope (chat / Auto, no task) stays unrestricted.
 func (t *Traffic) Tools() []actool.CoreTool {
 	allow := func(context.Context, json.RawMessage, permission.Context) permission.Decision {
 		return permission.Allowed()
 	}
 	ro := func(json.RawMessage) bool { return true }
+
+	// checkScope enforces the run's capture scope for one host. "" means allowed.
+	checkScope := func(ctx context.Context, host string) string {
+		scope, ok := capture.From(ctx)
+		if !ok {
+			return ""
+		}
+		if scope.Allows(host) {
+			return ""
+		}
+		reason := scope.Reason
+		if reason == "" {
+			reason = "该主机不在当前任务的资产范围内"
+		}
+		return fmt.Sprintf("拒绝读取 %s 的流量：%s。traffic 工具只返回当前任务范围内的抓包。", host, reason)
+	}
+	// idInScope reports whether an exchange id belongs to an in-scope host. Used by
+	// traffic_get / traffic_blob, which take an id and would otherwise let a model
+	// walk the whole index one id at a time.
+	idInScope := func(ctx context.Context, id string) (string, error) {
+		if _, scoped := capture.From(ctx); !scoped {
+			return "", nil
+		}
+		var host string
+		err := t.db.QueryRow(`SELECT COALESCE(host,'') FROM exchanges WHERE id=?`, id).Scan(&host)
+		if err != nil {
+			return "", err
+		}
+		if msg := checkScope(ctx, host); msg != "" {
+			return msg, nil
+		}
+		return "", nil
+	}
 
 	search := actool.Build(actool.Spec{
 		Name:        "traffic_search",
@@ -2073,7 +2292,7 @@ func (t *Traffic) Tools() []actool.CoreTool {
 		},
 		ReadOnly:    ro,
 		Permissions: allow,
-		Run: func(_ context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
+		Run: func(ctx context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
 			var a struct {
 				Host, Contains string
 				BodyContains   string `json:"body_contains"`
@@ -2083,6 +2302,13 @@ func (t *Traffic) Tools() []actool.CoreTool {
 			_ = json.Unmarshal(in, &a)
 			if strings.TrimSpace(a.Host) == "" {
 				return actool.Errorf("host 为必填参数：请指定裸主机、主机:端口或完整 URL，避免全库扫描。"), nil
+			}
+			hostName, _, err := normalizeSearchHost(a.Host)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if msg := checkScope(ctx, hostName); msg != "" {
+				return actool.Errorf(msg), nil
 			}
 			rows, err := t.query(a.Host, a.Contains, a.BodyContains, a.Page, a.Limit)
 			if err != nil {
@@ -2118,9 +2344,14 @@ func (t *Traffic) Tools() []actool.CoreTool {
 		},
 		ReadOnly:    ro,
 		Permissions: allow,
-		Run: func(_ context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
+		Run: func(ctx context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
 			var a struct{ ID string }
 			_ = json.Unmarshal(in, &a)
+			if msg, err := idInScope(ctx, a.ID); err != nil {
+				return actool.Errorf(err.Error()), nil
+			} else if msg != "" {
+				return actool.Errorf(msg), nil
+			}
 			req, resp, err := t.Get(a.ID)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
@@ -2143,7 +2374,7 @@ func (t *Traffic) Tools() []actool.CoreTool {
 		},
 		ReadOnly:    ro,
 		Permissions: allow,
-		Run: func(_ context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
+		Run: func(ctx context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
 			var a struct {
 				Hash   string
 				Offset int64
@@ -2152,6 +2383,14 @@ func (t *Traffic) Tools() []actool.CoreTool {
 			_ = json.Unmarshal(in, &a)
 			if a.Length <= 0 || a.Length > maxBlobRead {
 				a.Length = maxBlobRead
+			}
+			// A blob is content-addressed and shared by every exchange that carried
+			// the same body, so scope is checked against the exchanges referencing
+			// it: the hash is readable only if at least one of them is in scope.
+			if msg, err := t.blobInScope(ctx, a.Hash); err != nil {
+				return actool.Errorf(err.Error()), nil
+			} else if msg != "" {
+				return actool.Errorf(msg), nil
 			}
 			data, total, err := t.BlobRange(a.Hash, a.Offset, a.Length)
 			if err != nil {
@@ -2169,6 +2408,47 @@ func (t *Traffic) Tools() []actool.CoreTool {
 	})
 
 	return []actool.CoreTool{search, get, blob}
+}
+
+// blobInScope reports whether any exchange referencing hash is in the run's
+// capture scope. "" means allowed (or no scope attached). Blobs are shared by
+// content, so a single in-scope reference is enough — the same bytes are already
+// visible through traffic_get of that exchange.
+func (t *Traffic) blobInScope(ctx context.Context, hash string) (string, error) {
+	scope, ok := capture.From(ctx)
+	if !ok {
+		return "", nil
+	}
+	rows, err := t.db.Query(`SELECT COALESCE(e.host,'') FROM blob_refs b
+JOIN exchanges e ON e.id=b.exchange_id WHERE b.hash=? LIMIT 32`, hash)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	reason := scope.Reason
+	if reason == "" {
+		reason = "该内容不在当前任务的资产范围内"
+	}
+	refs := 0
+	for rows.Next() {
+		var host string
+		if err := rows.Scan(&host); err != nil {
+			return "", err
+		}
+		refs++
+		if scope.Allows(host) {
+			return "", nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if refs == 0 {
+		// No references at all: the blob is orphaned (already collected). Treat it
+		// as out of scope rather than leaking content by hash alone.
+		return fmt.Sprintf("拒绝读取该内容：%s。", reason), nil
+	}
+	return fmt.Sprintf("拒绝读取该内容：%s。traffic 工具只返回当前任务范围内的抓包。", reason), nil
 }
 
 // SeedToolMetas returns the traffic tools built on a ZERO receiver, for seeding the

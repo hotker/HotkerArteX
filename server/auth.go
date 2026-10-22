@@ -24,7 +24,7 @@ const (
 	// change) revokes every token signed under the previous generation.
 	authTokenGenKey = "auth.token_gen"
 	jwtTTL          = 7 * 24 * time.Hour
-	keyChars       = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	keyChars        = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 	// 下限与 setup 页的前端校验一致——校验只放在前端等于没放，直接打 API 就能
 	// 绕过。上限是 bcrypt 的硬限制：超过 72 字节 GenerateFromPassword 会返回
@@ -151,8 +151,31 @@ func verifyJWT(tokenStr string, key []byte, currentGen int64) bool {
 	return tokenGen == currentGen
 }
 
-// extractToken reads the JWT from Authorization: Bearer header,
-// artex_token cookie, or ?token= query param (for SSE connections).
+// tokenQueryPaths are the only routes that accept a token in the query string.
+// EventSource cannot set an Authorization header, so the SSE endpoints need it;
+// everywhere else a token in the URL leaks into proxy logs, browser history and
+// Referer headers, and stays valid for the full 7-day TTL.
+var tokenQueryPaths = []string{
+	"/api/logs/stream",
+	"/api/update/stream",
+	"/api/exploration/activity/stream",
+}
+
+func tokenQueryAllowed(p string) bool {
+	for _, prefix := range tokenQueryPaths {
+		if p == prefix {
+			return true
+		}
+	}
+	// Side-question event streams: /api/side-questions/{id}/events
+	if strings.HasPrefix(p, "/api/side-questions/") && strings.HasSuffix(p, "/events") {
+		return true
+	}
+	return false
+}
+
+// extractToken reads the JWT from Authorization: Bearer header, artex_token
+// cookie, or — only on the streaming endpoints — ?token=.
 func extractToken(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		return strings.TrimPrefix(h, "Bearer ")
@@ -160,7 +183,10 @@ func extractToken(r *http.Request) string {
 	if c, err := r.Cookie("artex_token"); err == nil && c.Value != "" {
 		return c.Value
 	}
-	return r.URL.Query().Get("token")
+	if tokenQueryAllowed(r.URL.Path) {
+		return r.URL.Query().Get("token")
+	}
+	return ""
 }
 
 // requireAuth wraps h with JWT validation.
@@ -208,6 +234,12 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
+	// Rate limited before anything else: bcrypt runs before the "already set"
+	// check can reject, so an unauthenticated peer could otherwise burn CPU here
+	// for free, and a fresh install is exactly when nobody is watching the port.
+	if initThrottled(w, r) {
+		return
+	}
 	existing, _, err := pg.GetSetting(authPassKey)
 	if err != nil {
 		writeErr(w, 503, errDataSourceUnavailable)
@@ -217,6 +249,7 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码已设置")
 		return
 	}
+	initNoteAttempt(r)
 	var req struct {
 		Password string `json:"password"`
 	}
@@ -250,6 +283,7 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "token 生成失败")
 		return
 	}
+	initDone(r)
 	writeJSON(w, 200, map[string]any{"token": tok})
 }
 

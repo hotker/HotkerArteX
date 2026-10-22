@@ -39,9 +39,22 @@ func (e *Engine) markSettling(taskID string) bool {
 
 // ---------- 在跑计数(worker.Execute + planner.Plan),用于 drain ----------
 
+// inflightCounter returns the counter for taskID, creating it on first use.
+// A read-only caller must not create one: waitTaskQuiescent polls this for tasks
+// that may already be gone, and an unconditional LoadOrStore would leave an entry
+// behind for every such poll.
 func (e *Engine) inflightCounter(taskID string) *int64 {
 	v, _ := e.inflight.LoadOrStore(taskID, new(int64))
 	return v.(*int64)
+}
+
+// inflightValue is the read-only form: it returns nil when the task has no
+// counter, which callers treat as zero.
+func (e *Engine) inflightValue(taskID string) *int64 {
+	if v, ok := e.inflight.Load(taskID); ok {
+		return v.(*int64)
+	}
+	return nil
 }
 
 // beginTaskOperation atomically registers a task-owned operation unless deletion
@@ -57,9 +70,23 @@ func (e *Engine) beginTaskOperation(taskID string) bool {
 	return true
 }
 
-func (e *Engine) decInflight(taskID string) { atomic.AddInt64(e.inflightCounter(taskID), -1) }
+// decInflight releases one admission. It must not create a counter: StopTask
+// deletes the entry, and a detached run (runDetachedIntent is not part of the
+// task runtime's WaitGroup) can still finish afterwards. Recreating the counter
+// there would leave a zero-valued entry behind for a task that no longer exists.
+func (e *Engine) decInflight(taskID string) {
+	if p := e.inflightValue(taskID); p != nil {
+		atomic.AddInt64(p, -1)
+	}
+}
+
+// inflightCount reports the in-flight operations for a task without creating a
+// counter for it (see inflightCounter).
 func (e *Engine) inflightCount(taskID string) int64 {
-	return atomic.LoadInt64(e.inflightCounter(taskID))
+	if p := e.inflightValue(taskID); p != nil {
+		return atomic.LoadInt64(p)
+	}
+	return 0
 }
 
 // ---------- deadline ----------

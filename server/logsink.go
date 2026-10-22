@@ -136,9 +136,16 @@ func (s *logSinkT) add(l LogLine) {
 		s.ring = s.ring[len(s.ring)-s.cap:]
 	}
 	ch := s.dbCh
-	subs := make([]chan LogLine, 0, len(s.subs))
+	// Fan out while still holding the lock. The sends are non-blocking, and
+	// unsubscribe() closes each channel under this same lock, so a subscriber can
+	// never be written to after it closed — sending after an unlock (as this did)
+	// races a closing tab into "send on closed channel", which panics the process
+	// from inside log.Printf. This is the shape Broadcaster.Publish already uses.
 	for sub := range s.subs {
-		subs = append(subs, sub)
+		select {
+		case sub <- l:
+		default:
+		}
 	}
 	s.mu.Unlock()
 
@@ -146,13 +153,6 @@ func (s *logSinkT) add(l LogLine) {
 	if ch != nil {
 		select {
 		case ch <- dbWriteReq{seq: l.Seq, ll: l}:
-		default:
-		}
-	}
-
-	for _, sub := range subs {
-		select {
-		case sub <- l:
 		default:
 		}
 	}
@@ -192,10 +192,12 @@ func (s *logSinkT) subscribe() (<-chan LogLine, func()) {
 	var once sync.Once
 	return ch, func() {
 		once.Do(func() {
+			// Delete and close under the same lock the fan-out holds: add() sends
+			// while holding it, so a send can never overlap this close.
 			s.mu.Lock()
 			delete(s.subs, ch)
-			s.mu.Unlock()
 			close(ch)
+			s.mu.Unlock()
 		})
 	}
 }

@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -44,6 +44,11 @@ type ArchiveExchange struct {
 // ExportHosts writes an exact-host snapshot to dir. It holds the traffic writer
 // lock while reading SQLite and blobs, so each body and its index row come from
 // one consistent point in time.
+//
+// Rows and bodies are read in one join rather than one lookup per exchange, and
+// bodies are streamed to disk instead of buffered: a host's capture can hold
+// thousands of exchanges, and the per-row query plus a second copy of every
+// blob in memory is what made a large export both slow and memory-hungry.
 func (t *Traffic) ExportHosts(hosts []string, dir string) (int64, error) {
 	if t == nil || len(hosts) == 0 {
 		return 0, nil
@@ -60,8 +65,10 @@ func (t *Traffic) ExportHosts(hosts []string, dir string) (int64, error) {
 		placeholders[i] = "?"
 		args[i] = host
 	}
-	rows, err := t.db.Query(`SELECT id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path
-FROM exchanges WHERE host IN (`+strings.Join(placeholders, ",")+`) ORDER BY ts,id`, args...)
+	rows, err := t.db.Query(`SELECT e.id,e.ts,e.host,e.method,e.url_template,e.url,e.status,e.content_type,e.req_len,e.resp_len,e.path,
+       b.req_head,b.req_body,b.req_blob,b.resp_head,b.resp_body,b.resp_blob
+FROM exchanges e LEFT JOIN exchange_bodies b ON b.id=e.id
+WHERE e.host IN (`+strings.Join(placeholders, ",")+`) ORDER BY e.ts,e.id`, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -71,14 +78,13 @@ FROM exchanges WHERE host IN (`+strings.Join(placeholders, ",")+`) ORDER BY ts,i
 	for rows.Next() {
 		var item ArchiveExchange
 		var legacyPath string
+		var reqHead, reqBlob, respHead, respBlob sql.NullString
 		if err := rows.Scan(&item.ID, &item.TS, &item.Host, &item.Method, &item.URLTemplate,
-			&item.URL, &item.Status, &item.ContentType, &item.ReqLen, &item.RespLen, &legacyPath); err != nil {
+			&item.URL, &item.Status, &item.ContentType, &item.ReqLen, &item.RespLen, &legacyPath,
+			&reqHead, &item.ReqBody, &reqBlob, &respHead, &item.RespBody, &respBlob); err != nil {
 			return 0, err
 		}
-		var reqBlob, respBlob sql.NullString
-		err := t.db.QueryRow(`SELECT req_head,req_body,req_blob,resp_head,resp_body,resp_blob
-FROM exchange_bodies WHERE id=?`, item.ID).Scan(&item.ReqHead, &item.ReqBody, &reqBlob, &item.RespHead, &item.RespBody, &respBlob)
-		if errors.Is(err, sql.ErrNoRows) && strings.TrimSpace(legacyPath) != "" {
+		if !reqHead.Valid && strings.TrimSpace(legacyPath) != "" && filepath.IsLocal(legacyPath) {
 			req, readErr := os.ReadFile(filepath.Join(t.dir, legacyPath, "request.http"))
 			if readErr != nil && !os.IsNotExist(readErr) {
 				return 0, readErr
@@ -88,8 +94,8 @@ FROM exchange_bodies WHERE id=?`, item.ID).Scan(&item.ReqHead, &item.ReqBody, &r
 				return 0, readErr
 			}
 			item.ReqHead, item.RespHead = string(req), string(resp)
-		} else if err != nil {
-			return 0, err
+		} else {
+			item.ReqHead, item.RespHead = reqHead.String, respHead.String
 		}
 		item.ReqBlob, item.RespBlob = reqBlob.String, respBlob.String
 		for _, hash := range []string{item.ReqBlob, item.RespBlob} {
@@ -102,16 +108,13 @@ FROM exchange_bodies WHERE id=?`, item.ID).Scan(&item.ReqHead, &item.ReqBody, &r
 	if err := rows.Err(); err != nil {
 		return 0, err
 	}
+	// Close before writing: the connection must go back to the pool while the
+	// (possibly long) blob copy below still holds the write lock.
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
 	for hash := range blobs {
-		source, err := t.blobPath(hash)
-		if err != nil {
-			return 0, err
-		}
-		data, err := os.ReadFile(source)
-		if err != nil {
-			return 0, err
-		}
-		if err := os.WriteFile(filepath.Join(dir, "blobs", hash+".bin"), data, 0o600); err != nil {
+		if err := t.copyBlobTo(hash, filepath.Join(dir, "blobs", hash+".bin")); err != nil {
 			return 0, err
 		}
 		snapshot.Blobs = append(snapshot.Blobs, hash)
@@ -127,16 +130,91 @@ FROM exchange_bodies WHERE id=?`, item.ID).Scan(&item.ReqHead, &item.ReqBody, &r
 	return int64(len(snapshot.Exchanges)), nil
 }
 
+// copyBlobTo streams one content-addressed body to destination without holding
+// it in memory.
+func (t *Traffic) copyBlobTo(hash, destination string) error {
+	source, err := t.blobPath(hash)
+	if err != nil {
+		return err
+	}
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// importBlob verifies one archived body and installs it into the blob store.
+// The hash is computed while streaming through a temp file, so verifying a
+// multi-gigabyte body costs no more memory than verifying a small one, and a
+// body that fails the checksum never reaches the live store.
+func (t *Traffic) importBlob(dir, hash string) error {
+	destination := filepath.Join(t.dir, "_blobs", "sha256", hash[:2], hash+".bin")
+	if _, err := os.Stat(destination); err == nil {
+		return nil // already present; content addressing makes it the same bytes
+	}
+	source, err := os.Open(filepath.Join(dir, "blobs", hash+".bin"))
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	if err := os.MkdirAll(filepath.Join(t.dir, "_blobs", "sha256", hash[:2]), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Join(t.dir, "_blobs", "sha256", hash[:2]), hash+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after the successful rename below
+	sum := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(tmp, sum), source); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if hex.EncodeToString(sum.Sum(nil)) != hash {
+		return fmt.Errorf("traffic blob checksum mismatch: %s", hash)
+	}
+	return os.Rename(tmpName, destination)
+}
+
+// maxArchiveManifest caps traffic.json. The manifest inlines every body below
+// maxInlineBody, so a large host legitimately produces a large file — but an
+// archive is a file another installation can hand us, and loading it must not be
+// allowed to consume arbitrary memory. 1 GiB is far above any real capture and
+// still bounded.
+const maxArchiveManifest = 1 << 30
+
 // ImportArchive imports only missing exchange IDs. Current hot rows always win,
 // and repeated restore attempts are safe after a partial external failure.
 func (t *Traffic) ImportArchive(dir string) (int64, error) {
 	if t == nil {
 		return 0, nil
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, "traffic.json"))
+	manifest := filepath.Join(dir, "traffic.json")
+	st, err := os.Stat(manifest)
 	if os.IsNotExist(err) {
 		return 0, nil
 	}
+	if err != nil {
+		return 0, err
+	}
+	if st.Size() > maxArchiveManifest {
+		return 0, fmt.Errorf("流量归档清单过大（%d 字节，上限 %d）", st.Size(), int64(maxArchiveManifest))
+	}
+	raw, err := os.ReadFile(manifest)
 	if err != nil {
 		return 0, err
 	}
@@ -153,22 +231,8 @@ func (t *Traffic) ImportArchive(dir string) (int64, error) {
 		if !blobHashRe.MatchString(hash) {
 			return 0, fmt.Errorf("invalid archived traffic blob %q", hash)
 		}
-		data, err := os.ReadFile(filepath.Join(dir, "blobs", hash+".bin"))
-		if err != nil {
+		if err := t.importBlob(dir, hash); err != nil {
 			return 0, err
-		}
-		sum := sha256.Sum256(data)
-		if hex.EncodeToString(sum[:]) != hash {
-			return 0, fmt.Errorf("traffic blob checksum mismatch: %s", hash)
-		}
-		destination := filepath.Join(t.dir, "_blobs", "sha256", hash[:2], hash+".bin")
-		if _, err := os.Stat(destination); os.IsNotExist(err) {
-			if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
-				return 0, err
-			}
-			if err := os.WriteFile(destination, data, 0o644); err != nil {
-				return 0, err
-			}
 		}
 	}
 	tx, err := t.db.Begin()

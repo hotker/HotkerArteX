@@ -10,8 +10,12 @@ package guard
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/intercept"
@@ -54,37 +58,323 @@ func newGuard(ic *intercept.Interceptor) *Guard {
 // Hooks returns the hook registry to attach to an agent session.
 func (g *Guard) Hooks() *hook.Registry { return g.reg }
 
-func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
-	// Extract the shell-command surface for the audit log: Bash + the interactive-shell
-	// tools (shell_open's command, shell_send's text). Destructive/exfil gating is no
-	// longer hard-coded here — it now lives in the DB intercept rules, evaluated by
-	// applyIntercept below. Other tools record an empty command.
-	var cmd string
-	switch ev.ToolName {
-	case "Bash", "shell_open":
-		var in struct {
-			Command string `json:"command"`
+// protectedPaths holds the absolute roots agents must never touch (the traffic
+// capture tree, the evidence blob store, the JWT key); replaced atomically at
+// server startup and read lock-free on every tool call.
+var protectedPaths atomic.Pointer[[]string]
+
+// SetProtectedPaths installs the absolute roots every agent must never touch —
+// the traffic capture tree (MITM CA *private* key + plaintext index), the
+// evidence blob store, and the JWT signing key. The workspace HTTP layer already
+// refuses these (server/workspace.go sensitiveWorkspaceTrees), but that gate is
+// reachable only through the API: an agent's CWD is inside the data dir, so
+// `cat ../../traffic/_ca/mitmproxy-ca.pem` opens the same file directly. Holding
+// that key forges TLS for any domain the operator intercepts; holding jwt.key
+// forges an admin session. Called once at server startup; an unset value (tests,
+// standalone guards) leaves agents unrestricted, as before.
+func SetProtectedPaths(paths []string) {
+	clean := make([]string, 0, len(paths)*2)
+	add := func(p string) {
+		for _, have := range clean {
+			if have == p {
+				return
+			}
 		}
-		_ = json.Unmarshal(ev.Input, &in)
-		cmd = in.Command
-	case "shell_send":
-		var in struct {
-			Text string `json:"text"`
-		}
-		_ = json.Unmarshal(ev.Input, &in)
-		cmd = in.Text
+		clean = append(clean, p)
 	}
-	g.record(ev.ToolName, "allow", "", cmd)
-	return g.applyIntercept(ctx, ev)
+	for _, p := range paths {
+		if p = filepath.Clean(strings.TrimSpace(p)); p == "" || p == "." {
+			continue
+		}
+		add(p)
+		// Also store the symlink-resolved spelling: macOS /var → /private/var and
+		// bind-mounted Docker volumes make the configured and the resolved form
+		// differ, and a containment check against only one side is vacuous.
+		if real, err := filepath.EvalSymlinks(p); err == nil && real != p {
+			add(real)
+		}
+	}
+	protectedPaths.Store(&clean)
+}
+
+// ProtectedPaths returns the currently installed protected roots (read-only).
+func ProtectedPaths() []string {
+	if p := protectedPaths.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// protectedTrees are the data-dir top-level trees agents must never read
+// directly: the traffic capture tree (MITM CA private key + plaintext capture
+// index) and the evidence blob store (raw target request/response bytes). Agents
+// get dedicated tool APIs for both instead.
+var protectedTrees = []string{"traffic", "evidence"}
+
+// protectedDirs are the internal subdirectories under those trees that hold the
+// material itself (the CA key, the SQLite index, the body blobs). Matched at any
+// depth so `../traffic/_ca/mitmproxy-ca.pem` and an absolute path are both hit.
+var protectedDirs = []string{"traffic/_ca", "traffic/_index", "traffic/_blobs", "evidence/blobs"}
+
+// protectedFiles is the set of file names to refuse wherever they appear: the
+// session signing key (never in an agent's read set) and the CA private key.
+// Matching the basename also closes the gap a stateful shell leaves open —
+// `cd traffic; cd _ca; cat mitmproxy-ca.pem` never puts the directory and the
+// file in the same token.
+var protectedFiles = []string{
+	"jwt.key",
+	"jwt.key.migrated",
+	"mitmproxy-ca.pem", // the CA *private* key
+}
+
+// pathFields names the tool-input keys that carry a filesystem path; only these
+// are inspected for structured file tools.
+var pathFields = []string{"file_path", "notebook_path", "path", "dir_path", "target_file", "from", "to"}
+
+// shellSplit separates a command line on whitespace and shell metacharacters, so
+// each resulting token can be treated as a candidate path.
+var shellSplit = regexp.MustCompile(`[\s"'` + "`" + `=<>|;&(){}\[\],]+`)
+
+// pathHit reports whether a raw token names protected content. It is deliberately
+// spelling-tolerant: a shell command is only text until the kernel resolves it,
+// and the guard never learns the agent's working directory, so it cannot do a
+// real containment check. It therefore matches, in order:
+//
+//   - the key file by basename, wherever it appears;
+//   - the internal material directories (`traffic/_ca`, `traffic/_index`,
+//     `traffic/_blobs`, `evidence/blobs`) at any depth — these names are
+//     unambiguous, and a symlink planted in the run dir cannot hide them;
+//   - a protected top-level tree reached by a climb (`../../traffic/...`) or by
+//     an absolute path.
+//
+// A bare relative `traffic/…` is allowed on purpose: every agent work dir is a
+// subdirectory of the data dir, so it can only ever resolve *inside* the run dir
+// (a local folder the agent may legitimately create) and never to the data dir's
+// traffic tree. URLs are skipped — a request to https://target/traffic/_ca goes
+// to the target, not to the local disk.
+func pathHit(p string) string {
+	if strings.Contains(p, "://") {
+		return ""
+	}
+	p = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(p), "\\", "/"))
+	if i := strings.IndexAny(p, "?#"); i >= 0 {
+		p = p[:i]
+	}
+	if p == "" {
+		return ""
+	}
+	// Key files are refused by name no matter where they sit.
+	base := p
+	if i := strings.LastIndexByte(base, '/'); i >= 0 {
+		base = base[i+1:]
+	}
+	for _, f := range protectedFiles {
+		if base == f {
+			return f
+		}
+	}
+	// The CA *public* certificate in that directory is meant to be shared (it is
+	// downloadable from /api/traffic/ca-cert and referenced by the proxy env), so
+	// `curl --cacert traffic/_ca/mitmproxy-ca-cert.pem` must keep working.
+	if base == "mitmproxy-ca-cert.pem" || base == "mitmproxy-ca-cert.cer" {
+		return ""
+	}
+	// Internal layout directories, at any depth and behind any climb.
+	for _, d := range protectedDirs {
+		if p == d || strings.HasPrefix(p, d+"/") || strings.Contains(p, "/"+d+"/") || strings.HasSuffix(p, "/"+d) {
+			return d
+		}
+	}
+	// Top-level trees only when the token climbs or is absolute.
+	climbed := strings.HasPrefix(p, "../") || strings.HasPrefix(p, "/")
+	for i := 0; ; i++ {
+		if strings.HasPrefix(p, "../") {
+			p = p[3:]
+			climbed = true
+			continue
+		}
+		if strings.HasPrefix(p, "./") {
+			p = p[2:]
+			continue
+		}
+		if strings.HasPrefix(p, "/") {
+			p = p[1:]
+			climbed = true
+			continue
+		}
+		if i > 64 {
+			return ""
+		}
+		break
+	}
+	if !climbed || !strings.Contains(p, "/") {
+		return ""
+	}
+	seg := p
+	if i := strings.IndexByte(seg, '/'); i >= 0 {
+		seg = seg[:i]
+	}
+	for _, t := range protectedTrees {
+		if seg == t {
+			return t
+		}
+	}
+	return ""
+}
+
+// protectedHit reports which protected path (if any) the call touches, or "".
+// cmd is the shell command already extracted by the caller ("" for file tools).
+func protectedHit(toolName string, input json.RawMessage, cmd string) string {
+	paths := ProtectedPaths()
+	if len(paths) == 0 {
+		return ""
+	}
+	// Shell-family tools: the command is opaque, so every token is treated as a
+	// candidate path. Absolute paths under a protected root are also caught by
+	// containment, which covers references the tree list does not name.
+	if _, isShell := shellTools[toolName]; isShell {
+		if cmd == "" {
+			cmd = string(input)
+		}
+		for _, tok := range shellSplit.Split(cmd, -1) {
+			if hit := pathHit(tok); hit != "" {
+				return hit
+			}
+			if hit := matchProtected(tok, paths); hit != "" {
+				return hit
+			}
+		}
+		return ""
+	}
+	// Structured file tools: resolve the declared path fields and compare against
+	// the protected roots (lexically, after following symlinks, and by tree name).
+	var in map[string]json.RawMessage
+	if json.Unmarshal(input, &in) != nil {
+		return ""
+	}
+	for _, key := range pathFields {
+		raw, ok := in[key]
+		if !ok {
+			continue
+		}
+		var p string
+		if json.Unmarshal(raw, &p) != nil || p == "" {
+			continue
+		}
+		if hit := pathHit(p); hit != "" {
+			return hit
+		}
+		if hit := matchProtected(p, paths); hit != "" {
+			return hit
+		}
+	}
+	return ""
+}
+
+// matchProtected compares one declared path against the protected roots. The
+// path may be relative (tool paths resolve against the agent's own working dir,
+// which the guard does not know), in which case the tree-name check above is
+// what catches it.
+func matchProtected(p string, paths []string) string {
+	cand := []string{filepath.Clean(p)}
+	if real, err := filepath.EvalSymlinks(p); err == nil {
+		cand = append(cand, real)
+	}
+	for _, c := range cand {
+		for _, prot := range paths {
+			// The protected root itself, or anything beneath it.
+			if c == prot || strings.HasPrefix(c, prot+string(os.PathSeparator)) {
+				return prot
+			}
+		}
+	}
+	return ""
+}
+
+// shellTools are the tools whose input carries a shell command that the audit
+// log should record and the protected-path check should scan. Monitor runs a
+// command too (in the background, through the task manager) and was previously
+// missing here in both places — so `Monitor{command:"…"}` executed with no audit
+// trail and no intercept match.
+var shellTools = map[string]string{
+	"Bash":       "command",
+	"shell_open": "command",
+	"shell_send": "text",
+	"Monitor":    "command",
+}
+
+// extractCommand returns the shell command a tool call would run ("" if none).
+func extractCommand(toolName string, input json.RawMessage) string {
+	key, ok := shellTools[toolName]
+	if !ok {
+		return ""
+	}
+	var in map[string]json.RawMessage
+	if json.Unmarshal(input, &in) != nil {
+		return ""
+	}
+	var s string
+	if raw, ok := in[key]; ok {
+		_ = json.Unmarshal(raw, &s)
+	}
+	return s
+}
+
+// unwrapDeferred expands an ExecuteExtraTool call into the tool it actually
+// invokes. Deferred tools (every MCP tool, and custom tools flagged deferred)
+// have their schema withheld, so the model calls them as
+// ExecuteExtraTool{tool_name, params}; the inner call runs directly with no
+// second PreToolUse. Gating the outer name therefore reviewed nothing:
+// ExecuteExtraTool was not in the enabled set, so `mcp__*` never reached the
+// seeded ^mcp__ ask rule and custom command/script tools ran unapproved.
+func unwrapDeferred(toolName string, input json.RawMessage) (string, json.RawMessage, bool) {
+	if toolName != "ExecuteExtraTool" {
+		return "", nil, false
+	}
+	var in struct {
+		ToolName string          `json:"tool_name"`
+		Params   json.RawMessage `json:"params"`
+	}
+	if json.Unmarshal(input, &in) != nil || strings.TrimSpace(in.ToolName) == "" {
+		return "", nil, false
+	}
+	params := in.Params
+	if len(params) == 0 {
+		params = json.RawMessage("{}")
+	}
+	return in.ToolName, params, true
+}
+
+func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
+	// Deferred tools run through ExecuteExtraTool; review the call that will
+	// actually execute, not the wrapper.
+	effective := ev
+	forced := false
+	if inner, params, ok := unwrapDeferred(ev.ToolName, ev.Input); ok {
+		effective = hook.Event{ToolName: inner, Input: params}
+		forced = true
+	}
+	cmd := extractCommand(effective.ToolName, effective.Input)
+
+	// Hard floor: the platform's own key material is off-limits regardless of
+	// intercept configuration (which is user-editable and can be disabled).
+	if hit := protectedHit(effective.ToolName, effective.Input, cmd); hit != "" {
+		return g.block(effective.ToolName, systemBlockMessage(
+			"访问系统保留文件 "+hit+"（其中包含可用于伪造任意站点 TLS 的 CA 私钥 / 会话签名密钥），严禁读取、复制或外传"), cmd)
+	}
+	g.record(effective.ToolName, "allow", "", cmd)
+	return g.applyIntercept(ctx, effective, forced)
 }
 
 // applyIntercept evaluates user-configured intercept rules against the tool call.
-// Both rules and the fallback judge receive the complete tool input.
-func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
+// Both rules and the fallback judge receive the complete tool input. force skips
+// the enabled-tools filter — used for tools unwrapped out of ExecuteExtraTool,
+// where the wrapper itself already proves the call needs review.
+func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event, force bool) hook.Result {
 	if g.interceptor == nil {
 		return hook.Result{}
 	}
-	if !g.interceptor.IsToolEnabled(ev.ToolName) {
+	if !force && !g.interceptor.IsToolEnabled(ev.ToolName) {
 		return hook.Result{}
 	}
 	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)

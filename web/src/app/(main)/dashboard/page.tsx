@@ -22,11 +22,13 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { type ChartConfig, ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart";
 import { Progress } from "@/components/ui/progress";
 import { api } from "@/lib/api";
+import { visibleInterval } from "@/lib/polling";
 import type {
   Activity,
   Agent,
   ConvTokenSummary,
   Finding,
+  FindingStats,
   InterceptPending,
   LLMProfile,
   MCPServer,
@@ -133,6 +135,9 @@ export default function DashboardPage() {
   // data state
   const [tasks, setTasks] = React.useState<Task[]>([]);
   const [findings, setFindings] = React.useState<Finding[]>([]);
+  // Whole-table aggregates (total + per-severity) come from the cheap stats
+  // endpoint instead of counting client-side over a full findings pull.
+  const [findingTotals, setFindingTotals] = React.useState<FindingStats | null>(null);
   const [stats, setStats] = React.useState<Stats | null>(null);
   const [settings, setSettings] = React.useState<Settings | null>(null);
   const [pending, setPending] = React.useState<InterceptPending[]>([]);
@@ -172,10 +177,10 @@ export default function DashboardPage() {
       }
     };
     void load();
-    const t = setInterval(load, 5000);
+    const stop = visibleInterval(load, 5000);
     return () => {
       alive = false;
-      clearInterval(t);
+      stop();
     };
   }, []);
 
@@ -187,17 +192,24 @@ export default function DashboardPage() {
       if (loading) return;
       loading = true;
       try {
-        const [findings, stats, settings, pending, activity, tokens, conversationTokens] = await Promise.all([
-          api.findings(),
-          api.stats(),
-          api.settings(),
-          api.interceptPending(),
-          api.activity(undefined, { limit: 30 }),
-          api.tokenStats(),
-          api.conversationTokens(),
-        ]);
+        const [findings, stats, settings, pending, activity, tokens, conversationTokens, findingStats] =
+          await Promise.all([
+            // Only the 8 newest findings are rendered here, but this used to fetch the
+            // full 500-row list (evidence + report bodies included) every 5s just to
+            // take len() and sort. Ask the paginated endpoint for the small page and
+            // read the totals from findingStats instead.
+            api.findingsPage({ page: 1, pageSize: 8, sort: "time" }),
+            api.stats(),
+            api.settings(),
+            api.interceptPending(),
+            api.activity(undefined, { limit: 30 }),
+            api.tokenStats(),
+            api.conversationTokens(),
+            api.findingStats(),
+          ]);
         if (!alive) return;
-        setFindings(findings);
+        setFindings(findings.items);
+        setFindingTotals(findingStats);
         setStats(stats);
         setSettings(settings);
         setPending(pending);
@@ -211,10 +223,10 @@ export default function DashboardPage() {
       }
     };
     void load();
-    const timer = setInterval(load, 5000);
+    const stop = visibleInterval(load, 5000);
     return () => {
       alive = false;
-      clearInterval(timer);
+      stop();
     };
   }, []);
 
@@ -247,10 +259,10 @@ export default function DashboardPage() {
       }
     };
     void load();
-    const t = setInterval(load, 15000);
+    const stop = visibleInterval(load, 15000);
     return () => {
       alive = false;
-      clearInterval(t);
+      stop();
     };
   }, []);
 
@@ -263,12 +275,22 @@ export default function DashboardPage() {
   }, [tasks]);
 
   const findingsBySev = React.useMemo(() => {
+    if (findingTotals) {
+      return {
+        critical: findingTotals.critical,
+        high: findingTotals.high,
+        medium: findingTotals.medium,
+        low: findingTotals.low,
+      };
+    }
     const m = { critical: 0, high: 0, medium: 0, low: 0 };
     for (const f of findings) {
       if (f.severity in m) m[f.severity as keyof typeof m]++;
     }
     return m;
-  }, [findings]);
+  }, [findings, findingTotals]);
+
+  const findingsTotal = findingTotals?.total ?? findings.length;
 
   const sortedTasks = React.useMemo(
     () =>
@@ -282,7 +304,6 @@ export default function DashboardPage() {
     () => [...findings].sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts)).slice(0, 8),
     [findings],
   );
-
   const recentActivity = React.useMemo(
     () =>
       [...activity]
@@ -528,7 +549,7 @@ export default function DashboardPage() {
             <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
               <BugIcon className="size-3" /> 确认发现
             </div>
-            <div className="text-2xl font-semibold tabular-nums">{findings.length}</div>
+            <div className="text-2xl font-semibold tabular-nums">{findingsTotal}</div>
           </CardHeader>
           <CardContent className="flex flex-wrap gap-2.5 text-[10px]">
             <span className="text-rose-500">严重 {findingsBySev.critical}</span>

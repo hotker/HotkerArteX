@@ -16,7 +16,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import { api, sseUrl } from "@/lib/api";
+import { api, handleUnauthorized, probeSession, sseUrl } from "@/lib/api";
 import type { UpdateCheck, UpdateProgress } from "@/lib/types";
 
 /** 等待新版本上线的最长时间。一次升级要经过三次进程启动（暂存 → 换装 → 新版），
@@ -44,6 +44,9 @@ export function UpdateCard() {
   // 与 progress 分开：暂存完成后进程就没了，SSE 会断，此时要切到轮询 /api/health。
   const [restarting, setRestarting] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
+  // 进度流的句柄与「已暂存」标记：onerror 要靠后者区分"正常重启断线"和"失败"。
+  const esRef = React.useRef<EventSource | null>(null);
+  const stagedRef = React.useRef(false);
 
   // quiet 同时决定要不要绕过后端缓存：进页面时的自动检查用缓存（顶栏刚查过），
   // 用户手动点「检查更新」则强制回源，否则刚发布的版本要等缓存过期才看得到。
@@ -74,6 +77,7 @@ export function UpdateCard() {
   // 判据必须是"版本变了"而不是"能连上了"：换装过程中旧版本会短暂地重新起来一次
   // （那一次只负责把 artex.new 换上去然后立刻退出），只看连通性会误判成功。
   const waitForNewVersion = React.useCallback(async (fromVersion: string) => {
+    stagedRef.current = true;
     setRestarting(true);
     const deadline = Date.now() + RESTART_TIMEOUT_MS;
     while (Date.now() < deadline) {
@@ -98,9 +102,15 @@ export function UpdateCard() {
   }, []);
 
   // 订阅更新进度。SSE 不走 Next 的 /api 重写（那层会缓冲，事件推不出来）。
+  //
+  // 流句柄放在 ref 里：原来是局部 const，组件卸载（切页/关设置页）时没人关闭它，
+  // 连接和监听会一直活到标签页关闭；而 onerror 又无条件关闭，导致暂存前断线时
+  // busy 永远为 true、所有按钮禁用、界面停在「准备中…」。
   const openStream = React.useCallback(
     (fromVersion: string) => {
+      esRef.current?.close();
       const es = new EventSource(sseUrl("/api/update/stream"));
+      esRef.current = es;
       es.onmessage = (ev) => {
         let p: UpdateProgress;
         try {
@@ -111,24 +121,43 @@ export function UpdateCard() {
         setProgress(p);
         if (p.phase === "failed") {
           es.close();
+          esRef.current = null;
           setBusy(false);
           toast.error("更新失败：" + (p.error || p.message));
           return;
         }
         if (p.phase === "staged") {
           es.close();
+          esRef.current = null;
           void waitForNewVersion(fromVersion);
         }
       };
       es.onerror = () => {
-        // 进程退出时 SSE 必然断开。如果已经进入等待重启，这属于正常现象，
-        // 交给 /api/health 轮询继续判定即可。
+        // 进程退出时 SSE 必然断开。已经进入「等待重启」时这属于正常现象，交给
+        // /api/health 轮询继续判定；否则（401、代理中断、后端重启）流不会自动
+        // 恢复，必须结束 busy 并告诉用户，否则界面永远卡在「准备中…」。
         es.close();
+        if (esRef.current === es) esRef.current = null;
+        if (stagedRef.current) return;
+        // 区分「令牌失效」和「传输中断」：前者重试多少次都不会成功，直接清凭证
+        // 回登录页；后者保留原来的「请重试」提示。
+        void probeSession().then((state) => {
+          if (state === "unauthorized") {
+            handleUnauthorized();
+            return;
+          }
+          setBusy(false);
+          setProgress(null);
+          toast.error("更新进度连接中断，请重试");
+        });
       };
       return es;
     },
     [waitForNewVersion],
   );
+
+  // 卸载时关闭流，避免离开设置页后仍挂着订阅。
+  React.useEffect(() => () => esRef.current?.close(), []);
 
   const doUpdate = () => {
     if (!info) return;
@@ -144,10 +173,12 @@ export function UpdateCard() {
     if (!ok) return;
 
     setBusy(true);
+    stagedRef.current = false;
     setProgress({ phase: "downloading", percent: 0, message: "准备中…" });
     const es = openStream(from);
     api.applyUpdate().catch((e) => {
       es.close();
+      if (esRef.current === es) esRef.current = null;
       setBusy(false);
       setProgress(null);
       toast.error("启动更新失败：" + (e as Error).message);

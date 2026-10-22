@@ -787,6 +787,9 @@ function ProfileSheet({
 
 export default function LLMPage() {
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
+  const [profilesLoading, setProfilesLoading] = React.useState(true);
+  const [profilesError, setProfilesError] = React.useState<string | null>(null);
+  const [profilesRetry, setProfilesRetry] = React.useState(0);
   const [pool, setPool] = React.useState<LLMPoolStatus | null>(null);
   const [poolOpen, setPoolOpen] = React.useState(false);
   // 抽屉的开关和内容分开存：关闭时 editing 保持不变，否则关闭动画期间标题会从
@@ -807,17 +810,24 @@ export default function LLMPage() {
   }, []);
 
   const load = React.useCallback(async () => {
+    setProfilesLoading(true);
+    setProfilesError(null);
     try {
       setProfiles(await api.llmProfiles());
-    } catch {
-      /* ignore */
+    } catch (e) {
+      // A failed load must not render as "no profiles configured": that copy
+      // invites the user to create a duplicate profile over a list that exists.
+      setProfilesError(e instanceof Error ? e.message : "加载失败");
+    } finally {
+      setProfilesLoading(false);
     }
     await loadPool();
   }, [loadPool]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: profilesRetry is an explicit manual-retry trigger.
   React.useEffect(() => {
     void load();
-  }, [load]);
+  }, [load, profilesRetry]);
 
   // 卡片上的健康徽章按 profile id 取轮询状态。
   const health = React.useMemo(() => {
@@ -970,7 +980,18 @@ export default function LLMPage() {
                 </Card>
               );
             })}
-            {profiles.length === 0 && (
+            {profilesLoading && profiles.length === 0 && (
+              <div className="col-span-full p-10 text-center text-muted-foreground text-sm">加载中…</div>
+            )}
+            {!profilesLoading && profilesError && (
+              <div className="col-span-full flex flex-col items-center gap-3 rounded-lg border border-dashed p-10 text-center text-sm">
+                <span className="text-muted-foreground">模型配置加载失败：{profilesError}</span>
+                <Button variant="outline" size="sm" onClick={() => setProfilesRetry((n) => n + 1)}>
+                  重试
+                </Button>
+              </div>
+            )}
+            {!profilesLoading && !profilesError && profiles.length === 0 && (
               <div className="col-span-full rounded-lg border border-dashed p-10 text-center text-muted-foreground text-sm">
                 还没有模型配置，点击右上角「新建」创建第一个。
               </div>
