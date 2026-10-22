@@ -51,12 +51,12 @@ func main() {
 	os.Exit(run())
 }
 
-// warnIfPublic logs a loud warning when -addr binds every interface. That is the
-// right setting inside a container (the port mapping needs it) and for a
-// deliberately LAN-exposed install, but it is also how an install ends up
-// reachable from the office network with only the /setup screen in front of it.
-// The banner line alone did not make that visible: it printed ":8787" and looked
-// identical to the old default.
+// warnIfPublic logs a reminder when -addr binds every interface, which is the
+// default again: the console is reachable from the local network unless the
+// operator passes "-addr 127.0.0.1:8787". It stays a log line rather than a hard
+// block because that is exactly what the container image (the port mapping needs
+// it), the release start scripts and LAN installs want — but it is worth one
+// line at boot, since the /setup screen is all that is in front of the API.
 func warnIfPublic(addr string) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -66,20 +66,19 @@ func warnIfPublic(addr string) {
 	if host != "" && host != "0.0.0.0" && host != "::" {
 		return
 	}
-	log.Printf("[security] -addr %s 监听所有网卡，控制台对同网段可达。仅在容器/反代或确需远程访问时这样启动；"+
-		"本机使用请改用 -addr 127.0.0.1:8787。", addr)
+	log.Printf("[security] -addr %s 监听所有网卡，控制台对同网段可达（这是默认值）。仅本机访问请改用 "+
+		"-addr 127.0.0.1:8787；容器/反代与确需远程访问时保持现状即可。", addr)
 }
 
 func run() int {
 	var (
-		// Default to loopback. The backend holds an unauthenticated-until-setup
-		// admin API, a JWT key and a full capture archive; binding 0.0.0.0 by
-		// default exposed all of it to the local network for anyone who started
-		// the binary and walked away before finishing /setup. Docker and LAN
-		// deployments opt in explicitly (the image passes -addr :8787, which the
-		// port mapping needs) — an operator who wants remote access can pass
-		// ":8787" just as well, but it is now a decision rather than a default.
-		addr    = flag.String("addr", "127.0.0.1:8787", "HTTP listen address (use \":8787\" to bind all interfaces)")
+		// Default to every interface: the console has to be reachable from the
+		// LAN/browser that is not the host itself (containers, LAN installs,
+		// remote access), which is how the packaged start scripts and the image
+		// run it. warnIfPublic prints one line at boot so the exposure is not
+		// silent; an operator who wants host-only access passes
+		// "-addr 127.0.0.1:8787".
+		addr    = flag.String("addr", ":8787", "HTTP listen address (use \"127.0.0.1:8787\" for host-only access)")
 		dataDir = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
 		proxy   = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
 	)
