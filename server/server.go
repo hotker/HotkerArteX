@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	buildversion "github.com/Autumn-27/artex/version"
 	"io"
 	"log"
 	"net"
@@ -34,9 +35,10 @@ import (
 )
 
 // BuildVersion is the backend application version, injected from cmd/artex at
-// startup (which in turn gets it from -ldflags "-X main.version=<tag>").
-// Defaults to "dev" for local builds. Exposed to the frontend via GET /api/health.
-var BuildVersion = "dev"
+// startup (which takes it from the version package, overridable by
+// -ldflags "-X main.version=<tag>"). Exposed to the frontend via GET /api/health
+// and compared against the latest GitHub release by GET /api/update/check.
+var BuildVersion = buildversion.Version
 
 // Server exposes the ARTEX backend over a JSON HTTP API for the shadcn/ui
 // frontend.
@@ -2377,16 +2379,16 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Status    *string `json:"status"`
-		Severity  *string `json:"severity"`
-		Name      *string `json:"name"`
+		Status   *string `json:"status"`
+		Severity *string `json:"severity"`
+		Name     *string `json:"name"`
 		// 交付级报告字段：人工/富化可改，报告渲染只读它们。
 		CVSS        *string `json:"cvss"`
 		Impact      *string `json:"impact"`
 		Remediation *string `json:"remediation"`
 		// reproduction 传对象即覆盖、传 null 即清空（*json.RawMessage 区分"没传"和"传了 null"）
 		Reproduction *json.RawMessage `json:"reproduction"`
-		VulnClass *string `json:"vulnclass"`
+		VulnClass    *string          `json:"vulnclass"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())

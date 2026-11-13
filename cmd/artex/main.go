@@ -7,6 +7,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	buildversion "github.com/Autumn-27/artex/version"
 	"log"
 	"net"
 	"net/http"
@@ -23,9 +24,13 @@ import (
 	"github.com/Autumn-27/artex/server"
 )
 
-// version is the build version, injected at release time via
-// -ldflags "-X main.version=<tag>". Defaults to "dev" for local builds.
-var version = "dev"
+// version is the build version. Default comes from the version package (the single
+// source of truth) so a plain `go build ./cmd/artex` reports the real repo version
+// instead of "dev" — that "dev" default is what used to make the admin console show
+// a stale/unknown version. Release builds still override it:
+//
+//	go build -ldflags "-X main.version=$(git describe --tags)" ./cmd/artex
+var version = buildversion.Version
 
 const banner = `
     _    ____ _____ _______  __

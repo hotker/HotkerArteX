@@ -2,6 +2,25 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2.5.4] - 2026-11-14
+
+### 修复
+
+- **后台版本号显示不正确（仍停在 2.3.1 / dev）**：版本号此前散在四处各写一遍且会漂——
+  `cmd/artex/main.go` 的 `var version = "dev"`（源码构建永远显示 dev）、`server.BuildVersion`、
+  `web/package.json`、`web/package-lock.json`（`npm ci` 不回写，长期停在 2.3.1）。于是「版本与更新」
+  卡片和 `/api/health` 报的版本与实际代码对不上，一键更新的"是否最新"也失去基准。
+  现在新增 **`version` 包作为唯一真值**：`main.version` 与 `server.BuildVersion` 的默认值都取自它
+  （release 仍可用 `-ldflags "-X main.version=<tag>"` 覆盖），并同步了 `web/package.json`
+  与 `web/package-lock.json`。
+
+### 新增
+
+- **版本一致性闸门** `version/version_test.go`：校验 `version.Version` 与 `web/package.json`、
+  `web/package-lock.json`（顶层 + `packages[""]`）、`CHANGELOG` 最新条目四处一致，并要求是
+  **纯净三段式**（带 `-rc1` 这类后缀会被 selfupdate 判为不可比较、禁用一键更新）。
+  以后漏改任何一处，`go test ./version` 直接失败，不用等发版后才发现。
+
 ## [2.5.3] - 2026-11-14
 
 ### 变更
