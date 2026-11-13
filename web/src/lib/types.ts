@@ -514,6 +514,8 @@ export interface Finding {
   cvss?: string;
   impact?: string;
   remediation?: string;
+  /** 结构化复现过程：入口/前置/有序步骤/攻击链来源（报告按此渲染逐步复现）。 */
+  reproduction?: Reproduction;
 }
 
 // FindingsPage 是发现列表的服务端分页响应。
@@ -1661,4 +1663,21 @@ export interface ReportRecord {
   size_bytes: number;
   findings_count: number;
   created_at: string;
+}
+
+// ---- 结构化复现过程 ----
+// 与"关联流量"分工：这里是【路径】（入口→前置→逐步），关联流量是【证据】（真实报文）。
+// runtime 侧存 findings.reproduction(JSONB)；单字段超 8000 字符会被截断并标注。
+export interface ReproStep {
+  request?: string;
+  response?: string;
+  expected?: string;
+  proves?: string;
+}
+
+export interface Reproduction {
+  entry_point?: string;
+  prerequisites?: string;
+  steps?: ReproStep[];
+  provenance?: string;
 }

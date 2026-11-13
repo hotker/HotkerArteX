@@ -1119,6 +1119,10 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS cvss           TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS impact         TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS remediation    TEXT NOT NULL DEFAULT '';
+-- 结构化复现过程：入口点 / 前置条件（含测试账号如何获得）/ 有序步骤（每步真实请求与响应）/
+-- 攻击链来源。与 finding_traffic_bindings（报文快照）互补：绑定给"证据"，这里给"怎么复现"。
+-- 用 JSONB 而不是多张表：步骤天然是有序整体、总随漏洞一起读写，拆表只增加连接成本。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS reproduction    JSONB;
 
 -- =====================================================================
 -- 交付级报告（report management）

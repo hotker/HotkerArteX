@@ -77,7 +77,41 @@ func TestGenerateReportEndToEnd(t *testing.T) {
 	}
 	assertDocxContains(t, readReportFile(t, s, rec3.FilePath), "Penetration Test Report")
 
-	// 4) 落盘路径必须留在数据目录内（文件名来自用户可控的标题）
+	// 4) 结构化复现：入口点/前置/逐步请求响应都要出现在报告里，且步骤按顺序
+	if _, err := pg.SetFindingReproduction(fA, &db.Reproduction{
+		EntryPoint:    "POST /api/login",
+		Prerequisites: "需要 admin 账号（/register 自助注册）",
+		Steps: []db.ReproStep{
+			{Request: "POST /api/login HTTP/1.1\nHost: app.demo.local\n\n{\"u\":\"admin' OR 1=1--\"}", Response: "HTTP/1.1 200 OK", Expected: "绕过认证", Proves: "注入点可绕过认证"},
+			{Request: "GET /api/admin/users HTTP/1.1", Response: "HTTP/1.1 200 OK\n[{...}]", Expected: "读到用户列表"},
+		},
+		Provenance: "从事实 #12 的报错指纹推来",
+	}); err != nil {
+		t.Fatalf("set reproduction: %v", err)
+	}
+	rec4, err := s.buildReportForTask(taskA.ID, []int64{fA}, "", "")
+	if err != nil {
+		t.Fatalf("generate with reproduction: %v", err)
+	}
+	body4 := readReportFile(t, s, rec4.FilePath)
+	for _, want := range []string{
+		"POST /api/login",          // 入口点
+		"需要 admin 账号",            // 前置
+		"从事实 #12",                 // 来源
+		"步骤 1", "步骤 2",           // 有序步骤
+		"GET /api/admin/users",     // 第 2 步的请求原文
+		"绕过认证",                    // 预期
+	} {
+		assertDocxContains(t, body4, want)
+	}
+	// 没登记复现的漏洞要显式说明，而不是留空白让人以为漏了
+	rec5, err := s.buildReportForTask(taskB.ID, nil, "", "")
+	if err != nil {
+		t.Fatalf("generate taskB: %v", err)
+	}
+	assertDocxContains(t, readReportFile(t, s, rec5.FilePath), "未登记结构化复现步骤")
+
+	// 5) 落盘路径必须留在数据目录内（文件名来自用户可控的标题）
 	if !filepath.IsLocal(rec.FilePath) {
 		t.Fatalf("report path escaped the data dir: %q", rec.FilePath)
 	}

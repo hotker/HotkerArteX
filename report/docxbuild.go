@@ -51,15 +51,15 @@ type langSet struct {
 	MetaVersion   string
 	MetaPeople    string
 
-	SecOverview   string
-	SecScope      string
-	SecSummary    string
-	SecFindings   string
-	SecAppendix   string
-	IntroDefault  string
-	ScopeMethods  string
-	SummaryLead   string
-	AppendixLead  string
+	SecOverview  string
+	SecScope     string
+	SecSummary   string
+	SecFindings  string
+	SecAppendix  string
+	IntroDefault string
+	ScopeMethods string
+	SummaryLead  string
+	AppendixLead string
 
 	ThID       string
 	ThName     string
@@ -84,30 +84,31 @@ type langSet struct {
 	StDuplicate    string
 	StFixed        string
 
-	LblVulnClass    string
-	LblSeverity     string
-	LblCVSS         string
-	LblAssets       string
-	LblStatus       string
-	LblSummary      string
-	LblImpact       string
-	LblRepro        string
-	LblEvidence     string
-	LblRemediation  string
-	LblDetail       string
-	LblEntry        string
-	LblPrereq       string
-	LblStepN        string
-	LblRequest      string
-	LblResponse     string
-	LblExpected     string
-	LblTraffic      string
-	LblNoFinding    string
-	LblNoStep       string
-	LblTruncated    string
-	FooterPrefix    string
-	TotalFindings   string
-	ReportedAtFmt   string
+	LblVulnClass   string
+	LblSeverity    string
+	LblCVSS        string
+	LblAssets      string
+	LblStatus      string
+	LblSummary     string
+	LblImpact      string
+	LblRepro       string
+	LblEvidence    string
+	LblRemediation string
+	LblDetail      string
+	LblEntry       string
+	LblPrereq      string
+	LblProvenance  string
+	LblStepN       string
+	LblRequest     string
+	LblResponse    string
+	LblExpected    string
+	LblTraffic     string
+	LblNoFinding   string
+	LblNoStep      string
+	LblTruncated   string
+	FooterPrefix   string
+	TotalFindings  string
+	ReportedAtFmt  string
 }
 
 var langs = map[Lang]langSet{
@@ -122,14 +123,14 @@ var langs = map[Lang]langSet{
 		ScopeMethods: "测试方法：主动扫描、手工验证、业务逻辑分析；所有验证均在实际可达范围内执行，并对每一步保留可复现的请求/响应证据。",
 		SummaryLead:  "本次测试共确认漏洞 %d 个，按严重程度分布如下；详细描述见第 4 章。",
 		AppendixLead: "附录汇总本次测试涉及的资产与关联证据，便于复核。",
-		ThID: "编号", ThName: "漏洞", ThSeverity: "等级", ThAsset: "资产", ThStatus: "状态", ThCount: "数量",
+		ThID:         "编号", ThName: "漏洞", ThSeverity: "等级", ThAsset: "资产", ThStatus: "状态", ThCount: "数量",
 		SevCritical: "严重", SevHigh: "高危", SevMedium: "中危", SevLow: "低危", SevUnknown: "未评级",
 		StPending: "待处理", StConfirmed: "已确认", StResolved: "已处理", StFalsePos: "误报",
 		StIgnored: "忽略", StInProgress: "处理中", StRiskAccepted: "风险接受", StDuplicate: "重复", StFixed: "已修复",
 		LblVulnClass: "漏洞类型", LblSeverity: "风险等级", LblCVSS: "CVSS", LblAssets: "影响资产",
 		LblStatus: "处置状态", LblSummary: "漏洞描述", LblImpact: "影响", LblRepro: "复现过程",
 		LblEvidence: "验证证据", LblRemediation: "修复建议", LblDetail: "详细说明",
-		LblEntry: "入口点", LblPrereq: "前置条件", LblStepN: "步骤 %d",
+		LblEntry: "入口点", LblPrereq: "前置条件", LblProvenance: "攻击链来源", LblStepN: "步骤 %d",
 		LblRequest: "请求", LblResponse: "响应", LblExpected: "预期", LblTraffic: "关联流量",
 		LblNoFinding: "本次测试未确认可利用漏洞。", LblNoStep: "（未登记结构化复现步骤）",
 		LblTruncated: "（报告内容过长，已截断）", FooterPrefix: "渗透测试报告",
@@ -146,14 +147,14 @@ var langs = map[Lang]langSet{
 		ScopeMethods: "測試方法：主動掃描、手工驗證、業務邏輯分析；所有驗證均於實際可達範圍內執行，並保留可重現的請求／回應證據。",
 		SummaryLead:  "本次測試共確認漏洞 %d 個，依嚴重程度分布如下；詳細描述見第 4 章。",
 		AppendixLead: "附錄彙整本次測試涉及的資產與關聯證據，便於複核。",
-		ThID: "編號", ThName: "漏洞", ThSeverity: "等級", ThAsset: "資產", ThStatus: "狀態", ThCount: "數量",
+		ThID:         "編號", ThName: "漏洞", ThSeverity: "等級", ThAsset: "資產", ThStatus: "狀態", ThCount: "數量",
 		SevCritical: "嚴重", SevHigh: "高風險", SevMedium: "中風險", SevLow: "低風險", SevUnknown: "未評級",
 		StPending: "待處理", StConfirmed: "已確認", StResolved: "已處理", StFalsePos: "誤報",
 		StIgnored: "忽略", StInProgress: "處理中", StRiskAccepted: "風險接受", StDuplicate: "重複", StFixed: "已修復",
 		LblVulnClass: "漏洞類型", LblSeverity: "風險等級", LblCVSS: "CVSS", LblAssets: "影響資產",
 		LblStatus: "處置狀態", LblSummary: "漏洞描述", LblImpact: "影響", LblRepro: "重現過程",
 		LblEvidence: "驗證證據", LblRemediation: "修復建議", LblDetail: "詳細說明",
-		LblEntry: "入口點", LblPrereq: "前置條件", LblStepN: "步驟 %d",
+		LblEntry: "入口點", LblPrereq: "前置條件", LblProvenance: "攻擊鏈來源", LblStepN: "步驟 %d",
 		LblRequest: "請求", LblResponse: "回應", LblExpected: "預期", LblTraffic: "關聯流量",
 		LblNoFinding: "本次測試未確認可利用漏洞。", LblNoStep: "（未登錄結構化重現步驟）",
 		LblTruncated: "（報告內容過長，已截斷）", FooterPrefix: "滲透測試報告",
@@ -170,14 +171,14 @@ var langs = map[Lang]langSet{
 		ScopeMethods: "Methodology: active scanning, manual verification and business-logic analysis. Every verification was performed within the reachable scope, with reproducible request/response evidence retained.",
 		SummaryLead:  "%d confirmed findings, distributed by severity below; see Chapter 4 for details.",
 		AppendixLead: "The appendix consolidates the assets and evidence involved, for review.",
-		ThID: "ID", ThName: "Finding", ThSeverity: "Severity", ThAsset: "Asset", ThStatus: "Status", ThCount: "Count",
+		ThID:         "ID", ThName: "Finding", ThSeverity: "Severity", ThAsset: "Asset", ThStatus: "Status", ThCount: "Count",
 		SevCritical: "Critical", SevHigh: "High", SevMedium: "Medium", SevLow: "Low", SevUnknown: "Unrated",
 		StPending: "Pending", StConfirmed: "Confirmed", StResolved: "Resolved", StFalsePos: "False positive",
 		StIgnored: "Ignored", StInProgress: "In progress", StRiskAccepted: "Risk accepted", StDuplicate: "Duplicate", StFixed: "Fixed",
 		LblVulnClass: "Class", LblSeverity: "Severity", LblCVSS: "CVSS", LblAssets: "Affected assets",
 		LblStatus: "Status", LblSummary: "Description", LblImpact: "Impact", LblRepro: "Reproduction",
 		LblEvidence: "Evidence", LblRemediation: "Remediation", LblDetail: "Details",
-		LblEntry: "Entry point", LblPrereq: "Prerequisites", LblStepN: "Step %d",
+		LblEntry: "Entry point", LblPrereq: "Prerequisites", LblProvenance: "Attack-chain provenance", LblStepN: "Step %d",
 		LblRequest: "Request", LblResponse: "Response", LblExpected: "Expected", LblTraffic: "Related traffic",
 		LblNoFinding: "No exploitable findings were confirmed in this engagement.",
 		LblNoStep:    "(no structured reproduction steps recorded)",
@@ -195,12 +196,12 @@ type Person struct {
 
 // Settings 是组织级报告设置（出具方/客户/人员/默认语言）。存在 settings 表的一行里。
 type Settings struct {
-	Company      string   `json:"company"`       // 出具方
-	Client       string   `json:"client"`        // 默认客户
-	Confidential string   `json:"confidential"`  // 封面密级文本；空 = 用语言默认
-	Lang         string   `json:"lang"`          // 默认语言
+	Company      string   `json:"company"`      // 出具方
+	Client       string   `json:"client"`       // 默认客户
+	Confidential string   `json:"confidential"` // 封面密级文本；空 = 用语言默认
+	Lang         string   `json:"lang"`         // 默认语言
 	People       []Person `json:"people"`
-	Version      string   `json:"version"`       // 报告版本，如 v1.0
+	Version      string   `json:"version"` // 报告版本，如 v1.0
 }
 
 // Step 是一个复现步骤（与 finding 的 reproduction 结构对齐）。
@@ -229,6 +230,8 @@ type Finding struct {
 	Prereq      string
 	Steps       []Step
 	Traffic     []string // 形如 "GET https://host/path → 200"
+	// Provenance 是结构化复现里的攻击链来源/依赖（从哪些事实/漏洞串起来）。
+	Provenance string
 }
 
 // DocInput 是渲染一份报告所需的全部数据。
@@ -413,6 +416,9 @@ func findingBlocks(ls langSet, n int, f Finding) []block {
 	}
 	if f.Prereq != "" {
 		out = append(out, row(ls.LblPrereq, f.Prereq))
+	}
+	if f.Provenance != "" {
+		out = append(out, row(ls.LblProvenance, f.Provenance))
 	}
 
 	section := func(label, body string) []block {

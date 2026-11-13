@@ -229,6 +229,22 @@ func (s *Server) toReportFindings(fs []*db.DBFinding) []report.Finding {
 			Remediation: f.Remediation, Evidence: f.Evidence, Detail: f.Report,
 			Traffic: trafficLines(f),
 		}
+		// 结构化复现：入口/前置直接进属性表，逐步请求-响应按原顺序渲染成代码块。
+		// 这是报告里"怎么复现"的那一半；绑定流量是"证据"的那一半，两者都在。
+		if r := f.Reproduction; r != nil {
+			rf.EntryPoint = r.EntryPoint
+			rf.Prereq = r.Prerequisites
+			for _, st := range r.Steps {
+				rf.Steps = append(rf.Steps, report.Step{
+					Request: st.Request, Response: st.Response,
+					Expected: st.Expected, Proves: st.Proves,
+				})
+			}
+			if p := strings.TrimSpace(r.Provenance); p != "" {
+				// 来源并进"详细说明"之前不合适 —— 单独一段更清楚，用 Evidence 承载会误导。
+				rf.Provenance = p
+			}
+		}
 		for _, aid := range f.AssetIDs {
 			if a, ok := assets[aid]; ok {
 				if label := reportAssetLabel(a); label != "" {

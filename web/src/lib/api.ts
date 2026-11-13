@@ -35,6 +35,7 @@ import type {
   DeleteTaskOptions,
   DeleteTaskResult,
   GenerateReportInput,
+  Reproduction,
   ReportRecord,
   ReportSettings,
   ReportSettingsInput,
@@ -817,6 +818,8 @@ export const api = {
       cvss?: string;
       impact?: string;
       remediation?: string;
+      // 结构化复现过程：传对象即覆盖、传 null 即清空（后端按"没传 vs 传 null"区分）。
+      reproduction?: Reproduction | null;
     },
   ) => patch<Finding>(`/exploration/findings/${id}`, fields),
   // 删除漏洞:移除 findings 记录 + 来源探索节点(从发现列表/任务发现 Tab/探索图一并消失)。

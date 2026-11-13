@@ -1304,12 +1304,25 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		"vulnclass": str("漏洞类别"), "name": str("漏洞名称"), "severity": str("critical|high|medium|low"), "summary": str("发现摘要"),
 		"intent_id": idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id"},
 		"evidence":         str("证据/PoC 文本"),
+		"reproduction": map[string]any{"type": "object", "description": "结构化复现过程（强烈建议填）：让工程师从零复现。entry_point=触发漏洞的关键接口(方法+URL)；prerequisites=前置(需要的账号/角色/前序步骤，需账号时写清如何注册)；steps=有序步骤数组，每步 request/response【逐字取自真实报文】(traffic_get 原文最准)、expected=该步预期、proves=证明了什么；provenance=攻击链来源/依赖。单步报文超 8000 字符会被截断(完整报文在关联流量里)。",
+			"properties": map[string]any{
+				"entry_point":   str("入口点：方法 + URL，如 POST /api/login"),
+				"prerequisites": str("前置条件：账号/角色/前序步骤；需要测试账号时写清如何注册"),
+				"steps": map[string]any{"type": "array", "description": "按利用顺序排列的步骤", "items": obj(map[string]any{
+					"request":  str("该步真实请求原文（逐字）"),
+					"response": str("该步真实响应关键片段（逐字）"),
+					"expected": str("该步预期/结论一句话"),
+					"proves":   str("该步证明了什么"),
+				})},
+				"provenance": str("攻击链来源/依赖：从哪些事实/漏洞串起来"),
+			}}, 
 		"evidence_hint_id": idp("可选：本任务中对应此漏洞的提示节点 ID，自动携带其结构化 traffic_refs；不能引用继承提示或其他漏洞的提示"),
 		"traffic_refs": map[string]any{"type": "array", "description": "可选；HTTP/HTTPS 漏洞先检索并逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID。TCP 等非 HTTP 漏洞、未采集或找不到确切记录时省略或传 []，不阻止上报；可在 evidence 说明原因并提供其他可验证证据。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。",
 			"items": obj(map[string]any{"traffic_id": str("traffic_search 返回的真实流量 ID"), "role": map[string]any{"type": "string", "enum": []string{"baseline", "proof", "verification", "supporting"}}, "note": str("该流量如何支持漏洞结论")}, "traffic_id")},
 	}, "vulnclass", "severity", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		var a struct {
 			VulnClass, Name, Severity, Summary, Evidence string
+			Reproduction                                 *db.Reproduction  `json:"reproduction"`
 			IntentID                                     json.RawMessage   `json:"intent_id"`
 			AssetIDs                                     []json.RawMessage `json:"asset_ids"`
 			TrafficRefs                                  []db.TrafficRef   `json:"traffic_refs"`
@@ -1336,7 +1349,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
-		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
+		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), Reproduction: a.Reproduction}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
@@ -1367,7 +1380,13 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			*db.RecordedFinding
 			EvidenceStatus string `json:"evidence_status"`
 			EvidenceNote   string `json:"evidence_note,omitempty"`
+			// ReproductionSteps 是本次落库的复现步骤数；0 表示没提供结构化复现。
+			// 回传它是为了让模型当场知道"报告里这条会缺复现路径"，好补而不是留空。
+			ReproductionSteps int `json:"reproduction_steps"`
 		}{RecordedFinding: recorded, EvidenceStatus: "bound"}
+		if n := a.Reproduction.Normalize(); n != nil {
+			result.ReproductionSteps = len(n.Steps)
+		}
 		if len(recorded.Traffic.Bindings) == 0 {
 			result.EvidenceStatus = "not_bound"
 			result.EvidenceNote = "漏洞已保存，未绑定流量。TCP/无包情形可正常继续；若已有核实的 HTTP 流量，请用可用的 bind_finding_traffic 或漏洞页面补绑，再完成证据交接。不要重复创建漏洞。"

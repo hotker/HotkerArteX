@@ -37,6 +37,9 @@ type DBFinding struct {
 	CVSS        string
 	Impact      string
 	Remediation string
+	// Reproduction 是结构化复现过程（入口/前置/有序步骤/来源）。仅 GetFinding 与
+	// 导出路径填充 —— 列表查询不带，避免 payload 膨胀。
+	Reproduction *Reproduction
 	CreatedAt       time.Time
 	TaskDescription string // populated via LEFT JOIN on tasks
 }
@@ -485,7 +488,7 @@ RETURNING id, created_at`, s.expID, audit.NodeID, utf8Clean(audit.Worker), utf8C
 // 再按时间倒序,与「导出汇总报告」的分组顺序一致。
 func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, error) {
 	const order = `ORDER BY CASE f.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, f.created_at DESC`
-	cols := findingSelectCols + `, COALESCE(f.report, ''), COALESCE(f.cvss, ''), COALESCE(f.impact, ''), COALESCE(f.remediation, '')`
+	cols := findingSelectCols + `, COALESCE(f.report, ''), COALESCE(f.cvss, ''), COALESCE(f.impact, ''), COALESCE(f.remediation, ''), f.reproduction`
 
 	var q string
 	var args []any
@@ -523,13 +526,15 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 	for rows.Next() {
 		f := &DBFinding{}
 		var aidsJSON string
+		var reproRaw sql.NullString
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
 			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report,
-			&f.CVSS, &f.Impact, &f.Remediation); err != nil {
+			&f.CVSS, &f.Impact, &f.Remediation, &reproRaw); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
+		f.Reproduction = DecodeReproduction(reproRaw)
 		out = append(out, f)
 	}
 	return out, rows.Err()
@@ -648,14 +653,15 @@ func (d *DB) FindingStats() (*FindingStats, error) {
 func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 	f := &DBFinding{}
 	var aidsJSON string
-	err := d.QueryRow(`SELECT `+findingSelectCols+`, COALESCE(f.report, ''), COALESCE(f.cvss, ''), COALESCE(f.impact, ''), COALESCE(f.remediation, '')
+	var reproRaw sql.NullString
+	err := d.QueryRow(`SELECT `+findingSelectCols+`, COALESCE(f.report, ''), COALESCE(f.cvss, ''), COALESCE(f.impact, ''), COALESCE(f.remediation, ''), f.reproduction
 		FROM findings f
 		LEFT JOIN tasks t ON f.task_id = t.id`+findingTrafficCountJoin+`
 		WHERE f.id = $1`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
 		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report,
-		&f.CVSS, &f.Impact, &f.Remediation)
+		&f.CVSS, &f.Impact, &f.Remediation, &reproRaw)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -663,6 +669,7 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
+	f.Reproduction = DecodeReproduction(reproRaw)
 	return f, nil
 }
 

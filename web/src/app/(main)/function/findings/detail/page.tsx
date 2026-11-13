@@ -5,7 +5,7 @@ import * as React from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
-import { ArrowLeftIcon, ArrowUpRightIcon, ShieldAlertIcon } from "lucide-react";
+import { ArrowLeftIcon, ArrowUpRightIcon, ShieldAlertIcon, Trash2Icon } from "lucide-react";
 import { toast } from "sonner";
 
 import { CopyButton } from "@/components/copy-button";
@@ -26,7 +26,7 @@ import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ApiError, api } from "@/lib/api";
 import { statusMeta } from "@/lib/status";
-import type { Finding, FindingStatus, Severity } from "@/lib/types";
+import type { Finding, FindingStatus, ReproStep, Reproduction, Severity } from "@/lib/types";
 
 import { FindingLineageView } from "./lineage";
 
@@ -45,6 +45,192 @@ const FINDING_STATUSES: FindingStatus[] = [
 
 function fmtTime(ts: string) {
   return new Date(ts).toLocaleString("zh-CN");
+}
+
+// ReproductionCard 展示/编辑结构化复现过程：入口 → 前置 → 逐步（请求/响应/预期/证明）→ 来源。
+// 报告按这个顺序逐段渲染成"步骤 1/2/3"，所以这里是唯一该改复现的地方 —— 让人从零复现，
+// 而不是靠一段自由文本自己揣摩。
+function ReproductionCard({ finding, onSaved }: { finding: Finding; onSaved: (f: Finding) => void }) {
+  const [draft, setDraft] = React.useState<Reproduction>(finding.reproduction ?? {});
+  const [saving, setSaving] = React.useState(false);
+  const [editing, setEditing] = React.useState(false);
+
+  React.useEffect(() => {
+    setDraft(finding.reproduction ?? {});
+    setEditing(false);
+  }, [finding.id, finding.reproduction]);
+
+  const steps = draft.steps ?? [];
+  const hasContent =
+    Boolean(draft.entry_point || draft.prerequisites || draft.provenance) || steps.length > 0;
+
+  function patch(next: Partial<Reproduction>) {
+    setDraft((cur) => ({ ...cur, ...next }));
+  }
+  function patchStep(i: number, next: Partial<ReproStep>) {
+    const list = [...steps];
+    list[i] = { ...list[i], ...next };
+    patch({ steps: list });
+  }
+
+  async function save() {
+    setSaving(true);
+    try {
+      const updated = await api.updateFinding(finding.finding_id || finding.id, { reproduction: draft });
+      onSaved(updated);
+      setEditing(false);
+      toast.success("复现过程已保存");
+    } catch (e) {
+      toast.error("保存失败：" + (e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader className="flex-row items-center justify-between">
+        <CardTitle className="text-sm">复现过程</CardTitle>
+        <div className="flex gap-1">
+          {editing ? (
+            <>
+              <Button size="sm" variant="ghost" onClick={() => { setDraft(finding.reproduction ?? {}); setEditing(false); }}>
+                取消
+              </Button>
+              <Button size="sm" variant="outline" onClick={save} disabled={saving}>
+                {saving ? "保存中…" : "保存"}
+              </Button>
+            </>
+          ) : (
+            <Button size="sm" variant="outline" disabled={finding.inherited} onClick={() => setEditing(true)}>
+              编辑
+            </Button>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        {!hasContent && !editing && (
+          <p className="text-muted-foreground text-sm">
+            尚未登记结构化复现过程。报告里这条漏洞只会显示"未登记"，工程师得自己猜怎么打。
+          </p>
+        )}
+
+        {!editing ? (
+          <>
+            {draft.entry_point && (
+              <FieldRow label="入口点">
+                <code className="font-mono text-xs">{draft.entry_point}</code>
+              </FieldRow>
+            )}
+            {draft.prerequisites && (
+              <div className="text-sm">
+                <span className="text-muted-foreground">前置条件：</span>
+                <span className="whitespace-pre-wrap">{draft.prerequisites}</span>
+              </div>
+            )}
+            {steps.map((st, i) => (
+              <div key={i} className="flex flex-col gap-1 border-t pt-2 first:border-0 first:pt-0">
+                <div className="font-medium text-xs">步骤 {i + 1}</div>
+                {st.expected && <p className="text-xs text-muted-foreground">预期：{st.expected}</p>}
+                {st.request && (
+                  <pre className="max-h-40 overflow-auto rounded bg-muted px-2 py-1 font-mono text-[11px] whitespace-pre-wrap">
+                    {st.request}
+                  </pre>
+                )}
+                {st.response && (
+                  <pre className="max-h-40 overflow-auto rounded bg-muted px-2 py-1 font-mono text-[11px] whitespace-pre-wrap">
+                    {st.response}
+                  </pre>
+                )}
+                {st.proves && <p className="text-xs">{st.proves}</p>}
+              </div>
+            ))}
+            {draft.provenance && (
+              <p className="text-xs text-muted-foreground">攻击链来源：{draft.provenance}</p>
+            )}
+          </>
+        ) : (
+          <>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <div className="grid gap-1">
+                <Label className="text-xs text-muted-foreground">入口点</Label>
+                <Input
+                  value={draft.entry_point ?? ""}
+                  placeholder="POST /api/login"
+                  onChange={(e) => patch({ entry_point: e.target.value })}
+                />
+              </div>
+              <div className="grid gap-1">
+                <Label className="text-xs text-muted-foreground">攻击链来源</Label>
+                <Input
+                  value={draft.provenance ?? ""}
+                  placeholder="从事实 #12 的报错指纹推来"
+                  onChange={(e) => patch({ provenance: e.target.value })}
+                />
+              </div>
+            </div>
+            <div className="grid gap-1">
+              <Label className="text-xs text-muted-foreground">前置条件（含账号如何获得）</Label>
+              <Textarea
+                rows={2}
+                value={draft.prerequisites ?? ""}
+                placeholder="需要普通用户账号，通过 /register 自助注册"
+                onChange={(e) => patch({ prerequisites: e.target.value })}
+              />
+            </div>
+            {steps.map((st, i) => (
+              <div key={i} className="flex flex-col gap-2 rounded-md border p-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-medium text-xs">步骤 {i + 1}</span>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label="删除该步骤"
+                    onClick={() => patch({ steps: steps.filter((_, j) => j !== i) })}
+                  >
+                    <Trash2Icon className="size-4" />
+                  </Button>
+                </div>
+                <Textarea
+                  rows={2}
+                  className="font-mono text-xs"
+                  placeholder="真实请求原文（逐字）"
+                  value={st.request ?? ""}
+                  onChange={(e) => patchStep(i, { request: e.target.value })}
+                />
+                <Textarea
+                  rows={2}
+                  className="font-mono text-xs"
+                  placeholder="真实响应关键片段（逐字）"
+                  value={st.response ?? ""}
+                  onChange={(e) => patchStep(i, { response: e.target.value })}
+                />
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <Input
+                    placeholder="预期"
+                    value={st.expected ?? ""}
+                    onChange={(e) => patchStep(i, { expected: e.target.value })}
+                  />
+                  <Input
+                    placeholder="这一步证明了什么"
+                    value={st.proves ?? ""}
+                    onChange={(e) => patchStep(i, { proves: e.target.value })}
+                  />
+                </div>
+              </div>
+            ))}
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => patch({ steps: [...steps, { request: "", response: "", expected: "", proves: "" }] })}
+            >
+              添加步骤
+            </Button>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
 }
 
 // ReportFieldsCard 编辑交付级报告字段（CVSS / 影响 / 修复建议）。
@@ -276,6 +462,7 @@ function FindingDetailInner() {
                 </CardContent>
               </Card>
               <ReportFieldsCard finding={finding} onSaved={setFinding} />
+              <ReproductionCard finding={finding} onSaved={setFinding} />
               <FindingRetestPanel key={id} findingId={id} readOnly={finding.inherited} onCompleted={load} />
               <Card>
                 <CardHeader>

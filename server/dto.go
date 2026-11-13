@@ -322,6 +322,8 @@ type FindingDTO struct {
 	CVSS        string `json:"cvss,omitempty"`
 	Impact      string `json:"impact,omitempty"`
 	Remediation string `json:"remediation,omitempty"`
+	// 结构化复现过程（入口/前置/有序步骤/来源）：详情接口返回，报告直接渲染。
+	Reproduction *db.Reproduction `json:"reproduction,omitempty"`
 
 	IntentID        string            `json:"intent_id,omitempty"`
 	ParamID         string            `json:"param_id,omitempty"`
@@ -452,17 +454,18 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 		FindingID:    i64s(f.ID),
 		TrafficCount: f.TrafficCount, EvidenceVersion: f.EvidenceVersion, ReportEvidenceVersion: f.ReportEvidenceVersion,
 		ReportStale: f.Report != "" && f.EvidenceVersion != f.ReportEvidenceVersion, TrafficBindings: f.TrafficBindings,
-		VulnClass:   f.VulnClass,
-		Name:        f.Name,
-		Severity:    f.Severity,
-		Status:      status,
-		Summary:     f.Summary,
-		Evidence:    f.Evidence,
-		Report:      f.Report,
-		CVSS:        f.CVSS,
-		Impact:      f.Impact,
-		Remediation: f.Remediation,
-		TS:          rfc3339(f.CreatedAt),
+		VulnClass:    f.VulnClass,
+		Name:         f.Name,
+		Severity:     f.Severity,
+		Status:       status,
+		Summary:      f.Summary,
+		Evidence:     f.Evidence,
+		Report:       f.Report,
+		CVSS:         f.CVSS,
+		Impact:       f.Impact,
+		Remediation:  f.Remediation,
+		Reproduction: f.Reproduction,
+		TS:           rfc3339(f.CreatedAt),
 	}
 	d.Assets = findingAssetDTOs(f.AssetIDs, assets)
 	if f.TaskID != nil {

@@ -2384,6 +2384,8 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		CVSS        *string `json:"cvss"`
 		Impact      *string `json:"impact"`
 		Remediation *string `json:"remediation"`
+		// reproduction 传对象即覆盖、传 null 即清空（*json.RawMessage 区分"没传"和"传了 null"）
+		Reproduction *json.RawMessage `json:"reproduction"`
 		VulnClass *string `json:"vulnclass"`
 	}
 	if err := decode(r, &body); err != nil {
@@ -2391,7 +2393,7 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.Status == nil && body.Severity == nil && body.Name == nil && body.VulnClass == nil &&
-		body.CVSS == nil && body.Impact == nil && body.Remediation == nil {
+		body.CVSS == nil && body.Impact == nil && body.Remediation == nil && body.Reproduction == nil {
 		writeErr(w, 400, "nothing to update: provide status/severity/name/vulnclass/cvss/impact/remediation")
 		return
 	}
@@ -2433,6 +2435,26 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Name != nil {
 		n, err := s.m.pg.SetFindingName(id, strings.TrimSpace(*body.Name))
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if n == 0 {
+			writeErr(w, 404, "finding not found")
+			return
+		}
+	}
+	if body.Reproduction != nil {
+		var repro *db.Reproduction
+		if raw := string(*body.Reproduction); strings.TrimSpace(raw) != "" && strings.TrimSpace(raw) != "null" {
+			var r db.Reproduction
+			if err := json.Unmarshal(*body.Reproduction, &r); err != nil {
+				writeErr(w, 400, "reproduction 格式错误: "+err.Error())
+				return
+			}
+			repro = &r
+		}
+		n, err := s.m.pg.SetFindingReproduction(id, repro)
 		if err != nil {
 			writeErr(w, 500, err.Error())
 			return

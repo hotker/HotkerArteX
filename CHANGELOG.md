@@ -2,6 +2,31 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2.5.1] - 2026-11-14
+
+### 新增
+
+- **结构化复现过程落库**（`findings.reproduction` JSONB）：`entry_point`（方法+URL）/ `prerequisites`
+  （账号与前置，需账号时写清如何注册）/ `steps`（有序，每步真实请求与响应、预期、证明什么）/ `provenance`
+  （攻击链来源）。此前 agent 写在自由文本 `evidence` 里的复现路径既不可检索、也无法按步骤渲染。
+- **`report_finding` 接受 `reproduction`**：登记漏洞时一并写入，返回里带 `reproduction_steps`，
+  模型当场就知道"这条会不会缺复现路径"，而不是等报告生成才发现。链路照旧原子（同一事务）。
+- **入库前统一收敛**（`db.Reproduction.Normalize`）：丢空步骤、限 40 步、单字段超 8000 字符截断并标注
+  且按 rune 边界截（不劈开多字节字符）。超长报文交给关联流量承载，不让一步几 MB 的 HTML 撑爆漏洞行。
+- **报告渲染逐步复现**：属性表新增「入口点 / 前置条件 / 攻击链来源」，正文按 `步骤 1…n` 分别渲染
+  请求、响应（等宽代码块）、预期与结论；没有登记时显式写「未登记结构化复现步骤」，不留空白。
+- **详情页「复现过程」卡片**：查看/编辑模式切换，可增删步骤、逐字段编辑，保存走
+  `PATCH /api/exploration/findings/{id}` 的 `reproduction`（传对象覆盖、传 null 清空）。
+- **worker 的代码固定取证纪律**新增一条：复现必须结构化落库（入口/前置/逐步/来源），只写自由文本
+  等于让报告缺逐步路径。
+
+### 说明
+
+- 与「关联流量」的分工被写进代码注释与文档：`finding_traffic_bindings` 是**证据**（真实报文快照），
+  `reproduction` 是**路径**（怎么一步步打出来）。报告同时渲染两者，互不可替代。
+- 数据库列为 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`，老库启动自动补齐；老漏洞 `reproduction` 为 NULL，
+  报告显示「未登记」而不是报错。
+
 ## [2.5.0] - 2026-11-14
 
 ### 新增
