@@ -17,7 +17,7 @@ import (
 // Exercise the actual SDK event -> hook -> execution -> result path. No real
 // model or command is used; the probe tool only returns a fixed string.
 func TestCaptureApprovalLifecycle(t *testing.T) {
-	dsn, _, err := db.DSN()
+	dsn, _, err := db.DSN() // 已由 dbtest.Main 指向隔离库
 	if err != nil {
 		t.Skip("no test database configured")
 	}

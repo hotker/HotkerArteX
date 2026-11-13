@@ -22,7 +22,7 @@ func names(tools []actool.CoreTool) map[string]actool.CoreTool {
 // catalog, ToolResolve keeps record_fact for worker but drops it for planner (not
 // bound), and an edited description + injected default flow through.
 func TestWireTools(t *testing.T) {
-	dsn, _, err := db.DSN()
+	dsn, _, err := db.DSN() // 已由 dbtest.Main 指向隔离库
 	if err != nil {
 		t.Skipf("no database config (%v) — skipping", err)
 	}

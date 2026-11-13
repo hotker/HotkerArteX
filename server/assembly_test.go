@@ -26,7 +26,7 @@ func hasSkillTool(tools []actool.CoreTool) bool {
 // ToolAugment hook. Skills live on disk under skillDir; visibility is a per-agent
 // (agent × skill_name) row keyed by the skill's directory name.
 func TestAssembleVisibleSkill(t *testing.T) {
-	dsn, _, err := db.DSN()
+	dsn, _, err := db.DSN() // 已由 dbtest.Main 指向隔离库
 	if err != nil {
 		t.Skipf("no database config (%v) — skipping", err)
 	}

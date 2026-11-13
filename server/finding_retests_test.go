@@ -36,7 +36,7 @@ func (p retestProvider) Stream(context.Context, llm.CompletionRequest) iter.Seq2
 
 func newRetestServer(t *testing.T) (*Server, int64) {
 	t.Helper()
-	dsn, _, err := db.DSN()
+	dsn, _, err := db.DSN() // 已由 dbtest.Main 指向隔离库
 	if err != nil {
 		t.Skip("test postgres not configured")
 	}

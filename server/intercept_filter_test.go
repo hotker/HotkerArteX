@@ -11,7 +11,7 @@ import (
 )
 
 func TestInterceptFilterHTTP(t *testing.T) {
-	dsn, _, err := db.DSN()
+	dsn, _, err := db.DSN() // 已由 dbtest.Main 指向隔离库
 	if err != nil {
 		t.Skip("no test database configured")
 	}

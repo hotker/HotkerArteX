@@ -2,6 +2,29 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2.5.2] - 2026-11-14
+
+### 变更
+
+- **测试不再写开发库**：新增 `dbtest` 包作为「需要真实 PostgreSQL 的测试」的统一入口。
+  每个测试包在 `TestMain` 里调 `dbtest.Main(m)`，进程启动时就在同一 PG 实例里建一个
+  临时库 `<原库名>_test_<pid>_<rand>`、把 `ARTEX_PG_DSN` 改写成它，包结束时 `DROP DATABASE`
+  （PG13+ 用 `WITH (FORCE)`，老版本回退）。此前 `go test ./...` 会直接往开发库里反复建
+  task/finding（task id 一路涨），既污染数据，也让跨包清理只能靠一把全局 advisory lock 串行化。
+
+### 修复
+
+- **`llmrec` 单包过、全量挂**：该包不经过 `db.Open`，`llm_usage` 表在空库上不存在。
+  现在由 `dbtest.Setup()` → `ensureSchemaForTests()` → `dbtest.RunOnly(m)` → `dbtest.Teardown()`
+  显式在**建完隔离库之后**建表（表格 DDL 仍走 `db.EnsureLLMUsageTable`，不手抄）。原先用
+  `init()` 会在 `TestMain` 之前执行，那时 DSN 还指向开发库——正是这个顺序错导致了上述症状。
+
+### 说明
+
+- 没有 `ARTEX_PG_DSN` 或 PG 不可达时行为不变：不建库，需要 DB 的用例各自 skip。
+- 隔离库名带原库名前缀，一眼可看出归属；`dbtest_test.go` 用纯函数测试钉住
+  「绝不等于开发库名 / ≤63 字符 / 只含安全标识符 / 每次调用不同」四条不变量。
+
 ## [2.5.1] - 2026-11-14
 
 ### 新增

@@ -12,7 +12,7 @@ import (
 // testDB opens a DB connection, skipping if PG is unavailable.
 func testDB(t *testing.T) *db.DB {
 	t.Helper()
-	dsn, _, err := db.DSN()
+	dsn, _, err := db.DSN() // 已由 dbtest.Main 指向隔离库
 	if err != nil {
 		t.Skipf("no database config (%v)", err)
 	}

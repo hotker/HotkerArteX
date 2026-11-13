@@ -1,30 +1,13 @@
 package agent
 
 import (
-	"database/sql"
-	"os"
 	"testing"
 
-	"github.com/Autumn-27/artex/db"
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/Autumn-27/artex/dbtest"
 )
 
-// TestMain acquires a PostgreSQL advisory lock (7337741002) for the entire
-// agent test suite so cross-package DELETE cleanup races with db/server
-// packages are avoided when running `go test ./...`.
-func TestMain(m *testing.M) {
-	dsn, _, err := db.DSN()
-	if err != nil {
-		os.Exit(m.Run())
-	}
-	conn, err := sql.Open("pgx", dsn)
-	if err != nil || conn.Ping() != nil {
-		os.Exit(m.Run())
-	}
-	defer conn.Close()
-	if _, err := conn.Exec(`SELECT pg_advisory_lock(7337741002)`); err != nil {
-		os.Exit(m.Run())
-	}
-	defer conn.Exec(`SELECT pg_advisory_unlock(7337741002)`) //nolint:errcheck
-	os.Exit(m.Run())
-}
+// TestMain 走统一的测试隔离入口（dbtest.Main）：有 ARTEX_PG_DSN 且 PG 可达时，
+// 先建一个临时库 artex_test_<pid>_<rand> 并把 DSN 指过去，包结束时 DROP。
+// 测试因此不再写开发库，也不再需要靠一把全局 advisory lock 串行化（锁仍在 dbtest 内保留）。
+// 没有 PG 配置时照旧直接跑，需要 DB 的用例各自 skip。
+func TestMain(m *testing.M) { dbtest.Main(m) }

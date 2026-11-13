@@ -1,34 +1,13 @@
 package config
 
 import (
-	"database/sql"
-	"os"
 	"testing"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/Autumn-27/artex/dbtest"
 )
 
-// TestMain acquires the same PostgreSQL advisory lock (7337741002) as the
-// db/server/agent/evidence test suites so this package's DSN-backed tests do
-// not run cross-package concurrent with them when running `go test ./...`.
-//
-// The DSN is read from ARTEX_PG_DSN directly: db.DSN() cannot be used here
-// because db imports config, which would be an import cycle in a test file.
-// Without the env var (pure unit-test runs) the suite proceeds unlocked, same
-// as before this file existed.
-func TestMain(m *testing.M) {
-	dsn := os.Getenv("ARTEX_PG_DSN")
-	if dsn == "" {
-		os.Exit(m.Run())
-	}
-	conn, err := sql.Open("pgx", dsn)
-	if err != nil || conn.Ping() != nil {
-		os.Exit(m.Run())
-	}
-	defer conn.Close()
-	if _, err := conn.Exec(`SELECT pg_advisory_lock(7337741002)`); err != nil {
-		os.Exit(m.Run())
-	}
-	defer conn.Exec(`SELECT pg_advisory_unlock(7337741002)`) //nolint:errcheck
-	os.Exit(m.Run())
-}
+// TestMain 走统一的测试隔离入口（dbtest.Main）：有 ARTEX_PG_DSN 且 PG 可达时，
+// 先建一个临时库 artex_test_<pid>_<rand> 并把 DSN 指过去，包结束时 DROP。
+// 测试因此不再写开发库，也不再需要靠一把全局 advisory lock 串行化（锁仍在 dbtest 内保留）。
+// 没有 PG 配置时照旧直接跑，需要 DB 的用例各自 skip。
+func TestMain(m *testing.M) { dbtest.Main(m) }
