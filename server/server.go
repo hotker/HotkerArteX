@@ -919,6 +919,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/notify/deliveries/{id}/retry", s.notifyRetryDelivery)
 	mux.HandleFunc("POST /api/settings/web-search/test", s.testWebSearch)
 	mux.HandleFunc("GET /api/report", s.getReport)
+
+	// --- 交付级报告（report management）：设置 / 生成 / 列表 / 下载 / 删除 ---
+	mux.HandleFunc("GET /api/report-settings", s.getReportSettings)
+	mux.HandleFunc("PUT /api/report-settings", s.putReportSettings)
+	mux.HandleFunc("POST /api/reports/generate", s.generateReport)
+	mux.HandleFunc("GET /api/reports", s.listReports)
+	mux.HandleFunc("GET /api/reports/{id}/download", s.downloadReport)
+	mux.HandleFunc("DELETE /api/reports/{id}", s.deleteReport)
 	mux.HandleFunc("GET /api/chat/mentions", s.searchChatMentions)
 	mux.HandleFunc("POST /api/chat", s.chat)
 	mux.HandleFunc("POST /api/chat/upload", s.chatUpload) // 方式1 文件上传:落到会话/任务工作目录 uploads/
@@ -2372,14 +2380,19 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		Status    *string `json:"status"`
 		Severity  *string `json:"severity"`
 		Name      *string `json:"name"`
+		// 交付级报告字段：人工/富化可改，报告渲染只读它们。
+		CVSS        *string `json:"cvss"`
+		Impact      *string `json:"impact"`
+		Remediation *string `json:"remediation"`
 		VulnClass *string `json:"vulnclass"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
-	if body.Status == nil && body.Severity == nil && body.Name == nil && body.VulnClass == nil {
-		writeErr(w, 400, "nothing to update: provide status/severity/name/vulnclass")
+	if body.Status == nil && body.Severity == nil && body.Name == nil && body.VulnClass == nil &&
+		body.CVSS == nil && body.Impact == nil && body.Remediation == nil {
+		writeErr(w, 400, "nothing to update: provide status/severity/name/vulnclass/cvss/impact/remediation")
 		return
 	}
 	if body.Status != nil {
@@ -2420,6 +2433,30 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Name != nil {
 		n, err := s.m.pg.SetFindingName(id, strings.TrimSpace(*body.Name))
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if n == 0 {
+			writeErr(w, 404, "finding not found")
+			return
+		}
+	}
+	// 报告字段：只写 findings 表（不镜像到探索节点 —— 节点是 worker 原始产出，
+	// 报告属性是交付层的东西，混进 payload 只会让 graph_overview 膨胀）。
+	for _, ed := range []struct {
+		val *string
+		set func(int64, string) (int64, error)
+		bad string
+	}{
+		{body.CVSS, s.m.pg.SetFindingCVSS, "cvss"},
+		{body.Impact, s.m.pg.SetFindingImpact, "impact"},
+		{body.Remediation, s.m.pg.SetFindingRemediation, "remediation"},
+	} {
+		if ed.val == nil {
+			continue
+		}
+		n, err := ed.set(id, strings.TrimSpace(*ed.val))
 		if err != nil {
 			writeErr(w, 500, err.Error())
 			return

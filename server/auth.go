@@ -161,6 +161,16 @@ var tokenQueryPaths = []string{
 	"/api/exploration/activity/stream",
 }
 
+// 报告文件下载同样只能在链接里带凭据：<a download> 触发的是浏览器导航，没有地方
+// 放 Authorization 头。这里按【前缀】而非精确路径匹配 /api/reports/{id}/download，
+// 并且只认这一种形状 —— 不能让 ?token= 悄悄扩散到其它 /api/reports/* 路由。
+func tokenQueryAllowedPath(p string) bool {
+	if tokenQueryAllowed(p) {
+		return true
+	}
+	return strings.HasPrefix(p, "/api/reports/") && strings.HasSuffix(p, "/download")
+}
+
 func tokenQueryAllowed(p string) bool {
 	for _, prefix := range tokenQueryPaths {
 		if p == prefix {
@@ -183,7 +193,7 @@ func extractToken(r *http.Request) string {
 	if c, err := r.Cookie("artex_token"); err == nil && c.Value != "" {
 		return c.Value
 	}
-	if tokenQueryAllowed(r.URL.Path) {
+	if tokenQueryAllowedPath(r.URL.Path) {
 		return r.URL.Query().Get("token")
 	}
 	return ""

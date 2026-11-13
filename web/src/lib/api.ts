@@ -34,6 +34,10 @@ import type {
   DailyTokenBucket,
   DeleteTaskOptions,
   DeleteTaskResult,
+  GenerateReportInput,
+  ReportRecord,
+  ReportSettings,
+  ReportSettingsInput,
   Edge,
   EvidenceBodyPreview,
   ExplorationNodePage,
@@ -804,7 +808,16 @@ export const api = {
   // 一次保存漏洞的名称/类别/严重等级(发现列表行内编辑用),只传出现的字段。
   updateFinding: (
     id: string,
-    fields: { name?: string; vulnclass?: string; severity?: Severity; status?: FindingStatus },
+    fields: {
+      name?: string;
+      vulnclass?: string;
+      severity?: Severity;
+      status?: FindingStatus;
+      // 交付级报告字段：人工可改，报告渲染直接读它们（不调 LLM）。
+      cvss?: string;
+      impact?: string;
+      remediation?: string;
+    },
   ) => patch<Finding>(`/exploration/findings/${id}`, fields),
   // 删除漏洞:移除 findings 记录 + 来源探索节点(从发现列表/任务发现 Tab/探索图一并消失)。
   deleteFinding: (id: string) => del<{ deleted: boolean; id: number }>(`/exploration/findings/${id}`),
@@ -1461,6 +1474,24 @@ export const api = {
   // per-agent 绑定 / 轮询 / 中断消耗都覆盖）。
   tokensByModel: (task: string) =>
     get<{ models: ModelTokenStat[] }>(`/llm/records/by-model?task=${encodeURIComponent(task)}`),
+
+  // ---- 交付级报告（report management）----
+  reportSettings: () => get<ReportSettings>("/report-settings"),
+  saveReportSettings: (p: ReportSettingsInput) => put<{ ok: boolean; lang: string }>("/report-settings", p),
+  generateReport: (p: GenerateReportInput) => post<ReportRecord>("/reports/generate", p),
+  reports: (task?: string) =>
+    get<{ reports: ReportRecord[] }>(`/reports${task ? `?task_id=${encodeURIComponent(task)}` : ""}`).then((r) =>
+      arr(r.reports),
+    ),
+  deleteReport: (id: string) => del<{ deleted: number }>(`/reports/${id}`),
+  // 下载走浏览器直连（不是 fetch）：要的是文件保存 + 大文件不占 JS 内存。
+  // token 只能进查询串 —— 与后端"文件路由也接受 ?token=" 的约定一致。
+  reportDownloadURL: (id: string) => {
+    const token = getToken();
+    return `${apiBase()}/api/reports/${encodeURIComponent(id)}/download${
+      token ? `?token=${encodeURIComponent(token)}` : ""
+    }`;
+  },
 
   // ---- 一键更新 ----
   // 检查以后端为准：下载是后端做的，浏览器能连 GitHub 而服务器连不上的情况很常见

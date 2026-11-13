@@ -1114,6 +1114,41 @@ CREATE TABLE IF NOT EXISTS findings (
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS name   TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
+-- 交付级报告需要的结构化字段：CVSS 向量/分、影响、修复建议。上游靠 AI 富化即时生成，
+-- 这里落成列：报告渲染只读库、不调 LLM，同一份数据任何时候渲染结果一致（可追溯）。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS cvss           TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS impact         TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS remediation    TEXT NOT NULL DEFAULT '';
+
+-- =====================================================================
+-- 交付级报告（report management）
+-- =====================================================================
+-- 组织级报告设置：单行表（id 恒为 true），存出具方/客户/密级/默认语言/署名人员/版本。
+CREATE TABLE IF NOT EXISTS report_settings (
+    id           BOOLEAN PRIMARY KEY DEFAULT true CHECK (id),
+    company      TEXT NOT NULL DEFAULT '',
+    client       TEXT NOT NULL DEFAULT '',
+    confidential TEXT NOT NULL DEFAULT '',
+    lang         TEXT NOT NULL DEFAULT 'zh-CN',
+    version      TEXT NOT NULL DEFAULT 'v1.0',
+    people       JSONB NOT NULL DEFAULT '[]',
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- 已生成的报告记录。文件落在 <dataDir>/reports/ 下，行里只存相对路径与元数据，
+-- 删记录即删文件；不改文件系统布局就能备份/迁移。
+CREATE TABLE IF NOT EXISTS reports (
+    id             BIGSERIAL PRIMARY KEY,
+    task_id        BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
+    title          TEXT NOT NULL DEFAULT '',
+    lang           TEXT NOT NULL DEFAULT 'zh-CN',
+    file_path      TEXT NOT NULL DEFAULT '',
+    file_name      TEXT NOT NULL DEFAULT '',
+    size_bytes     BIGINT NOT NULL DEFAULT 0,
+    findings_count INT NOT NULL DEFAULT 0,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_reports_time ON reports(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reports_task ON reports(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_time ON findings(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, created_at DESC);

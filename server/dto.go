@@ -318,6 +318,10 @@ type FindingDTO struct {
 	Summary   string `json:"summary"`
 	Evidence  string `json:"evidence"`
 	Report    string `json:"report,omitempty"` // 详细报告(Markdown);仅详情接口返回,列表为空
+	// 交付级报告字段：详情页可编辑，报告渲染只读它们（不调 LLM，可离线复现）。
+	CVSS        string `json:"cvss,omitempty"`
+	Impact      string `json:"impact,omitempty"`
+	Remediation string `json:"remediation,omitempty"`
 
 	IntentID        string            `json:"intent_id,omitempty"`
 	ParamID         string            `json:"param_id,omitempty"`
@@ -448,14 +452,17 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 		FindingID:    i64s(f.ID),
 		TrafficCount: f.TrafficCount, EvidenceVersion: f.EvidenceVersion, ReportEvidenceVersion: f.ReportEvidenceVersion,
 		ReportStale: f.Report != "" && f.EvidenceVersion != f.ReportEvidenceVersion, TrafficBindings: f.TrafficBindings,
-		VulnClass: f.VulnClass,
-		Name:      f.Name,
-		Severity:  f.Severity,
-		Status:    status,
-		Summary:   f.Summary,
-		Evidence:  f.Evidence,
-		Report:    f.Report,
-		TS:        rfc3339(f.CreatedAt),
+		VulnClass:   f.VulnClass,
+		Name:        f.Name,
+		Severity:    f.Severity,
+		Status:      status,
+		Summary:     f.Summary,
+		Evidence:    f.Evidence,
+		Report:      f.Report,
+		CVSS:        f.CVSS,
+		Impact:      f.Impact,
+		Remediation: f.Remediation,
+		TS:          rfc3339(f.CreatedAt),
 	}
 	d.Assets = findingAssetDTOs(f.AssetIDs, assets)
 	if f.TaskID != nil {

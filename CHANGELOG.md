@@ -2,6 +2,37 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2.5.0] - 2026-11-14
+
+### 新增
+
+- **交付级报告（.docx，零外部依赖）**：新增 `report` 包内的纯 Go OOXML 渲染器（`archive/zip` + 手写 OOXML），
+  封面 / 目录域 / 页码页脚 / 四级标题 / 表格 / 等宽代码块 / 三语（简·繁·英）。**不需要 python3 + python-docx**，
+  任何跑得动本二进制的机器都能出报告；python 缺失不再是一类运行期错误。
+- **报告只渲染库里的确定事实**：正文来源是漏洞字段（名称/类型/等级/CVSS/影响/修复建议）、证据、关联流量
+  （admin 绑定的真实报文快照）、任务范围（task_scope）与资产。**不调 LLM**：同一份数据任何时候渲染结果一致，
+  客户可以逐条复核，也不需要为出报告准备可用模型。想补叙述性文字就先写进字段（详情页可编辑）。
+- **报告管理后台**：新增 `/system/reports` 页面 + 6 条 API（`GET/PUT /api/report-settings`、
+  `POST /api/reports/generate`、`GET /api/reports`、`GET /api/reports/{id}/download`、`DELETE /api/reports/{id}`）。
+  组织级设置（出具方 / 客户 / 密级 / 默认语言 / 署名人员 / 版本）单行表存储；按任务生成、支持勾选漏洞子集、
+  可指定语言覆盖默认值；文件落 `<dataDir>/reports/`，删记录即删文件。
+- **漏洞详情的「报告字段」编辑卡片**：CVSS / 影响 / 修复建议三项可直接在详情页改并落库
+  （`findings.cvss / impact / remediation`），报告渲染直接读它们。
+- **同步生成**：docx 渲染是毫秒级纯 Go 计算，生成接口同步返回「文件大小 / 漏洞数 / 下载入口」，
+  不做异步队列 —— 失败能立刻定位，用户也不用轮询。
+
+### 安全
+
+- **`?token=` 只对「浏览器导航必须用」的路由放行**：新增 `tokenQueryAllowedPath`，在原有 SSE 白名单之外
+  仅额外允许 `/api/reports/{id}/download`（`<a download>` 无法设置 Authorization 头）。仍按前缀+后缀精确匹配，
+  不会扩散到 `/api/reports/*` 的其它路由；其余接口继续只认 `Authorization: Bearer`（或同源 cookie）。
+
+### 兼容
+
+- 数据库新增 `report_settings`、`reports` 两张表与 `findings.cvss/impact/remediation` 三列，
+  全部 `ADD COLUMN IF NOT EXISTS` / `CREATE TABLE IF NOT EXISTS`，老库启动即自动补齐。
+- `GET /api/exploration/findings/{id}` 的响应多三个可选字段（`cvss/impact/remediation`），旧前端忽略不影响。
+
 ## [2.4.0] - 2026-11-14
 
 ### 新增

@@ -510,6 +510,10 @@ export interface Finding {
   inherited?: boolean;
   assets?: FindingAsset[];
   ts: string;
+  /** 交付级报告字段：CVSS 向量/分、影响、修复建议（详情页可编辑，报告直接读）。 */
+  cvss?: string;
+  impact?: string;
+  remediation?: string;
 }
 
 // FindingsPage 是发现列表的服务端分页响应。
@@ -1614,4 +1618,47 @@ export interface InterceptExecution {
   session: string;
   seq: number;
   items: Activity[];
+}
+
+// ---- 交付级报告（report management）----
+// 报告只渲染库里的确定事实（漏洞字段 + 证据 + 关联流量 + 范围），不调 LLM：
+// 同一份数据任何时候渲染结果一致，客户可逐条复核。
+
+export interface ReportPerson {
+  name: string;
+  role: string;
+  contact: string;
+}
+
+export interface ReportSettingsInput {
+  company: string;
+  client: string;
+  confidential: string;
+  lang: string; // zh-CN | zh-TW | en-US
+  version: string;
+  people: ReportPerson[];
+}
+
+export interface ReportSettings extends ReportSettingsInput {
+  configured: boolean; // 从未保存过 = false（前端据此提示"先配置出具方"）
+  updated_at?: string;
+}
+
+export interface GenerateReportInput {
+  task_id: string;
+  title?: string;
+  lang?: string; // 留空沿用设置里的默认语言
+  finding_ids?: number[]; // 留空 = 该任务全部漏洞
+}
+
+export interface ReportRecord {
+  id: number;
+  task_id?: number;
+  title: string;
+  lang: string;
+  file_name: string;
+  file_path: string;
+  size_bytes: number;
+  findings_count: number;
+  created_at: string;
 }

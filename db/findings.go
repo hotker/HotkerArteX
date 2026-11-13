@@ -32,6 +32,11 @@ type DBFinding struct {
 	AssetIDs        []int64
 	Status          string
 	Report          string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
+	// 交付级报告字段：CVSS 向量/分、影响、修复建议。都能被人工在详情页改；
+	// 报告渲染只读它们，不调 LLM（同一数据任何时候渲染结果一致）。
+	CVSS        string
+	Impact      string
+	Remediation string
 	CreatedAt       time.Time
 	TaskDescription string // populated via LEFT JOIN on tasks
 }
@@ -480,7 +485,7 @@ RETURNING id, created_at`, s.expID, audit.NodeID, utf8Clean(audit.Worker), utf8C
 // 再按时间倒序,与「导出汇总报告」的分组顺序一致。
 func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, error) {
 	const order = `ORDER BY CASE f.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, f.created_at DESC`
-	cols := findingSelectCols + `, COALESCE(f.report, '')`
+	cols := findingSelectCols + `, COALESCE(f.report, ''), COALESCE(f.cvss, ''), COALESCE(f.impact, ''), COALESCE(f.remediation, '')`
 
 	var q string
 	var args []any
@@ -520,7 +525,8 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 		var aidsJSON string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report); err != nil {
+			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report,
+			&f.CVSS, &f.Impact, &f.Remediation); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -642,13 +648,14 @@ func (d *DB) FindingStats() (*FindingStats, error) {
 func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 	f := &DBFinding{}
 	var aidsJSON string
-	err := d.QueryRow(`SELECT `+findingSelectCols+`, COALESCE(f.report, '')
+	err := d.QueryRow(`SELECT `+findingSelectCols+`, COALESCE(f.report, ''), COALESCE(f.cvss, ''), COALESCE(f.impact, ''), COALESCE(f.remediation, '')
 		FROM findings f
 		LEFT JOIN tasks t ON f.task_id = t.id`+findingTrafficCountJoin+`
 		WHERE f.id = $1`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report)
+		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report,
+		&f.CVSS, &f.Impact, &f.Remediation)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -766,6 +773,31 @@ func (d *DB) SetFindingSeverity(id int64, severity string) (int64, error) {
 
 // SetFindingName updates one finding's 漏洞名称 (+ node payload sync). Empty name is
 // allowed — the frontend falls back to the vuln class for display.
+// SetFindingCVSS / SetFindingImpact / SetFindingRemediation 写交付级报告用的三个字段。
+// 只写 findings 表、不镜像到 node payload：探索节点是 worker 的原始产出，报告字段是
+// 人工/富化后的交付属性，混进 payload 会让 graph_overview 膨胀。
+func (d *DB) SetFindingCVSS(id int64, v string) (int64, error) {
+	return d.setFindingColOnly(id, "cvss", v)
+}
+
+func (d *DB) SetFindingImpact(id int64, v string) (int64, error) {
+	return d.setFindingColOnly(id, "impact", v)
+}
+
+func (d *DB) SetFindingRemediation(id int64, v string) (int64, error) {
+	return d.setFindingColOnly(id, "remediation", v)
+}
+
+// setFindingColOnly 更新 findings 单列（不镜像 node payload）。
+// col MUST 是可信常量（会被拼进 SQL）。
+func (d *DB) setFindingColOnly(id int64, col, val string) (int64, error) {
+	res, err := d.Exec(`UPDATE findings SET `+col+`=$1 WHERE id=$2`, val, id)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func (d *DB) SetFindingName(id int64, name string) (int64, error) {
 	return d.setFindingCol(id, "name", "name", name)
 }

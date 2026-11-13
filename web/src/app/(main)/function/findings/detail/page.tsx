@@ -17,6 +17,9 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { SidebarTrigger } from "@/components/ui/sidebar";
@@ -42,6 +45,85 @@ const FINDING_STATUSES: FindingStatus[] = [
 
 function fmtTime(ts: string) {
   return new Date(ts).toLocaleString("zh-CN");
+}
+
+// ReportFieldsCard 编辑交付级报告字段（CVSS / 影响 / 修复建议）。
+// 报告渲染只读这三项 + 摘要证据，不调 LLM —— 所以在详情页改完，下次生成的 .docx
+// 里就是改后的内容，可离线复现、可逐条复核。
+function ReportFieldsCard({ finding, onSaved }: { finding: Finding; onSaved: (f: Finding) => void }) {
+  const [cvss, setCvss] = React.useState(finding.cvss ?? "");
+  const [impact, setImpact] = React.useState(finding.impact ?? "");
+  const [remediation, setRemediation] = React.useState(finding.remediation ?? "");
+  const [saving, setSaving] = React.useState(false);
+
+  // 切换漏洞时重置草稿（组件按 id 复用，不能把上一个漏洞的值带过来）
+  React.useEffect(() => {
+    setCvss(finding.cvss ?? "");
+    setImpact(finding.impact ?? "");
+    setRemediation(finding.remediation ?? "");
+  }, [finding.id, finding.cvss, finding.impact, finding.remediation]);
+
+  const dirty =
+    cvss !== (finding.cvss ?? "") || impact !== (finding.impact ?? "") || remediation !== (finding.remediation ?? "");
+
+  async function save() {
+    setSaving(true);
+    try {
+      const updated = await api.updateFinding(finding.finding_id || finding.id, { cvss, impact, remediation });
+      onSaved(updated);
+      toast.success("报告字段已保存");
+    } catch (e) {
+      toast.error("保存失败：" + (e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader className="flex-row items-center justify-between">
+        <CardTitle className="text-sm">报告字段</CardTitle>
+        <Button size="sm" variant="outline" onClick={save} disabled={saving || !dirty || finding.inherited}>
+          {saving ? "保存中…" : "保存"}
+        </Button>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        <p className="text-muted-foreground text-xs">
+          这些字段直接进入交付报告的属性表；报告渲染不调用模型，改完即生效。
+        </p>
+        <div className="grid gap-3 sm:grid-cols-[140px_1fr]">
+          <div className="grid gap-1">
+            <Label className="text-xs text-muted-foreground">CVSS</Label>
+            <Input
+              value={cvss}
+              placeholder="如 9.8 或 AV:N/AC:L/…"
+              disabled={finding.inherited}
+              onChange={(e) => setCvss(e.target.value)}
+            />
+          </div>
+          <div className="grid gap-1">
+            <Label className="text-xs text-muted-foreground">影响</Label>
+            <Input
+              value={impact}
+              placeholder="如 可读取全库用户数据"
+              disabled={finding.inherited}
+              onChange={(e) => setImpact(e.target.value)}
+            />
+          </div>
+        </div>
+        <div className="grid gap-1">
+          <Label className="text-xs text-muted-foreground">修复建议</Label>
+          <Textarea
+            value={remediation}
+            rows={3}
+            placeholder="如 改用参数化查询，并给数据库账号最小权限"
+            disabled={finding.inherited}
+            onChange={(e) => setRemediation(e.target.value)}
+          />
+        </div>
+      </CardContent>
+    </Card>
+  );
 }
 
 // FieldRow is one label/value line in the right-hand status panel.
@@ -193,6 +275,7 @@ function FindingDetailInner() {
                   <p className="text-sm leading-relaxed whitespace-pre-wrap">{finding.summary || "（无摘要）"}</p>
                 </CardContent>
               </Card>
+              <ReportFieldsCard finding={finding} onSaved={setFinding} />
               <FindingRetestPanel key={id} findingId={id} readOnly={finding.inherited} onCompleted={load} />
               <Card>
                 <CardHeader>
