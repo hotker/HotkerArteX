@@ -922,6 +922,21 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/settings/web-search/test", s.testWebSearch)
 	mux.HandleFunc("GET /api/report", s.getReport)
 
+	// --- 知识库（两层 RAG：全局库 + 任务库）---
+	mux.HandleFunc("GET /api/knowledge", s.listKnowledge)
+	mux.HandleFunc("POST /api/knowledge", s.createKnowledge)
+	mux.HandleFunc("POST /api/knowledge/upload", s.uploadKnowledge)
+	mux.HandleFunc("GET /api/knowledge/categories", s.knowledgeCategories)
+	mux.HandleFunc("POST /api/knowledge/search", s.searchKnowledge)
+	mux.HandleFunc("GET /api/knowledge/logs", s.knowledgeLogs)
+	mux.HandleFunc("GET /api/knowledge/config", s.getKnowledgeConfig)
+	mux.HandleFunc("PUT /api/knowledge/config", s.saveKnowledgeConfig)
+	mux.HandleFunc("POST /api/knowledge/config/test", s.testKnowledgeEmbedder)
+	mux.HandleFunc("POST /api/knowledge/reindex", s.reindexKnowledge)
+	mux.HandleFunc("GET /api/knowledge/{id}", s.getKnowledge)
+	mux.HandleFunc("PUT /api/knowledge/{id}", s.updateKnowledge)
+	mux.HandleFunc("DELETE /api/knowledge/{id}", s.deleteKnowledge)
+
 	// --- 交付级报告（report management）：设置 / 生成 / 列表 / 下载 / 删除 ---
 	mux.HandleFunc("GET /api/report-settings", s.getReportSettings)
 	mux.HandleFunc("PUT /api/report-settings", s.putReportSettings)

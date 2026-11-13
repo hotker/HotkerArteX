@@ -10,6 +10,7 @@ import (
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/knowledge"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"
@@ -24,6 +25,7 @@ import (
 // into the frontier. It is the sole intent generator.
 type Planner struct {
 	findingRecorder   FindingRecorder
+	kb                *knowledge.Service // 知识库（nil = search_knowledge 回报未启用）
 	prov              llm.Provider
 	model             string
 	tx                *transcript.Store                      // raw LLM conversation persistence (nil = off)
@@ -65,6 +67,10 @@ func (p *Planner) SetBudget(fn func(ctx context.Context, expID int64) (float64, 
 }
 
 // Model reports the model id this planner runs on (host-side cost estimation).
+// SetKnowledgeStore 挂上知识库服务，让 search_knowledge / list_knowledge_categories
+// 生效。nil = 工具回报"知识库未启用"（宿主未配置时就是没有这一层能力）。
+func (p *Planner) SetKnowledgeStore(kb *knowledge.Service) { p.kb = kb }
+
 func (p *Planner) Model() string { return p.model }
 
 // stallFor returns the task's stall tracker (created on first use).
@@ -417,6 +423,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// runs in a detached goroutine so it never adds latency to this round.
 	p.compactor.OnPlannerRound(ctx, ts)
 	tsx := NewToolSet(ts, "planner")
+	tsx.SetKnowledgeStore(p.kb) // 知识库工具（nil = 未启用）
 	tsx.SetFindingRecorder(p.findingRecorder)
 	if as != nil {
 		tsx.SetAssetStore(as, as.Companies())

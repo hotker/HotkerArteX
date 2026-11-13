@@ -12,6 +12,7 @@ import (
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/knowledge"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/harness"
@@ -54,6 +55,7 @@ type WebSearchOpts struct {
 
 type Worker struct {
 	findingRecorder FindingRecorder
+	kb              *knowledge.Service // 知识库（nil = search_knowledge 回报未启用）
 	prov            llm.Provider
 	model           string
 	workDir         string
@@ -115,6 +117,10 @@ func hasWorkerChatMessage(messages []llm.Message, requestID string) bool {
 // SetNonStreaming wires a resolver deciding whether runs use the non-streaming
 // model path (true = non-streaming). nil/unset = streaming (default). Read per
 // run so a profile or task-chain toggle takes effect without rebuilding.
+// SetKnowledgeStore 挂上知识库服务，让 search_knowledge / list_knowledge_categories
+// 生效。nil = 工具回报"知识库未启用"（宿主未配置时就是没有这一层能力）。
+func (w *Worker) SetKnowledgeStore(kb *knowledge.Service) { w.kb = kb }
+
 func (w *Worker) SetNonStreaming(fn func() bool) { w.nonStreamingFn = fn }
 
 func (w *Worker) nonStreaming() bool { return w.nonStreamingFn != nil && w.nonStreamingFn() }
@@ -373,6 +379,7 @@ func (w *Worker) ExecuteWithMessage(ctx context.Context, name string, taskID int
 
 func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, intent *db.Node, hooks harness.HookRunner, emit func(db.Activity), enr EnrichTrigger, notifyFinding func(int64, string), requestID, message string) (harness.TerminalReason, WriteCounts, error) {
 	tsx := NewToolSet(ts, name)
+	tsx.SetKnowledgeStore(w.kb) // 知识库工具（nil = 未启用）
 	tsx.SetFindingRecorder(w.findingRecorder)
 	tsx.SetTaskID(taskID)
 	coverageEnabled := as == nil || as.CoverageEnabled(taskID)

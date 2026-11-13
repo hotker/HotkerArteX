@@ -1128,6 +1128,62 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS reproduction    JSONB;
 -- 交付级报告（report management）
 -- =====================================================================
 -- 组织级报告设置：单行表（id 恒为 true），存出具方/客户/密级/默认语言/署名人员/版本。
+
+-- =====================================================================
+-- K. 知识库（两层 RAG：全局库 + 任务库）+ Embedding 语义检索
+-- =====================================================================
+-- 文档层：scope=global（平台通用漏洞库/0day/技巧/方法论）| task（某任务的授权范围/评分规则/检查项）。
+-- 向量分块层 knowledge_chunks 含 pgvector 的 vector 列，由 Go 侧守卫式创建
+-- （db.ensureKnowledgeVectorSchema）：CREATE EXTENSION vector 需要超级用户预装，
+-- 缺失时整体降级为关键词检索而不是让程序起不来 —— 所以它不在必须成功的 schema.sql 里。
+CREATE TABLE IF NOT EXISTS knowledge_docs (
+    id         BIGSERIAL PRIMARY KEY,
+    scope      TEXT   NOT NULL DEFAULT 'global',           -- global | task
+    task_id    BIGINT REFERENCES tasks(id) ON DELETE CASCADE,
+    category   TEXT   NOT NULL DEFAULT '',
+    title      TEXT   NOT NULL DEFAULT '',
+    content    TEXT   NOT NULL DEFAULT '',
+    source     TEXT   NOT NULL DEFAULT 'manual',           -- manual | upload | migrated
+    file_name  TEXT   NOT NULL DEFAULT '',
+    bytes      BIGINT NOT NULL DEFAULT 0,
+    indexed    BOOLEAN NOT NULL DEFAULT false,             -- 是否已生成向量分块
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_docs_scope ON knowledge_docs(scope);
+CREATE INDEX IF NOT EXISTS idx_knowledge_docs_task ON knowledge_docs(task_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_docs_cat ON knowledge_docs(category);
+
+-- 检索日志：agent 每次 search_knowledge 都记一行，用来回答"它到底查没查知识库、
+-- 命中的是哪几篇"。只记 query 与 doc id，不存内容。
+CREATE TABLE IF NOT EXISTS knowledge_retrieval_logs (
+    id         BIGSERIAL PRIMARY KEY,
+    task_id    BIGINT,
+    agent_key  TEXT   NOT NULL DEFAULT '',
+    query      TEXT   NOT NULL DEFAULT '',
+    scope      TEXT   NOT NULL DEFAULT '',
+    mode       TEXT   NOT NULL DEFAULT '',                 -- semantic | keyword
+    top_k      INT    NOT NULL DEFAULT 0,
+    hits       INT    NOT NULL DEFAULT 0,
+    doc_ids    BIGINT[] NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_logs_created ON knowledge_retrieval_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_knowledge_logs_task ON knowledge_retrieval_logs(task_id);
+
+-- embedder 配置（单例）：OpenAI 兼容 embeddings 端点（智谱/硅基流动/OpenAI/Ollama）。
+-- api_key 不回显给 UI（只用 has_key 表示已配置）。
+CREATE TABLE IF NOT EXISTS knowledge_config (
+    id         INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    enabled    BOOLEAN NOT NULL DEFAULT false,             -- 语义检索开关；关=只用关键词
+    base_url   TEXT NOT NULL DEFAULT 'https://open.bigmodel.cn/api/paas/v4',
+    model      TEXT NOT NULL DEFAULT 'embedding-3',
+    api_key    TEXT NOT NULL DEFAULT '',
+    dim        INT  NOT NULL DEFAULT 1024,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO knowledge_config (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS report_settings (
     id           BOOLEAN PRIMARY KEY DEFAULT true CHECK (id),
     company      TEXT NOT NULL DEFAULT '',

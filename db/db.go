@@ -169,6 +169,9 @@ func Open(dsn string) (*DB, error) {
 		sqlDB.Close()
 		return nil, err
 	}
+	// 语义检索层（pgvector）单独守卫式创建：CREATE EXTENSION 需要超级用户预装，
+	// 缺失时整体降级为关键词检索，绝不因此阻断启动。
+	d.ensureKnowledgeVectorSchema()
 	return d, nil
 }
 

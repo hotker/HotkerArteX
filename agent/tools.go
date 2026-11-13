@@ -9,6 +9,7 @@ import (
 
 	"github.com/Autumn-27/artex/capture"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/knowledge"
 	acperm "github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -53,14 +54,17 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 // One ToolSet is created per planner/worker run; per-run signals live here.
 type ToolSet struct {
 	findingRecorder FindingRecorder
+	// kb 是知识库服务（nil = 未启用）。挂上后 search_knowledge /
+	// list_knowledge_categories 生效，让 agent 动手前先查方法论与本次授权范围。
+	kb *knowledge.Service
 	// intentNotes 收集本轮 add_intent 产生的去重软提示（近似重复的提醒）。
 	// 由 add_intent 取走并回传给模型，见 agent/strategy.go。
 	intentNotes []string
-	as              *db.AssetStore   // asset store (optional; nil = asset tools not available)
-	cs              *db.CompanyStore // company store (optional)
-	ts              *db.ExplorationStore
-	worker          string
-	taskID          int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
+	as          *db.AssetStore   // asset store (optional; nil = asset tools not available)
+	cs          *db.CompanyStore // company store (optional)
+	ts          *db.ExplorationStore
+	worker      string
+	taskID      int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
 	// coverageDisabled mirrors tasks.coverage_enabled=false. Stored inverted so the
 	// zero value (all existing ToolSet constructions) means ENABLED — matching the
 	// DB default (true). When true: graphOverviewData drops the coverage block, the
@@ -1303,7 +1307,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 	return writeTool("report_finding", "记录确认的漏洞，用 evidence 提供命令输出、日志等可验证证据。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。", obj(map[string]any{
 		"vulnclass": str("漏洞类别"), "name": str("漏洞名称"), "severity": str("critical|high|medium|low"), "summary": str("发现摘要"),
 		"intent_id": idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id"},
-		"evidence":         str("证据/PoC 文本"),
+		"evidence": str("证据/PoC 文本"),
 		"reproduction": map[string]any{"type": "object", "description": "结构化复现过程（强烈建议填）：让工程师从零复现。entry_point=触发漏洞的关键接口(方法+URL)；prerequisites=前置(需要的账号/角色/前序步骤，需账号时写清如何注册)；steps=有序步骤数组，每步 request/response【逐字取自真实报文】(traffic_get 原文最准)、expected=该步预期、proves=证明了什么；provenance=攻击链来源/依赖。单步报文超 8000 字符会被截断(完整报文在关联流量里)。",
 			"properties": map[string]any{
 				"entry_point":   str("入口点：方法 + URL，如 POST /api/login"),
@@ -1315,7 +1319,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 					"proves":   str("该步证明了什么"),
 				})},
 				"provenance": str("攻击链来源/依赖：从哪些事实/漏洞串起来"),
-			}}, 
+			}},
 		"evidence_hint_id": idp("可选：本任务中对应此漏洞的提示节点 ID，自动携带其结构化 traffic_refs；不能引用继承提示或其他漏洞的提示"),
 		"traffic_refs": map[string]any{"type": "array", "description": "可选；HTTP/HTTPS 漏洞先检索并逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID。TCP 等非 HTTP 漏洞、未采集或找不到确切记录时省略或传 []，不阻止上报；可在 evidence 说明原因并提供其他可验证证据。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。",
 			"items": obj(map[string]any{"traffic_id": str("traffic_search 返回的真实流量 ID"), "role": map[string]any{"type": "string", "enum": []string{"baseline", "proof", "verification", "supporting"}}, "note": str("该流量如何支持漏洞结论")}, "traffic_id")},
@@ -2134,6 +2138,8 @@ func (t *ToolSet) listWorkerTraces() actool.CoreTool {
 // PlannerTools is the read + intent-generation + goal-judgement tool set.
 func (t *ToolSet) PlannerTools() []actool.CoreTool {
 	return []actool.CoreTool{
+		// 知识库：规划前先查方法论与任务的量化验收标准。
+		t.searchKnowledge(), t.listKnowledgeCategories(),
 		t.graphOverview(), t.listFindings(), t.listFacts(), t.nodeDetail(),
 		// cold-digest §6.1: restore folded cold nodes (digest body → members → detail).
 		t.expandDigest(),

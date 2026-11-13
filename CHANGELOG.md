@@ -2,6 +2,40 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [3.1.0] - 2026-11-14
+
+### 新增
+
+- **知识库（两层 RAG：全局库 + 任务库）**：全局库存方法论/漏洞库/技巧，任务库存该次授权的
+  范围与评分规则。Agent 通过 `search_knowledge` / `list_knowledge_categories` 在动手前检索，
+  每次检索都写审计（查了什么、命中几篇、用的哪种模式）。
+- **Embedding 语义检索**（OpenAI 兼容 `/embeddings`：智谱/硅基流动/OpenAI/Ollama）：
+  文档按约 700 字（含 80 字重叠）分块 → 向量化 → 存 pgvector；检索走余弦距离 top-k。
+  每块记 `embed_model/dim`，检索只比较同一模型的向量 —— **换模型后旧向量自动被忽略**，
+  重建索引后统一，不会串味；也不需要 ALTER TABLE 改维度。
+- **后台页 `/system/knowledge`**：文档管理（全局/任务、上传/手写/删除）、Embedder 配置
+  （开关/端点/模型/维度/Key + 测试连通 + 重建索引）、试检索、检索审计四个页签。
+
+### 关键取舍
+
+- **永不因知识库而不可用**：pgvector 缺失或 embedder 未配 → 全链路降级为关键词检索，
+  页面如实显示当前模式，而不是报错或拒绝启动。语义路径任何一步失败也静默降级。
+- **上传零外部依赖**：`.docx` 用 `archive/zip` + `encoding/xml` 直接抽段落与表格，
+  不调 `python-docx` 子进程；PDF 明确不支持（要求先导出为文本），比抽出一堆乱码诚实。
+- **分块按 rune 计长并带重叠**：中文按字节切会劈出乱码；相邻块重叠 80 字，
+  避免一句话被切断后两边都命中不到。
+
+### 验证
+
+- `knowledge/chunk_test.go`：段落聚合、超长硬切重叠、中文按 rune 计长。
+- `knowledge/embed_test.go`：按 `index` 对齐乱序返回、缺 key/model 本地拒、provider 错误透出、
+  数量不符、同批维度不一致。
+- `knowledge/extract_test.go`：`.docx` 段落 + 多 run + 表格单元格、PDF 明确拒绝、坏 zip 报错。
+- `server/knowledge_test.go`：无 embedder 时关键词降级仍可用；任务知识隔离（A 任务看不到 B）；
+  任务范围缺 task_id 被拒（避免静默落成孤儿）。
+- `server/knowledge_vector_test.go`：**真 pgvector + 假 embedder** 跑通语义链路 ——
+  相关文档排第一、换模型后旧向量被跳过、检索审计留痕、重建索引覆盖全部文档。
+
 ## [3.0.1] - 2026-11-14
 
 ### 变更

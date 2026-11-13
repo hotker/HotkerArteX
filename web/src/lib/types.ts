@@ -1681,3 +1681,56 @@ export interface Reproduction {
   steps?: ReproStep[];
   provenance?: string;
 }
+
+// ---- 知识库（两层 RAG：全局库 + 任务库）----
+// 语义检索依赖 pgvector + embedder；任一缺失时【整体降级为关键词检索】，
+// 不是报错 —— 前端据 semantic 字段显示当前模式。
+
+export interface KnowledgeDoc {
+  id: number;
+  scope: "global" | "task";
+  task_id?: number;
+  category: string;
+  title: string;
+  content?: string; // 列表不返回
+  source: string; // manual | upload | migrated
+  file_name?: string;
+  bytes: number;
+  indexed: boolean;
+  chunks: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface KnowledgeHit {
+  doc_id: number;
+  title: string;
+  category: string;
+  scope: "global" | "task";
+  content: string;
+  score: number;
+}
+
+export interface KnowledgeConfig {
+  enabled: boolean;
+  base_url: string;
+  model: string;
+  dim: number;
+  has_key: boolean;
+  /** pgvector 语义层是否存在 */
+  vector_ready: boolean;
+  /** 向量检索是否真正可用（pgvector + enabled + key 三者齐备） */
+  semantic: boolean;
+}
+
+export interface KnowledgeRetrievalLog {
+  id: number;
+  task_id?: number;
+  agent_key: string;
+  query: string;
+  scope: string;
+  mode: "semantic" | "keyword";
+  top_k: number;
+  hits: number;
+  created_at: string;
+}

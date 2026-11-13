@@ -35,6 +35,10 @@ import type {
   DeleteTaskOptions,
   DeleteTaskResult,
   GenerateReportInput,
+  KnowledgeConfig,
+  KnowledgeDoc,
+  KnowledgeHit,
+  KnowledgeRetrievalLog,
   Reproduction,
   ReportRecord,
   ReportSettings,
@@ -162,7 +166,9 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(`/api${path}`, {
     ...init,
     headers: {
-      ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      // FormData 必须让浏览器自己带 multipart 边界；硬塞 application/json 会让
+      // 后端 ParseMultipartForm 直接失败（知识库上传就是这条路）。
+      ...(init?.body && !(init.body instanceof FormData) ? { "Content-Type": "application/json" } : {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(init?.headers as Record<string, string> | undefined),
     },
@@ -1477,6 +1483,49 @@ export const api = {
   // per-agent 绑定 / 轮询 / 中断消耗都覆盖）。
   tokensByModel: (task: string) =>
     get<{ models: ModelTokenStat[] }>(`/llm/records/by-model?task=${encodeURIComponent(task)}`),
+
+  // ---- 知识库（两层 RAG）----
+  knowledgeDocs: (q: { scope?: string; task?: string } = {}) => {
+    const p = new URLSearchParams();
+    if (q.scope) p.set("scope", q.scope);
+    if (q.task) p.set("task", q.task);
+    const qs = p.toString();
+    return get<{
+      docs: KnowledgeDoc[];
+      global_count: number;
+      task_count: number;
+      vector_ready: boolean;
+      semantic: boolean;
+    }>(`/knowledge${qs ? `?${qs}` : ""}`).then((r) => ({ ...r, docs: arr(r.docs) }));
+  },
+  knowledgeDoc: (id: string) => get<KnowledgeDoc>(`/knowledge/${id}`),
+  createKnowledgeDoc: (p: { scope: string; task_id?: number; category: string; title: string; content: string }) =>
+    post<KnowledgeDoc>("/knowledge", p),
+  updateKnowledgeDoc: (id: string, p: { category: string; title: string; content: string }) =>
+    put<KnowledgeDoc>(`/knowledge/${id}`, p),
+  deleteKnowledgeDoc: (id: string) => del<{ ok: boolean }>(`/knowledge/${id}`),
+  uploadKnowledgeDoc: (file: File, opts: { scope: string; task_id?: string; category?: string }) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("scope", opts.scope);
+    if (opts.task_id) fd.append("task_id", opts.task_id);
+    if (opts.category) fd.append("category", opts.category);
+    // FormData 走 multipart，http() 只在 body 是字符串时才设 JSON 头
+    return http<KnowledgeDoc>("/knowledge/upload", { method: "POST", body: fd });
+  },
+  knowledgeCategories: (task?: string) =>
+    get<{ categories: string[] }>(`/knowledge/categories${task ? `?task=${encodeURIComponent(task)}` : ""}`).then((r) =>
+      arr(r.categories),
+    ),
+  searchKnowledge: (p: { query: string; task_id?: number; top_k?: number }) =>
+    post<{ hits: KnowledgeHit[]; mode: "semantic" | "keyword" }>("/knowledge/search", p),
+  knowledgeLogs: (limit = 100) =>
+    get<{ logs: KnowledgeRetrievalLog[] }>(`/knowledge/logs?limit=${limit}`).then((r) => arr(r.logs)),
+  knowledgeConfig: () => get<KnowledgeConfig>("/knowledge/config"),
+  saveKnowledgeConfig: (p: { enabled: boolean; base_url: string; model: string; api_key?: string; dim: number }) =>
+    put<{ ok: boolean; semantic: boolean }>("/knowledge/config", p),
+  testKnowledgeEmbedder: () => post<{ ok: boolean; dim?: number; error?: string }>("/knowledge/config/test"),
+  reindexKnowledge: () => post<{ ok: boolean; indexed?: number; error?: string }>("/knowledge/reindex"),
 
   // ---- 交付级报告（report management）----
   reportSettings: () => get<ReportSettings>("/report-settings"),
