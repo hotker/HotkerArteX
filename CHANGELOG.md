@@ -2,6 +2,42 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [3.2.0] - 2026-11-14
+
+### 新增
+
+- **多用户权限（RBAC）**：`rbac_users / rbac_roles / rbac_permissions / rbac_role_permissions /
+  rbac_user_roles` 五张表 + 35 项权限目录（`module:action`）+ 四个系统角色
+  （admin / operator / auditor / viewer）+ 资源级 scope（all / assigned / own）。
+  权限在 `requireAuth` 里统一强制，三条安全阀：**未映射路由放行**（避免一次漏映射把平台打成 403）、
+  **admin 永不被拦**（否则管理员自己会被锁在门外，而他是唯一能修的人）、**开关 `rbac.enforce` 默认开**。
+- **每个用户独立的 token_version**：改密 / 停用 / 管理员重置密码都会自增，携带旧版本号的 token
+  立即失效 —— 这是"只踢某一个人"（此前只有全局 `auth.token_gen`，一改就踢所有人）。
+- **审计日志**（`audit_logs` + `GET /api/audit/logs`）：记 actor / category / action / result / ip / detail。
+  每个变更类 API 请求都落一条（`category=api`），登录、改密、用户/角色变更另有语义化记录。
+- **后台页 `/system/rbac`**：用户管理（新建/停用/重置密码/删除）、角色与权限矩阵
+  （按模块分组勾选、系统角色只读）、审计日志（按用户/类别/关键词筛选）。
+- **登录页用户名可编辑**：多用户后不再固定；默认填上次成功登录的用户名（首次为 `admin`）。
+  `Foxker` / `ARTEX` 仍作为内置 admin 的别名继续可用。
+
+### 兼容（升级不掉线）
+
+- 启动时 `bootstrapRBAC` 把旧单用户密码（`settings.auth.password_hash`）迁移成内置 admin；
+  **改名与多用户化之前签发的 token（无 uid）仍按内置 admin 处理**，不会在升级瞬间把在线会话全部踢掉。
+- 「是否已初始化」的判据从"存在用户行"改为"有可用密码"：bootstrap 会先建占位 admin（哈希 `"!"`），
+  拿它当判据会让全新安装永远 403 —— 这个坑在实机联调时被抓到，并有测试钉住。
+
+### 测试
+
+- `TestRBACBootstrapMigratesLegacyAdmin`：权限目录 / 四个系统角色 / admin 授权完整 / 旧密码迁移。
+- `TestRBACEnforcementBlocksWrites`：viewer 读放行、写 403、权限管理写 403，admin 同路径 200。
+- `TestRBACCustomRolePermissions`：自定义角色只给 log:read + auth:self，确认能看审计、看不到任务。
+- `TestRBACTokenVersionRevokesSession`：停用与改密都让旧 token 变 401，新密码可登录。
+- `TestLegacyTokenResolvesAsAdmin`：改名前的 token 仍解析为 admin。
+- `TestFreshInstallInitializedFlag`：占位哈希不算已初始化。
+- `TestEveryAPIRouteMapsToAPermission`：**扫源码 AST 抽出全部 `mux.HandleFunc` 注册**，
+  逐条断言都能映射到权限 —— 新增模块忘映射会直接红灯。
+
 ## [3.1.0] - 2026-11-14
 
 ### 新增

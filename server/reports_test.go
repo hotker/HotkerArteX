@@ -95,12 +95,12 @@ func TestGenerateReportEndToEnd(t *testing.T) {
 	}
 	body4 := readReportFile(t, s, rec4.FilePath)
 	for _, want := range []string{
-		"POST /api/login",          // 入口点
-		"需要 admin 账号",            // 前置
-		"从事实 #12",                 // 来源
-		"步骤 1", "步骤 2",           // 有序步骤
-		"GET /api/admin/users",     // 第 2 步的请求原文
-		"绕过认证",                    // 预期
+		"POST /api/login", // 入口点
+		"需要 admin 账号",     // 前置
+		"从事实 #12",         // 来源
+		"步骤 1", "步骤 2",    // 有序步骤
+		"GET /api/admin/users", // 第 2 步的请求原文
+		"绕过认证",                 // 预期
 	} {
 		assertDocxContains(t, body4, want)
 	}

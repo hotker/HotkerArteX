@@ -240,11 +240,11 @@ func (s *Server) httpReqClient(redirect *bool) *http.Client {
 	tr := &http.Transport{
 		// 渗透目标常年是自签/过期证书：这里关校验是刻意选择 —— 记录代理本身也会重签
 		// 证书，目标证书链不可信时仍要把请求打出去并落库。
-		TLSClientConfig:        &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConns:           16,
-		IdleConnTimeout:        30 * time.Second,
-		ForceAttemptHTTP2:      false, // 走私/降级类需要 h1 语义
-		ExpectContinueTimeout:  time.Second,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:          16,
+		IdleConnTimeout:       30 * time.Second,
+		ForceAttemptHTTP2:     false, // 走私/降级类需要 h1 语义
+		ExpectContinueTimeout: time.Second,
 		ResponseHeaderTimeout: 0,
 	}
 	if s != nil && s.m != nil {

@@ -233,6 +233,10 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 				s.tokenGen.Store(n)
 			}
 		}
+		// 多用户权限：播种权限目录/系统角色/内置 admin，并把旧单用户密码迁移过来。
+		// 必须在 HTTP 服务开始监听之前完成 —— 否则第一波请求会在"还没有用户"的
+		// 窗口里被当成未初始化，或者更糟：拿旧密码登录却解析不出授权画像。
+		s.bootstrapRBAC()
 		agent.SetPromptOverride(func(key string) (string, bool) {
 			a, err := m.pg.GetAgentByKey(key)
 			if err != nil || a == nil {
@@ -921,6 +925,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/notify/deliveries/{id}/retry", s.notifyRetryDelivery)
 	mux.HandleFunc("POST /api/settings/web-search/test", s.testWebSearch)
 	mux.HandleFunc("GET /api/report", s.getReport)
+
+	// --- 多用户权限（RBAC）：身份 / 用户 / 角色 / 权限目录 ---
+	mux.HandleFunc("GET /api/rbac/me", s.rbacMe)
+	mux.HandleFunc("GET /api/rbac/metadata", s.rbacMetadata)
+	mux.HandleFunc("GET /api/rbac/users", s.rbacListUsers)
+	mux.HandleFunc("POST /api/rbac/users", s.rbacCreateUser)
+	mux.HandleFunc("PUT /api/rbac/users/{id}", s.rbacUpdateUser)
+	mux.HandleFunc("DELETE /api/rbac/users/{id}", s.rbacDeleteUser)
+	mux.HandleFunc("GET /api/rbac/roles", s.rbacListRoles)
+	mux.HandleFunc("POST /api/rbac/roles", s.rbacCreateRole)
+	mux.HandleFunc("PUT /api/rbac/roles/{id}", s.rbacUpdateRole)
+	mux.HandleFunc("DELETE /api/rbac/roles/{id}", s.rbacDeleteRole)
+	// --- 审计日志（谁动了什么）---
+	mux.HandleFunc("GET /api/audit/logs", s.auditLogs)
 
 	// --- 知识库（两层 RAG：全局库 + 任务库）---
 	mux.HandleFunc("GET /api/knowledge", s.listKnowledge)

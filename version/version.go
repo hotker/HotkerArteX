@@ -17,7 +17,7 @@ package version
 // Version 是当前程序版本，形如 "2.5.4"（不带 v 前缀，release tag 才有 v）。
 // 必须是纯净三段式：selfupdate.parseVersion 只接受可比较的版本号，
 // 带后缀（如 2.5.4-rc1）会让"一键更新"整体禁用。
-const Version = "3.1.0"
+const Version = "3.2.0"
 
 // DisplaySuffix 用于开发构建的额外标记（正式 release 不设）。
 // 例：go build -ldflags "-X main.version=$(...)" 时不需要它。

@@ -35,8 +35,13 @@ import type {
   DeleteTaskOptions,
   DeleteTaskResult,
   GenerateReportInput,
+  AuditLog,
   KnowledgeConfig,
   KnowledgeDoc,
+  RBACMe,
+  RBACPermission,
+  RBACRole,
+  RBACUser,
   KnowledgeHit,
   KnowledgeRetrievalLog,
   Reproduction,
@@ -1483,6 +1488,45 @@ export const api = {
   // per-agent 绑定 / 轮询 / 中断消耗都覆盖）。
   tokensByModel: (task: string) =>
     get<{ models: ModelTokenStat[] }>(`/llm/records/by-model?task=${encodeURIComponent(task)}`),
+
+  // ---- 多用户权限（RBAC）----
+  rbacMe: () => get<RBACMe>("/rbac/me"),
+  rbacMetadata: () =>
+    get<{
+      permissions: RBACPermission[];
+      scopes: { value: string; label: string }[];
+      system_roles: string[];
+    }>("/rbac/metadata"),
+  rbacUsers: () => get<{ users: RBACUser[] }>("/rbac/users").then((r) => arr(r.users)),
+  createRBACUser: (p: {
+    username: string;
+    display_name: string;
+    password: string;
+    role_ids: string[];
+  }) => post<RBACUser>("/rbac/users", p),
+  updateRBACUser: (
+    id: string,
+    p: { display_name?: string; password?: string; enabled?: boolean; role_ids?: string[] },
+  ) => put<RBACUser>(`/rbac/users/${encodeURIComponent(id)}`, p),
+  deleteRBACUser: (id: string) => del<{ ok: boolean }>(`/rbac/users/${encodeURIComponent(id)}`),
+  rbacRoles: () => get<{ roles: RBACRole[] }>("/rbac/roles").then((r) => arr(r.roles)),
+  createRBACRole: (p: { name: string; description: string; scope: string; permissions: string[] }) =>
+    post<RBACRole>("/rbac/roles", p),
+  updateRBACRole: (
+    id: string,
+    p: { name: string; description: string; scope: string; permissions: string[] },
+  ) => put<RBACRole>(`/rbac/roles/${encodeURIComponent(id)}`, p),
+  deleteRBACRole: (id: string) => del<{ ok: boolean }>(`/rbac/roles/${encodeURIComponent(id)}`),
+  auditLogs: (q: { actor?: string; category?: string; result?: string; q?: string; limit?: number; offset?: number } = {}) => {
+    const p = new URLSearchParams();
+    for (const [k, v] of Object.entries(q)) {
+      if (v !== undefined && v !== "" && v !== 0) p.set(k, String(v));
+    }
+    const qs = p.toString();
+    return get<{ logs: AuditLog[]; total: number; categories: string[] }>(`/audit/logs${qs ? `?${qs}` : ""}`).then(
+      (r) => ({ ...r, logs: arr(r.logs) }),
+    );
+  },
 
   // ---- 知识库（两层 RAG）----
   knowledgeDocs: (q: { scope?: string; task?: string } = {}) => {

@@ -1734,3 +1734,53 @@ export interface KnowledgeRetrievalLog {
   hits: number;
   created_at: string;
 }
+
+// ---- 多用户权限（RBAC）----
+// 权限是扁平目录 module:action；角色带资源 scope（all / assigned / own）。
+// 前端只用它做"显示/禁用"，真正的强制在后端 requireAuth 中间件里。
+
+export type RBACScope = "all" | "assigned" | "own";
+
+export interface RBACUser {
+  id: string;
+  username: string;
+  display_name: string;
+  enabled: boolean;
+  is_builtin: boolean;
+  roles: string[];
+}
+
+export interface RBACRole {
+  id: string;
+  name: string;
+  description: string;
+  scope: RBACScope;
+  is_system: boolean;
+  permissions: string[];
+}
+
+export interface RBACPermission {
+  key: string;
+  description: string;
+  group: string;
+}
+
+export interface RBACMe {
+  user: RBACUser;
+  roles: RBACRole[];
+  permissions: string[];
+  scope: RBACScope;
+  is_admin: boolean;
+}
+
+export interface AuditLog {
+  id: number;
+  created_at: string;
+  actor: string;
+  category: string;
+  action: string;
+  result: string;
+  ip: string;
+  message: string;
+  detail?: Record<string, unknown>;
+}

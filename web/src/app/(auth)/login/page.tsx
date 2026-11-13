@@ -17,6 +17,12 @@ import { auth } from "@/lib/auth";
 
 export default function LoginPage() {
   const router = useRouter();
+  // 多用户后用户名可编辑：默认取上次成功登录的名字（同一台机器通常还是同一个人），
+  // 首次访问用 admin —— 内置管理员一定存在。
+  const [username, setUsername] = useState(() => {
+    if (typeof window === "undefined") return "admin";
+    return window.localStorage.getItem("foxker.last_username") || "admin";
+  });
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -69,7 +75,9 @@ export default function LoginPage() {
     setLoading(true);
     setError("");
     try {
-      const { token } = await api.login("Foxker", password);
+      const name = username.trim() || "admin";
+      const { token } = await api.login(name, password);
+      window.localStorage.setItem("foxker.last_username", name);
       auth.setToken(token);
       window.location.replace("/function/tasks");
     } catch {
@@ -108,7 +116,13 @@ export default function LoginPage() {
           <form onSubmit={handleSubmit} className="flex flex-col gap-4">
             <div className="space-y-1.5">
               <Label htmlFor="username">用户名</Label>
-              <Input id="username" value="Foxker" readOnly className="bg-muted text-muted-foreground" />
+              <Input
+                id="username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="admin"
+                autoComplete="username"
+              />
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="password">密码</Label>

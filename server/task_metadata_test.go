@@ -24,10 +24,7 @@ func TestTaskMetadataPatchReturnsRenameAndPin(t *testing.T) {
 	taskID, _ := strconv.ParseInt(task.ID, 10, 64)
 	defer func() { _ = m.pg.DeleteTask(taskID) }()
 	s := newTestServer(t, m, t.TempDir())
-	token, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatal(err)
-	}
+	token := testAdminToken(t, s)
 
 	body, _ := json.Marshal(map[string]any{"name": "  renamed task  ", "pinned": true})
 	req := httptest.NewRequest(http.MethodPatch, "/api/tasks/"+task.ID, bytes.NewReader(body))
@@ -79,10 +76,7 @@ func TestConversationBatchDeleteReportsMissing(t *testing.T) {
 		_ = m.pg.DeleteConversation(first.ID)
 		_ = m.pg.DeleteConversation(second.ID)
 	}()
-	token, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatal(err)
-	}
+	token := testAdminToken(t, s)
 	missing := int64(1<<62 - 1)
 	body, _ := json.Marshal(map[string]any{"ids": []int64{first.ID, missing, second.ID}})
 	req := httptest.NewRequest(http.MethodPost, "/api/conversations/delete/batch", bytes.NewReader(body))

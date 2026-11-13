@@ -25,10 +25,7 @@ func TestCoreTaskLifecyclePG(t *testing.T) {
 	td := t.TempDir()
 	s := newTestServer(t, m, td)
 	h := s.Handler()
-	tok, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatalf("sign jwt: %v", err)
-	}
+	tok := testAdminToken(t, s)
 
 	do := func(method, path string, body any) (int, map[string]any) {
 		var r *http.Request

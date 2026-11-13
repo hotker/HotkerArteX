@@ -23,10 +23,7 @@ func TestInterceptFilterHTTP(t *testing.T) {
 	m := &Manager{pg: d, interceptor: intercept.New(d)}
 	s := &Server{m: m, jwtKey: []byte("approval-filter-test-key")}
 	h := s.Handler()
-	token, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatal(err)
-	}
+	token := testAdminToken(t, s)
 	scope := "approval-http-filter"
 	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_pending WHERE task_id IN ($1,$2)`, scope, scope+"-other") })
 	_, baseline, err := d.ListAllInterceptsPage(1, 20, db.InterceptApprovalFilter{Status: "denied", DecisionSource: "model"})

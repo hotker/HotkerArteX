@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Autumn-27/artex/db"
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -92,12 +93,19 @@ func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
 // server signs new tokens with the current generation via signJWTGen.
 func signJWT(key []byte) (string, error) { return signJWTGen(key, 0) }
 
-// authClaims is the JWT payload. Gen carries the token generation (see
-// auth.token_gen); it is omitted for gen==0 so fresh-install tokens look
-// identical to the legacy (pre-generation) ones.
+// authClaims is the JWT payload.
+//
+//   - Gen：全局令牌世代（见 auth.token_gen）。gen==0 省略，让全新安装的 token 与
+//     引入世代之前的旧 token 完全同形。
+//   - Uid：用户 id（rbac_users.id）。多用户后"令牌属于谁"必须写进签名，否则
+//     sub 里一个共享用户名无法区分人。
+//   - Ver：该用户自己的 token_version。改密/停用/管理员强制下线时自增，
+//     携带旧版本号的 token 立即失效 —— 这是"只踢某个人"的能力。
 type authClaims struct {
 	jwt.RegisteredClaims
 	Gen string `json:"gen,omitempty"`
+	Uid string `json:"uid,omitempty"`
+	Ver int    `json:"ver,omitempty"`
 }
 
 // signJWTGen issues a 7-day HS256 token stamped with gen (the current token
@@ -125,17 +133,52 @@ func validLoginUsername(u string) bool {
 }
 
 func signJWTGen(key []byte, gen int64) (string, error) {
+	return signJWTFor(key, gen, "", 0)
+}
+
+// signJWTFor 签发一个绑定了具体用户与版本号的 token。
+func signJWTFor(key []byte, gen int64, uid string, ver int) (string, error) {
+	subject := "Foxker"
+	if uid != "" {
+		subject = uid
+	}
 	claims := authClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   "Foxker",
+			Subject:   subject,
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(jwtTTL)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
+		Uid: uid,
+		Ver: ver,
 	}
 	if gen > 0 {
 		claims.Gen = strconv.FormatInt(gen, 10)
 	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(key)
+}
+
+// parseJWT 校验签名与过期，返回 claims（无效时 error）。
+func parseJWT(tokenStr string, key []byte) (*authClaims, error) {
+	var claims authClaims
+	_, err := jwt.ParseWithClaims(tokenStr, &claims, func(t *jwt.Token) (any, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method")
+		}
+		return key, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &claims, nil
+}
+
+// tokenGenOf 从 claims 里取全局世代（缺失 = 0）。
+func tokenGenOf(c *authClaims) int64 {
+	if c == nil || c.Gen == "" {
+		return 0
+	}
+	n, _ := strconv.ParseInt(c.Gen, 10, 64)
+	return n
 }
 
 // verifyJWT returns true when tokenStr is a valid, non-expired HS256 token whose
@@ -219,8 +262,12 @@ func extractToken(r *http.Request) string {
 	return ""
 }
 
-// requireAuth wraps h with JWT validation.
-// /api/auth/* and /api/health are exempt.
+// requireAuth wraps h with JWT validation + RBAC resolution + enforcement.
+// /api/auth/* and /api/health are exempt from *authentication*.
+//
+// 解析画像（rbac_users / 角色 / 权限）就放在这里而不是各 handler 里：
+// 一是每个请求本来就要过这一层，二是"忘了加权限检查"这类漏洞只能靠统一入口堵住。
+// 画像不缓存：权限一改立刻生效，缓存的失效逻辑比一次索引查询更容易出错。
 func (s *Server) requireAuth(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
@@ -233,12 +280,52 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			writeErr(w, 401, "未授权")
 			return
 		}
-		if !verifyJWT(tok, s.jwtKey, s.tokenGen.Load()) {
+		claims, err := parseJWT(tok, s.jwtKey)
+		if err != nil {
 			writeErr(w, 401, "token 无效或已过期")
 			return
 		}
+		if tokenGenOf(claims) != s.tokenGen.Load() {
+			writeErr(w, 401, "token 无效或已过期")
+			return
+		}
+		if acc := s.resolveAccess(claims); acc != nil {
+			if acc.User.TokenVersion != claims.Ver {
+				writeErr(w, 401, "登录状态已失效，请重新登录")
+				return
+			}
+			r = withAccess(r, acc)
+			if !s.enforceRBAC(w, r, acc) {
+				return
+			}
+		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// resolveAccess 从 claims 解析授权画像。
+//
+// 兼容两类 token：
+//   - 带 uid 的（多用户之后签发）：按 id 取用户；
+//   - 无 uid 的（升级前签发、尚未过期）：按内置 admin 处理 —— 那时候平台只有
+//     一个管理员，把它当作 admin 既符合历史语义，也不会在升级瞬间把所有在线会话踢掉。
+//
+// 解析失败（PG 暂时不可用）返回 nil：鉴权已通过，交给 handler 自己报数据源错误，
+// 不要在这里把用户判成"无权限"，那会变成一次假的 403。
+func (s *Server) resolveAccess(claims *authClaims) *db.RBACAccess {
+	if s.m == nil || s.m.pg == nil || claims == nil {
+		return nil
+	}
+	uid := claims.Uid
+	if uid == "" {
+		uid = "admin" // 升级前的单用户 token
+	}
+	acc, err := s.m.pg.ResolveRBACAccess(uid)
+	if err != nil {
+		log.Printf("[rbac] 解析授权画像失败 uid=%s: %v", uid, err)
+		return nil
+	}
+	return acc
 }
 
 // GET /api/auth/status — reports whether the admin password has been initialised.
@@ -250,12 +337,15 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	hash, _, err := pg.GetSetting(authPassKey)
+	// 初始化与否以 rbac_users 为准（多用户后它是唯一真值）。旧单用户版本的
+	// auth.password_hash 只作为迁移来源，不再决定"是否已初始化"。
+	admin, err := pg.GetRBACUserByID("admin")
 	if err != nil {
 		writeErr(w, 503, errDataSourceUnavailable)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"initialized": hash != ""})
+	initialized := admin != nil && admin.PasswordHash != "" && admin.PasswordHash != "!"
+	writeJSON(w, 200, map[string]any{"initialized": initialized})
 }
 
 // POST /api/auth/init — sets the password for the first time; rejected if already set.
@@ -270,12 +360,15 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	if initThrottled(w, r) {
 		return
 	}
-	existing, _, err := pg.GetSetting(authPassKey)
+	// "已初始化"的判据是【有一个能用的密码】，不是"存在用户行"：
+	// bootstrap 会先建内置 admin（哈希为占位 "!"），只存在用户行但不能登录，
+	// 若拿它当判据，全新安装会永远卡在"密码已设置"而进不去。
+	admin, err := pg.GetRBACUserByID("admin")
 	if err != nil {
 		writeErr(w, 503, errDataSourceUnavailable)
 		return
 	}
-	if existing != "" {
+	if admin != nil && admin.PasswordHash != "" && admin.PasswordHash != "!" {
 		writeErr(w, 403, "密码已设置")
 		return
 	}
@@ -296,25 +389,61 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "密码加密失败")
 		return
 	}
-	// 用 INSERT ... ON CONFLICT DO NOTHING 而不是 upsert：上面那次 GetSetting 只是
-	// 快速失败路径，真正"仅首次可设"的保证落在主键约束上。bcrypt 要跑几十毫秒，
-	// 这期间别的请求完全可能先把密码设好，而读检查本身也可能因故障而失效。
-	inserted, err := pg.InsertSettingIfAbsent(authPassKey, string(hash))
+	// bootstrap 已经把内置 admin 建好（密码哈希是占位 "!"，任何密码都验不过）。
+	// 这里写入真正的哈希。并发下用条件更新避免覆盖掉另一个请求刚设的密码：
+	// 只有当前哈希仍是占位值时才写。
+	res, err := pg.Exec(`UPDATE rbac_users SET password_hash=$1, token_version = token_version + 1, updated_at=now()
+		WHERE id='admin' AND COALESCE(password_hash,'') IN ('','!')`, string(hash))
 	if err != nil {
 		writeErr(w, 500, "保存失败: "+err.Error())
 		return
 	}
-	if !inserted {
+	if n, _ := res.RowsAffected(); n == 0 {
 		writeErr(w, 403, "密码已设置")
 		return
 	}
-	tok, err := signJWTGen(s.jwtKey, s.tokenGen.Load())
+	initDone(r)
+	adminUser, err := pg.GetRBACUserByID("admin")
+	if err != nil || adminUser == nil {
+		writeErr(w, 500, "读取管理员失败")
+		return
+	}
+	tok, err := signJWTFor(s.jwtKey, s.tokenGen.Load(), adminUser.ID, adminUser.TokenVersion)
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
 		return
 	}
-	initDone(r)
 	writeJSON(w, 200, map[string]any{"token": tok})
+}
+
+// resolveLoginUser 把登录框里的用户名解析成一个平台用户。
+//
+// 优先级：先按 rbac_users 精确/忽略大小写匹配；再退回历史用户名（Foxker / ARTEX），
+// 它们指向内置 admin —— 改名与多用户化都不该让现网的脚本与书签失效。
+func (s *Server) resolveLoginUser(pg *db.DB, username string) (*db.RBACUser, error) {
+	name := strings.TrimSpace(username)
+	if name == "" {
+		return nil, nil
+	}
+	u, err := pg.GetRBACUserByUsername(name)
+	if err != nil || u != nil {
+		return u, err
+	}
+	if validLoginUsername(name) {
+		return pg.GetRBACUserByID("admin")
+	}
+	return nil, nil
+}
+
+// userDTO 是回给前端的用户视图（不含哈希）。
+func userDTO(u *db.RBACUser) map[string]any {
+	if u == nil {
+		return nil
+	}
+	return map[string]any{
+		"id": u.ID, "username": u.Username, "display_name": u.DisplayName,
+		"enabled": u.Enabled, "is_builtin": u.IsBuiltin,
+	}
 }
 
 // POST /api/auth/change-password — changes the admin password. Requires a valid
@@ -328,7 +457,8 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	if !verifyJWT(extractToken(r), s.jwtKey, s.tokenGen.Load()) {
+	acc := CurrentAccess(r)
+	if acc == nil {
 		writeErr(w, 401, "未授权")
 		return
 	}
@@ -348,25 +478,17 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, msg)
 		return
 	}
-	hash, ok, err := pg.GetSetting(authPassKey)
-	if err != nil {
-		writeErr(w, 503, errDataSourceUnavailable)
-		return
-	}
-	if !ok || hash == "" {
+	if strings.TrimSpace(acc.User.PasswordHash) == "" || acc.User.PasswordHash == "!" {
 		writeErr(w, 403, "密码未初始化，请先设置密码")
 		return
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.OldPassword)); err != nil {
+	if err := bcrypt.CompareHashAndPassword([]byte(acc.User.PasswordHash), []byte(req.OldPassword)); err != nil {
 		writeErr(w, 401, "当前密码错误")
 		return
 	}
-	newHash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
-	if err != nil {
-		writeErr(w, 500, "密码加密失败")
-		return
-	}
-	if err := pg.SetSetting(authPassKey, string(newHash)); err != nil {
+	// 改自己的密码 → 自增自己的 token_version（其它设备上的旧 token 立即失效），
+	// 同时保留全局世代自增（兼容升级前签发的无 uid token，让它们也一起失效）。
+	if err := pg.SetRBACUserPassword(acc.User.ID, req.NewPassword); err != nil {
 		writeErr(w, 500, "保存失败: "+err.Error())
 		return
 	}
@@ -384,11 +506,17 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	// Hand the caller a token stamped with the new generation so its own session
 	// stays logged in without re-login.
-	tok, err := signJWTGen(s.jwtKey, newGen)
+	fresh, err := pg.GetRBACUserByID(acc.User.ID)
+	if err != nil || fresh == nil {
+		writeErr(w, 500, "读取用户失败")
+		return
+	}
+	tok, err := signJWTFor(s.jwtKey, newGen, fresh.ID, fresh.TokenVersion)
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
 		return
 	}
+	s.auditFrom(r, acc.User.Username, "auth", "change_password", "success", "修改了自己的密码", nil)
 	writeJSON(w, 200, map[string]any{"ok": true, "token": tok})
 }
 
@@ -409,30 +537,38 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 	if loginThrottled(w, r, req.Username) {
 		return
 	}
-	if !validLoginUsername(req.Username) {
-		loginNoteFail(r, req.Username)
-		writeErr(w, 401, "用户名或密码错误")
-		return
-	}
-	hash, ok, err := pg.GetSetting(authPassKey)
+	// 用户名解析：多用户后按 rbac_users 查；旧用户名（Foxker / ARTEX）继续指向内置 admin，
+	// 避免升级后现网脚本与书签全部登不进来。
+	user, err := s.resolveLoginUser(pg, req.Username)
 	if err != nil {
 		writeErr(w, 503, errDataSourceUnavailable)
 		return
 	}
-	if !ok || hash == "" {
+	if user == nil {
+		loginNoteFail(r, req.Username)
+		writeErr(w, 401, "用户名或密码错误")
+		return
+	}
+	if !user.Enabled {
+		loginNoteFail(r, req.Username)
+		writeErr(w, 403, "账号已停用")
+		return
+	}
+	if strings.TrimSpace(user.PasswordHash) == "" || user.PasswordHash == "!" {
 		writeErr(w, 403, "密码未初始化，请先设置密码")
 		return
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
 		loginNoteFail(r, req.Username)
 		writeErr(w, 401, "用户名或密码错误")
 		return
 	}
 	loginNoteSuccess(r, req.Username)
-	tok, err := signJWTGen(s.jwtKey, s.tokenGen.Load())
+	tok, err := signJWTFor(s.jwtKey, s.tokenGen.Load(), user.ID, user.TokenVersion)
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"token": tok})
+	s.auditFrom(r, user.Username, "auth", "login", "success", "登录成功", nil)
+	writeJSON(w, 200, map[string]any{"token": tok, "user": userDTO(user)})
 }

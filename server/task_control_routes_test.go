@@ -17,10 +17,7 @@ func TestWorkerControlRoutes(t *testing.T) {
 	td := t.TempDir()
 	s := newTestServer(t, m, td)
 	h := s.Handler()
-	token, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatalf("sign jwt: %v", err)
-	}
+	token := testAdminToken(t, s)
 
 	request := func(path string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"action":"pause"}`))

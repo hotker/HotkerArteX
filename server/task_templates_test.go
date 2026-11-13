@@ -24,10 +24,7 @@ func TestTaskTemplateHTTPCRUD(t *testing.T) {
 	t.Cleanup(func() { m.Close() })
 	s := newTestServer(t, m, t.TempDir())
 	h := s.Handler()
-	token, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatal(err)
-	}
+	token := testAdminToken(t, s)
 
 	do := func(method, path string, body any) (int, map[string]any) {
 		var data []byte
@@ -101,10 +98,7 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = m.pg.DeleteConversation(conversation.ID) })
-	token, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatal(err)
-	}
+	token := testAdminToken(t, s)
 
 	body, _ := json.Marshal(map[string]any{"title": "  pinned title  ", "pinned": true})
 	req := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/conversations/%d", conversation.ID), bytes.NewReader(body))

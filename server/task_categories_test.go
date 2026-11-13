@@ -22,10 +22,7 @@ func TestTaskCategoryBatchRoute(t *testing.T) {
 	td := t.TempDir()
 	s := newTestServer(t, m, td)
 	h := s.Handler()
-	token, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatalf("sign jwt: %v", err)
-	}
+	token := testAdminToken(t, s)
 
 	post := func(body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/api/tasks/category/batch", strings.NewReader(body))

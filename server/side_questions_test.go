@@ -147,6 +147,10 @@ func newSideHTTPFixture(t *testing.T) *sideHTTPFixture {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, jwtKey: []byte("btw-test-signing-key-only"), chatBusy: map[string]bool{}}
 	s.initSideQuestions()
+	// 多用户权限：requireAuth 会解析授权画像并校验 token_version。
+	// 这里先播种 RBAC，再签发一个绑定内置 admin 的令牌 —— 否则画像为 nil，
+	// 拿不到 token_version，中间件会把请求判成"登录状态已失效"。
+	s.bootstrapRBAC()
 	p := &sideHTTPProvider{started: make(chan llm.CompletionRequest, 16), release: make(chan struct{})}
 	cfg := agent.Config{Format: llm.FormatOpenAI, BaseURL: "http://fixture.invalid", Model: "fixture", Stream: true}
 	s.cfgMu.Lock()
@@ -154,7 +158,11 @@ func newSideHTTPFixture(t *testing.T) *sideHTTPFixture {
 	s.llmOn = true
 	s.llmDirect = bindSideProvider(p, cfg, 0, "fixture")
 	s.cfgMu.Unlock()
-	token, err := signJWT(s.jwtKey)
+	admin, err := s.m.pg.GetRBACUserByID("admin")
+	if err != nil || admin == nil {
+		t.Fatalf("resolve admin for token: %v", err)
+	}
+	token, err := signJWTFor(s.jwtKey, 0, admin.ID, admin.TokenVersion)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1129,6 +1129,75 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS reproduction    JSONB;
 -- =====================================================================
 -- 组织级报告设置：单行表（id 恒为 true），存出具方/客户/密级/默认语言/署名人员/版本。
 
+
+-- =====================================================================
+-- U. 多用户权限（RBAC）：用户 / 角色 / 权限 / 授权
+-- =====================================================================
+-- 设计目标只有一条：**谁能对哪个资源做什么**必须可查、可改、可审计。
+-- 角色带资源级 scope（all 全部 / assigned 被授权的任务 / own 自己创建的），
+-- 权限是 module:action 形式的扁平目录（见 db/rbac.go 的 RBACPermissions）。
+-- 系统角色（admin/operator/auditor/viewer）的授权由 bootstrap 确定性重建，
+-- 用户在页面上改不动它们；自定义角色可以任意勾选权限。
+CREATE TABLE IF NOT EXISTS rbac_users (
+    id            TEXT PRIMARY KEY,
+    username      TEXT NOT NULL UNIQUE,
+    display_name  TEXT NOT NULL DEFAULT '',
+    password_hash TEXT NOT NULL,
+    enabled       BOOLEAN NOT NULL DEFAULT true,
+    is_builtin    BOOLEAN NOT NULL DEFAULT false,
+    -- 改密 / 停用 / 管理员强制下线时自增；JWT 里的 ver 落后即失效。
+    -- 与全局 auth.token_gen 的区别：那个是"所有人下线"，这个是"某一个人下线"。
+    token_version INT NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS rbac_roles (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    scope       TEXT NOT NULL DEFAULT 'assigned',   -- all | assigned | own
+    is_system   BOOLEAN NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS rbac_permissions (
+    key         TEXT PRIMARY KEY,
+    description TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS rbac_role_permissions (
+    role_id        TEXT NOT NULL REFERENCES rbac_roles(id) ON DELETE CASCADE,
+    permission_key TEXT NOT NULL,
+    PRIMARY KEY (role_id, permission_key)
+);
+
+CREATE TABLE IF NOT EXISTS rbac_user_roles (
+    user_id TEXT NOT NULL REFERENCES rbac_users(id) ON DELETE CASCADE,
+    role_id TEXT NOT NULL REFERENCES rbac_roles(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, role_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rbac_user_roles_user ON rbac_user_roles(user_id);
+CREATE INDEX IF NOT EXISTS idx_rbac_user_roles_role ON rbac_user_roles(role_id);
+
+-- 审计日志：谁（actor）在什么时候、对什么、做了什么、结果如何。
+-- 与 server_logs 的分工：server_logs 是"程序说了什么"（排障），这张表是"人动了什么"（合规）。
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id         BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    actor      TEXT NOT NULL DEFAULT '',
+    category   TEXT NOT NULL DEFAULT '',
+    action     TEXT NOT NULL DEFAULT '',
+    result     TEXT NOT NULL DEFAULT 'success',
+    ip         TEXT NOT NULL DEFAULT '',
+    message    TEXT NOT NULL DEFAULT '',
+    detail     JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_time ON audit_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_actor ON audit_logs(actor, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_category ON audit_logs(category, created_at DESC);
+
 -- =====================================================================
 -- K. 知识库（两层 RAG：全局库 + 任务库）+ Embedding 语义检索
 -- =====================================================================

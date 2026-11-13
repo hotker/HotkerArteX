@@ -54,10 +54,7 @@ func TestInheritedActivityDetailAndRelationDeletion(t *testing.T) {
 	}
 
 	s := newTestServer(t, m, t.TempDir())
-	token, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatal(err)
-	}
+	token := testAdminToken(t, s)
 	fetchDetail := func(stepID int64) string {
 		req := httptest.NewRequest(http.MethodGet,
 			fmt.Sprintf("/api/exploration/activity/%d?task=%s", stepID, current.ID), nil)
