@@ -497,6 +497,7 @@ func (s *Server) seedOrchestrationTools() {
 	}
 	s.refreshBuiltinToolSchemas()
 	s.seedAutoDefaultBindings()
+	s.seedHTTPRequestBinding()
 	s.seedPlannerDefaultBindings()
 	s.seedPlannerListAssetsBinding()
 	s.seedCompanyScopeRebind()
@@ -909,6 +910,19 @@ func (s *Server) seedWorkerReadbackRebind() {
 // ONCE (guarded by a settings flag), so existing DBs whose tool rows were seeded
 // before Auto existed still give Auto its default toolset — without re-adding it
 // after a user deliberately unbinds.
+// seedHTTPRequestBinding 把 http_request 默认绑给所有执行/对话 agent。幂等、每次启动
+// 补一遍（不走"一次性旗标"）：旗标一旦在写反参数的版本上被置位就再也不会补，而这条
+// 补丁本身幂等且零风险 —— 用户手工解绑后下次启动会补回（内置工具默认可用，可在 UI 再解绑）。
+func (s *Server) seedHTTPRequestBinding() {
+	for _, agentKey := range []string{"worker", "planner", "mainagent", "auto", "pentest"} {
+		if err := s.m.pg.AddAgentToToolBinding(agentKey, []string{"http_request"}); err != nil {
+			log.Printf("[tools] http_request 默认绑定失败(%s): %v", agentKey, err)
+			return
+		}
+	}
+	log.Printf("[tools] http_request 已默认绑定到 worker/planner/mainagent/auto/pentest")
+}
+
 func (s *Server) seedAutoDefaultBindings() {
 	const flag = "auto_default_bindings_v3" // v3: 替换旧资产工具名，加入 insert_assets/add_company_scope
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {

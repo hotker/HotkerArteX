@@ -7,6 +7,7 @@ import (
 	"iter"
 	"log"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -32,8 +33,33 @@ type Member struct {
 	// WindowTokens is the profile's context window in tokens. A member whose
 	// window can't hold the request is skipped rather than made to fail on it.
 	WindowTokens int
-	Prov         llm.Provider
+	// Quality is the profile's capability tier (0..3, 0 = unset): 3 = frontier,
+	// 2 = strong, 1 = workhorse, 0 = light/cheap. Used ONLY to order the chain for
+	// a given task mode — never to exclude anyone. A cheap member still serves when
+	// the strong ones are cooling off; it just isn't first.
+	Quality int
+	// Economy marks an explicitly cost-saving tier (the UI's 省钱档 flag). Economy
+	// members are tried last in deep mode and first in economy mode.
+	Economy bool
+	Prov    llm.Provider
 }
+
+// Mode is the caller's routing intent for one task/agent, expressed as a default
+// order over the SAME chain rather than a separate chain — so failover across all
+// profiles keeps working in every mode.
+type Mode string
+
+const (
+	// ModeDeep is for exploration: the planner inventing intents, a worker
+	// carrying an exploit chain, the pentest agent reasoning across many steps.
+	// Order: quality DESC (strong first), economy last.
+	ModeDeep Mode = "deep"
+	// ModeEconomy is for bulk/cheap work: enrichment, one-off summarisation,
+	// mechanical classification. Order: economy first, then cheapest.
+	ModeEconomy Mode = "economy"
+	// ModeBalanced is the default: the caller's ordering, untouched.
+	ModeBalanced Mode = ""
+)
 
 // RankActive is the Rank the caller gives the chain head (the active profile, or
 // an explicitly bound one) so it always outranks any configured priority.
@@ -49,6 +75,7 @@ type Pool struct {
 	members []*Member // in chain order (active first, then priority DESC)
 	health  *Registry
 	rr      atomic.Uint64 // rotates the starting point within an equal-priority group
+	mode    Mode          // 路由意图：只决定顺序，不决定"谁能用"（见 Mode）
 }
 
 // New builds a Pool over members (already in chain order). Returns nil when the
@@ -62,6 +89,27 @@ func New(members []*Member, health *Registry) *Pool {
 		health = NewRegistry(nil, nil)
 	}
 	return &Pool{members: members, health: health}
+}
+
+// WithMode returns a pool with the same members/health that orders the chain for
+// the given intent. Members and health are shared (health is process-wide), so a
+// mode switch costs nothing and immediately benefits from what other agents learned.
+func (p *Pool) WithMode(m Mode) *Pool {
+	if p == nil {
+		return nil
+	}
+	// 显式构造而不是 `cp := *p`：Pool 内含 atomic.Uint64，整体复制会触发 vet 的
+	// copylocks 告警（并发下也是隐患）。成员与健康登记表本就共享，只有 rr 是每个
+	// Pool 自己的轮转计数器，给新模式一份新的即可。
+	return &Pool{members: p.members, health: p.health, mode: m}
+}
+
+// PoolMode returns the pool's routing mode (empty for a bare/balanced pool).
+func (p *Pool) PoolMode() Mode {
+	if p == nil {
+		return ModeBalanced
+	}
+	return p.mode
 }
 
 // Members returns the chain in order (read-only).
@@ -182,7 +230,44 @@ func (p *Pool) order(req llm.CompletionRequest) []*Member {
 	if len(open) == 0 {
 		return p.members[:1] // last resort: probe the head rather than stall
 	}
+	// 模式排序只在「健康且窗口够用」的集合内生效：冷却中的成员永远不排到前面，
+	// 强模型熔断时廉价成员立刻顶上 —— 模式决定【顺序】，不决定【能不能用】。
+	open = orderByMode(open, p.mode)
 	return rotateGroups(open, p.rr.Add(1)-1)
+}
+
+// orderByMode reorders the usable members for the pool's mode. It is a STABLE sort,
+// so within a tier the caller's original chain order (active-first / priority DESC)
+// still decides — the mode only lifts/lowers whole tiers.
+//
+//	Deep:    quality DESC (unset quality counts as 2 = strong), economy last.
+//	Economy: economy-marked first, then quality ASC (cheapest first).
+//	Balanced: unchanged (zero risk).
+func orderByMode(in []*Member, m Mode) []*Member {
+	if m == ModeBalanced || len(in) < 2 {
+		return in
+	}
+	out := append([]*Member{}, in...)
+	tier := func(x *Member) int {
+		q := x.Quality
+		if q <= 0 {
+			q = 2 // unset ⇒ assume the strong tier rather than punishing config gaps
+		}
+		if x.Economy {
+			q -= 3 // economy always sits at the bottom of deep mode
+		}
+		return q
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if m == ModeEconomy {
+			if out[i].Economy != out[j].Economy {
+				return out[i].Economy
+			}
+			return tier(out[i]) < tier(out[j])
+		}
+		return tier(out[i]) > tier(out[j])
+	})
+	return out
 }
 
 // rotateGroups rotates each run of equal-ranked members by n, so profiles sharing

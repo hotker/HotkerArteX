@@ -225,11 +225,21 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 	// Default binding = worker (preserves prior behavior). Their runtime availability
 	// is still gated by the global capture switch (hostTools() returns them only when
 	// capture is on), so an off-capture binding simply never surfaces the tool.
-	trafficAgents, _ := json.Marshal([]string{"worker"})
+	// traffic_curl 的价值在【写报告与复现】的 agent 手里，所以默认多绑 planner/mainagent：
+	// 它们不亲自打目标，但需要把流量翻成可执行命令贴进报告。
+	trafficAgents, _ := json.Marshal([]string{"worker", "planner", "mainagent"})
 	for _, t := range traffic.SeedToolMetas() {
 		schema, _ := json.Marshal(t.InputSchema())
 		if err := pg.SeedTool(t.Name(), t.Description(), schema, trafficAgents); err != nil {
 			log.Printf("[tools] seed %s 失败: %v", t.Name(), err)
+		}
+	}
+	// 老库里 traffic_* 行是「worker only」时留下的；traffic_curl 需要给 planner/mainagent
+	// 才能用于报告复现。幂等补绑（不覆盖用户解绑之外的任何设置）。
+	for _, agentKey := range []string{"worker", "planner", "mainagent"} {
+		if err := pg.AddAgentToToolBinding(agentKey, []string{"traffic_curl"}); err != nil {
+			log.Printf("[tools] traffic_curl 绑定失败(%s): %v", agentKey, err)
+			break
 		}
 	}
 	// bashInteractiveShellNote is appended to Bash's description ONLY for agents whose

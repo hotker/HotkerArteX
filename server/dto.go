@@ -603,6 +603,10 @@ type LLMProfileDTO struct {
 	// pool_exclude=true 则不作为故障转移目标，但仍可被 agent/任务显式绑定。
 	Priority    int  `json:"priority"`
 	PoolExclude bool `json:"pool_exclude"`
+	// 能力档位(0 未设/1 轻量/2 主力/3 前沿)与省钱标记：只决定轮询链内的顺序，
+	// 不排除任何配置（深度任务强模型优先、批量任务廉价优先）。
+	Quality int  `json:"quality"`
+	Economy bool `json:"economy"`
 	// 收发模式：true=流式(SSE) | false=非流式。没有 omitempty —— false 必须出现在
 	// 响应里，否则前端读不到「非流式」，开关会回落成默认的流式。
 	Streaming bool `json:"streaming"`
@@ -636,6 +640,8 @@ func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 		IsDefault:        p.IsDefault,
 		Priority:         p.Priority,
 		PoolExclude:      p.PoolExclude,
+		Quality:          p.Quality,
+		Economy:          p.Economy,
 		Streaming:        p.Streaming,
 		MaxTokens:        p.MaxTokens,
 		MaxTokensField:   p.MaxTokensField,

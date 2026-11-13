@@ -414,6 +414,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_llm_one_default ON llm_profiles(is_default)
 DROP TRIGGER IF EXISTS trg_llm_upd ON llm_profiles;
 CREATE TRIGGER trg_llm_upd BEFORE UPDATE ON llm_profiles
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+-- 能力档位与省钱标记（HotkerArteX）：quality=0(未设)/1(轻量)/2(主力)/3(前沿)，
+-- economy=true 表示显式标记的省钱档。二者只影响【同一个轮询链内的顺序】——
+-- 深度任务(规划/执行)强模型优先、批量任务(富化/摘要)廉价优先；从不排除任何配置，
+-- 强模型熔断时廉价成员照样顶上（见 llmpool.Mode）。
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS quality INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS economy BOOLEAN NOT NULL DEFAULT false;
 -- 轮询顺位/排除标记；补旧库。默认 0 / false = 全部配置都参与轮询。
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS priority     INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS pool_exclude BOOLEAN NOT NULL DEFAULT false;

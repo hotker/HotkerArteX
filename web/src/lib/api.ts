@@ -1121,6 +1121,8 @@ export const api = {
     reasoning_effort?: string; // ""(不发送)|"low"|"medium"|"high"|"xhigh"|"max"
     priority?: number; // 轮询顺位，越大越先用
     pool_exclude?: boolean; // true=不作为故障转移目标
+    quality?: number; // 能力档位 0=未设 1=轻量 2=主力 3=前沿（只改轮询链内顺序）
+    economy?: boolean; // 省钱档：深度任务排最后、批量任务优先
     streaming?: boolean; // true(默认)=流式 | false=非流式
     max_tokens?: number; // 单次回复输出上限；0=不发送，由服务端默认值决定
     max_tokens_field?: string; // ""=max_tokens(默认) | "max_completion_tokens"（仅 openai 格式）

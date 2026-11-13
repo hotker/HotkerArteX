@@ -11,6 +11,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
+	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -47,10 +48,56 @@ type Planner struct {
 	// dispatch it step-by-step over rounds instead of front-loading it in parallel.
 	todoMu sync.Mutex
 	todos  map[int64]*actool.TodoStore
+
+	// stall 逐任务统计推进停滞（facts/findings 跨轮不增），让 planner 的本轮态势带上
+	// 一个【代码算出来】的停滞告警，而不是靠模型自己感觉"在空转"。
+	stallMu sync.Mutex
+	stalls  map[int64]*stallTracker
+	// budget 若设置，报告该任务已消耗的 LLM 花费（host 侧回调，读 token 统计）。
+	// 放进 planner 态势后，"烧着预算没进展"在运行中就可见。
+	budget func(ctx context.Context, expID int64) (spentUSD float64, tokens int, known bool)
+}
+
+// SetBudget wires the token/$ reporter shown in the planner's situational block
+// (nil = no budget line). Pricing stays out of the agent layer.
+func (p *Planner) SetBudget(fn func(ctx context.Context, expID int64) (float64, int, bool)) {
+	p.budget = fn
+}
+
+// Model reports the model id this planner runs on (host-side cost estimation).
+func (p *Planner) Model() string { return p.model }
+
+// stallFor returns the task's stall tracker (created on first use).
+func (p *Planner) stallFor(expID int64) *stallTracker {
+	p.stallMu.Lock()
+	defer p.stallMu.Unlock()
+	st := p.stalls[expID]
+	if st == nil {
+		st = &stallTracker{}
+		p.stalls[expID] = st
+	}
+	return st
+}
+
+// budgetLine renders the spend snapshot for the situational block ("" when the
+// host wired no reporter or the figure is unknown).
+func (p *Planner) budgetLine(ctx context.Context, expID int64) string {
+	if p.budget == nil {
+		return ""
+	}
+	usd, tok, known := p.budget(ctx, expID)
+	if !known || tok <= 0 {
+		return ""
+	}
+	if usd <= 0 {
+		return fmt.Sprintf("\n\n【本任务 LLM 消耗（代码统计）：累计 %d tokens（价格未知，未折算金额）】", tok)
+	}
+	return fmt.Sprintf("\n\n【本任务 LLM 消耗（代码统计）：累计 %d tokens ≈ $%.4f】\n继续推进要对得起这份消耗：优先打「离目标最近、前置已满足」的方向，别把预算烧在已封锁路线的同义重试或大页面的重复抓取上。", tok, usd)
 }
 
 func NewPlanner(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int) *Planner {
-	return &Planner{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, todos: map[int64]*actool.TodoStore{}}
+	return &Planner{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns,
+		todos: map[int64]*actool.TodoStore{}, stalls: map[int64]*stallTracker{}}
 }
 
 func (p *Planner) SetCompactionWindowResolver(fn func() int) { p.windowFn = fn }
@@ -392,7 +439,11 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// 关键态势（刚完成的意图 + 预取的完整图）改放【本轮 user 输入】(见下方 input)，system
 	// 只留静态规划正文。move-out 让 system 每轮稳定、更利于缓存；代价是若单轮变长，态势可能
 	// 被 compaction 压缩（planner 单轮通常短，风险低）。situational 会拼进下方 input。
-	situational := renderTriggers(ts, triggers) + renderGraphOverview(tsx.graphOverviewData())
+	overview := tsx.graphOverviewData()
+	// 推进统计：代码统计"连续几轮没有任何新增"，比模型自评"好像卡住了"可靠。
+	idle := p.stallFor(ts.ID()).observe(overview)
+	situational := renderTriggers(ts, triggers) + renderGraphOverview(overview) +
+		stallAdvisory(idle) + p.budgetLine(ctx, ts.ID())
 	// 任务级 deadline / 终局模式(经 ctx 注入,见 taskclock.go)。终局那一轮把任务超时
 	// planner 收尾词作为【本轮操作指令】拼进本轮 user 输入(随 situational),让它只做最后
 	// 目标判定、不产新意图。
@@ -441,7 +492,11 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		ToolOutputDir:         cmdOutDir(taskDir),
 		MaxTurns:              p.maxTurns, // 0 = unlimited (configurable in agent management)
 		MaxDuration:           maxDur,     // 0=不限;有 deadline 时=距 deadline 剩余
-		Compaction:            compactionConfig(p.compactionWindow()),
+		// 渗透态压缩（agent/pentest_compaction.go）：阈值/micro-compact/skill 重注入与
+		// SDK 完全一致，只把摘要器换成"通用摘要 → 渗透态重写"。Compactor 与 Compaction
+		// 互斥，所以这里不再设 Compaction。
+		Compactor: pentestCompactorFor(compactionConfig(p.compactionWindow()),
+			compaction.ProviderSummarizer(p.prov, p.maxTokens(), p.nonStreaming()), p.prov, p.maxTokens(), p.nonStreaming()),
 		// 跨唤醒共享的规划待办：让串行链在多轮之间保留（session 是新的，store 不是）。
 		Todos: p.todoFor(ts.ID()),
 		// 命中【本轮】步数预算→ SDK 跑收尾:把本轮已想清楚的结论落地(该派的 add_intent、

@@ -103,7 +103,10 @@ type taskLLMSelection struct {
 	task      *Task
 	profileID int64
 	revision  int64
-	provider  llm.Provider
+	// role 是这次调用的角色（planner/worker/mainagent/enrich…），用来决定轮询链的
+	// 路由模式（deep/economy/balanced）。空 = balanced，行为与从前一致。
+	role     string
+	provider llm.Provider
 	// retry 是这次选中的配置解析出来的重试参数(profile 覆盖 → 全局策略 → 内置默认)。
 	// 同 provider 安全窗口重试按它走,所以换了 profile 就换一套重试节奏。
 	retry agent.RetryConfig
@@ -135,9 +138,9 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 	}
 	r.s.syncTaskLLMState(pt)
 	t, _ := r.s.m.Task(r.taskID)
-	sel := taskLLMSelection{task: t, revision: pt.LLMChainRevision}
+	sel := taskLLMSelection{task: t, revision: pt.LLMChainRevision, role: r.agentKey}
 	if prov, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
-		sel.provider, sel.retry = prov, cfg.Retry
+		sel.provider, sel.retry = poolWithRole(prov, r.agentKey), cfg.Retry
 		return sel, nil
 	}
 	if len(pt.LLMProfileIDs) > 0 {
@@ -149,14 +152,14 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 		if !ok {
 			return sel, fmt.Errorf("LLM profile #%d is missing or invalid", sel.profileID)
 		}
-		sel.provider, sel.retry = prov, cfg.Retry
+		sel.provider, sel.retry = poolWithRole(prov, r.agentKey), cfg.Retry
 		return sel, nil
 	}
 	prov, cfg, ok := r.s.globalProvider()
 	if !ok {
 		return sel, fmt.Errorf("task %s has no available fallback LLM provider", r.taskID)
 	}
-	sel.provider, sel.retry = prov, cfg.Retry
+	sel.provider, sel.retry = poolWithRole(prov, r.agentKey), cfg.Retry
 	return sel, nil
 }
 
@@ -514,7 +517,8 @@ func (s *Server) agentBindingProvider(agentKey string) (llm.Provider, agent.Conf
 	if !ok {
 		return nil, agent.Config{}, false
 	}
-	return s.poolForBinding(*id, prov, cfg), cfg, true
+	// 按角色套路由模式（deep / economy / balanced）：只改链内顺序，见 llmpool.Mode。
+	return poolWithRole(s.poolForBinding(*id, prov, cfg), agentKey), cfg, true
 }
 
 // globalProvider returns the process-wide provider (persisted active profile or
@@ -604,6 +608,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
+	pl.SetBudget(s.taskBudget) // planner 态势带"本任务已烧多少 tokens/多少钱"（agent/pricing.go）
 	pl.SetFindingRecorder(s.evidenceStore())
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)
 	pl.SetNonStreaming(plannerRuntime.nonStreaming)

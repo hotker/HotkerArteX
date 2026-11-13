@@ -324,6 +324,10 @@ function ProfileSheet({
   const [effort, setEffort] = React.useState(NONE);
   const [priority, setPriority] = React.useState("0"); // 轮询顺位;越大越先
   const [poolExclude, setPoolExclude] = React.useState(false);
+  // 能力档位(0 未设/1 轻量/2 主力/3 前沿)与省钱标记：只决定轮询链内的顺序，
+  // 深度任务(规划/执行)强模型优先、批量任务(富化/摘要)廉价优先，从不排除任何配置。
+  const [quality, setQuality] = React.useState("0");
+  const [economy, setEconomy] = React.useState(false);
   const [streaming, setStreaming] = React.useState(true); // true=流式(默认);false=非流式
   const [maxTokens, setMaxTokens] = React.useState("0"); // 单次回复输出上限;0=不发送
   const [maxTokensField, setMaxTokensField] = React.useState(NONE); // 上限用哪个字段名;NONE=max_tokens
@@ -351,6 +355,8 @@ function ProfileSheet({
     setEffort(fromStore(profile?.reasoning_effort));
     setPriority(String(profile?.priority ?? 0));
     setPoolExclude(profile?.pool_exclude ?? false);
+    setQuality(String(profile?.quality ?? 0));
+    setEconomy(profile?.economy ?? false);
     setStreaming(profile?.streaming ?? true);
     setMaxTokens(String(profile?.max_tokens ?? 0));
     setMaxTokensField(fromStore(profile?.max_tokens_field));
@@ -438,6 +444,8 @@ function ProfileSheet({
         reasoning_effort: toStore(effort),
         priority: Number(priority) || 0,
         pool_exclude: poolExclude,
+        quality: Number(quality) || 0,
+        economy,
         streaming,
         max_tokens: Math.max(0, Number(maxTokens) || 0),
         // 字段名开关只对 openai(Chat Completions) 有意义，其它格式一律回落到默认；
@@ -659,6 +667,37 @@ function ProfileSheet({
                 </p>
               </div>
               <Switch checked={poolExclude} onCheckedChange={setPoolExclude} aria-label="不参与轮询" />
+            </div>
+            <div className="flex items-center justify-between gap-4 border-t pt-3">
+              <div className="grid gap-0.5">
+                <Label htmlFor="p-quality" className="text-sm">
+                  能力档位
+                </Label>
+                <p className="text-muted-foreground text-xs">
+                  只影响同一轮询链内的顺序：深度探索任务（规划/执行）先试高档位，批量任务（漏洞富化/摘要）先试低档位。
+                  不会排除任何配置——高档位熔断时低档位照常顶上。
+                </p>
+              </div>
+              <select
+                id="p-quality"
+                className="h-9 w-36 shrink-0 rounded-md border bg-transparent px-2 text-sm"
+                value={quality}
+                onChange={(e) => setQuality(e.target.value)}
+              >
+                <option value="0">未设（按主力档）</option>
+                <option value="1">1 · 轻量</option>
+                <option value="2">2 · 主力</option>
+                <option value="3">3 · 前沿</option>
+              </select>
+            </div>
+            <div className="flex items-center justify-between gap-4 border-t pt-3">
+              <div className="grid gap-0.5">
+                <Label className="text-sm">省钱档</Label>
+                <p className="text-muted-foreground text-xs">
+                  显式标注为省钱档：深度任务排到最后、批量任务优先使用。适合只为压成本的备用配置。
+                </p>
+              </div>
+              <Switch checked={economy} onCheckedChange={setEconomy} aria-label="省钱档" />
             </div>
             <div className="flex items-center justify-between gap-4 border-t pt-3">
               <div className="grid gap-0.5">

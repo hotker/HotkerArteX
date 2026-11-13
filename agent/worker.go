@@ -13,6 +13,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
+	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
@@ -285,6 +286,18 @@ func ensureRunDir(base string, taskID, intentID int64) string {
 // cmdOutDir is the SDK large-tool-output spill dir under an agent's run dir.
 func cmdOutDir(dir string) string { return filepath.Join(dir, "cmd-output") }
 
+// workerHasTools 判断本次装配的工具集里是否包含某个工具（决定段 [B2] 是否注入）。
+func workerHasTools(tools []actool.CoreTool, names ...string) bool {
+	for _, t := range tools {
+		for _, n := range names {
+			if t.Name() == n {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
 	body := renderSystem("worker", workerDefaultTmpl, WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()})
 	// caCert is present only when the recording MITM is on, which is exactly when
@@ -395,7 +408,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
 	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
-	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
+	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir) +
+		workerEvidenceBlock(workerHasTools(tools, "traffic_search"), workerHasTools(tools, "http_request"))
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}
@@ -465,10 +479,12 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		// large tool output spills to cmd-output/ with a head + pointer (SDK tool.Capture);
 		// full output preserved on disk. 截断上限用 SDK 默认(30000 字符)。
 		ToolOutputDir: cmdOutDir(runDir),
-		Compaction:    compactionConfig(w.compactionWindow()), // long tool-heavy runs stay within the window
-		Todos:         actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
-		NonStreaming:  w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:     w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
+		// 渗透态压缩：窗口阈值不变，摘要器换成"通用 → 渗透态重写"（见 pentest_compaction.go）。
+		Compactor: pentestCompactorFor(compactionConfig(w.compactionWindow()),
+			compaction.ProviderSummarizer(w.prov, w.maxTokens(), w.nonStreaming()), w.prov, w.maxTokens(), w.nonStreaming()),
+		Todos:        actool.NewTodoStore(), // 会话级临时待办（TodoWrite），纯规划用，退出即丢
+		NonStreaming: w.nonStreaming(),      // 该 profile 选非流式时走 Provider.Complete
+		MaxTokens:    w.maxTokens(),         // 0 = 不发上限,由服务端默认值决定
 	}
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks

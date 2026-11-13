@@ -24,6 +24,7 @@ func (s *Server) platformTools() []actool.CoreTool {
 		s.toolCreateMCP(),
 		s.toolUpdateMCP(),
 		s.toolDeleteAssetsByHost(),
+		s.httpRequestTool(), // 结构化发包（默认走记录代理 → 证据链）
 	}
 }
 

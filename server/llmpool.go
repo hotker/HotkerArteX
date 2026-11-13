@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"log"
 	"time"
 
@@ -66,6 +67,7 @@ func (s *Server) poolMember(p *db.LLMProfile, rank int) *llmpool.Member {
 		ID: p.ID, Name: p.Name, Model: p.Model, Format: p.Format,
 		Priority: p.Priority, Active: p.IsDefault, Rank: rank,
 		WindowTokens: cfg.CompactionWindow(), Prov: prov,
+		Quality: p.Quality, Economy: p.Economy,
 	}
 }
 
@@ -100,10 +102,12 @@ func (s *Server) poolChain(headID int64, headProv llm.Provider, headCfg agent.Co
 			return nil
 		}
 	}
+	headQuality, headEconomy := head.Quality, head.Economy
 	members := []*llmpool.Member{{
 		ID: head.ID, Name: head.Name, Model: head.Model, Format: head.Format,
 		Priority: head.Priority, Active: head.IsDefault, Rank: llmpool.RankActive,
 		WindowTokens: headCfg.CompactionWindow(), Prov: headProv,
+		Quality: headQuality, Economy: headEconomy,
 	}}
 	for _, p := range profs {
 		if p.ID == headID {
@@ -150,6 +154,31 @@ func (s *Server) poolForBinding(id int64, prov llm.Provider, cfg agent.Config) l
 	}
 	if pool := s.poolChain(id, prov, cfg); pool != nil {
 		return pool
+	}
+	return prov
+}
+
+// roleMode 返回每个角色的默认路由意图（HotkerArteX）。mode 只改【同一条链内】的顺序，
+// 所有健康配置在任何模式下都仍可被选中 —— 这正是它敢按角色下判断的原因：
+//
+//	planner / worker / pentest / mainagent / auto → deep（探索与利用依赖推理质量）
+//	enrich（漏洞 AI 富化）/ summarize（压缩摘要）→ economy（量大、可容忍质量损失）
+//	chat → balanced（不替用户做取舍）
+func roleMode(role string) llmpool.Mode {
+	switch role {
+	case "planner", "worker", "pentest", "mainagent", "auto":
+		return llmpool.ModeDeep
+	case "enrich", "summarize":
+		return llmpool.ModeEconomy
+	default:
+		return llmpool.ModeBalanced
+	}
+}
+
+// poolWithRole 给已建好的 provider 套上角色模式；非 Pool（单配置）原样返回。
+func poolWithRole(prov llm.Provider, role string) llm.Provider {
+	if p, ok := prov.(*llmpool.Pool); ok && p != nil {
+		return p.WithMode(roleMode(role))
 	}
 	return prov
 }
@@ -236,4 +265,34 @@ func poolLess(a, b LLMPoolMemberStatus) bool {
 		return a.Active
 	}
 	return a.Priority > b.Priority
+}
+
+// 成本估算（HotkerArteX）：价格表住在 agent 包（agent.ModelPrice），这里薄薄地接一层
+// —— 价格只在 planner 态势里做"消耗感"提示，不进账务/报表。
+func priceForModel(model string) (agent.ModelPrice, bool) { return agent.PriceFor(model) }
+
+// taskBudget 把任务累计 token 用量换算成金额，供 planner 的态势块展示。
+// 价格按本轮 planner 实际使用的模型估算；未命中价格表 → known=true 但金额为 0
+// （调用方只显示 token，绝不编一个假数字）。
+func (s *Server) taskBudget(ctx context.Context, expID int64) (float64, int, bool) {
+	if s == nil || s.m == nil || s.m.pg == nil {
+		return 0, 0, false
+	}
+	u, err := s.m.pg.Exploration(expID).TokenTotal()
+	if err != nil {
+		return 0, 0, false
+	}
+	total := agent.UsageTotal(u)
+	if total == 0 {
+		return 0, 0, false
+	}
+	var model string
+	s.cfgMu.Lock()
+	model = s.llmCfg.Model
+	s.cfgMu.Unlock()
+	p, ok := priceForModel(model)
+	if !ok {
+		return 0, total, true // 知道 token，不知道价钱
+	}
+	return agent.CostUSD(p, u), total, true
 }

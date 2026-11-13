@@ -7,6 +7,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
+	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -158,9 +159,11 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		BashEnv:               proxyEnv(m.proxyAddr, m.proxyCACert), // Bash 子命令默认走代理+信任 CA
 		WorkingDir:            mainDir,                              // 本任务工作目录 <workDir>/tasks/<taskID>
 		ToolOutputDir:         cmdOutDir(mainDir),
-		MaxTurns:              m.maxTurns,                             // 0 = unlimited (configurable in agent management)
-		Compaction:            compactionConfig(m.compactionWindow()), // long chats stay within the window
-		Todos:                 actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
+		MaxTurns:              m.maxTurns, // 0 = unlimited (configurable in agent management)
+		// 主 Agent 也在渗透上下文里：摘要按作战状态取舍（见 pentest_compaction.go）。
+		Compactor: pentestCompactorFor(compactionConfig(m.compactionWindow()),
+			compaction.ProviderSummarizer(m.prov, m.maxTokens(), m.nonStreaming()), m.prov, m.maxTokens(), m.nonStreaming()),
+		Todos: actool.NewTodoStore(), // 会话级临时待办（TodoWrite），纯规划用，退出即丢
 		// 命中预算(步数)→ SDK 跑收尾:向用户输出一句进展总结。Prompt 与收尾轮数可后台编辑(默认 10 轮)。
 		Settlement:   wrapupSettlement("mainagent", nil),
 		NonStreaming: m.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete

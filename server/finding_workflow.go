@@ -87,9 +87,16 @@ func (s *Server) seedFindingWorkflowTools() {
 	}
 	// Upgrade only the original default binding. Customized lists and enabled
 	// flags survive; the one-time flag also preserves future user unbinding.
+	// 只把【原始的代码默认绑定】升级到带上 reporter —— 它必须与 wireTools 里
+	// trafficAgents 的字面值保持一致（worker/planner/mainagent + traffic_curl）。
+	// HotkerArteX 把 traffic_curl 的默认绑定加到了 planner/mainagent，若这里仍按旧的
+	// `["worker"]` 匹配，reporter 就永远拿不到 traffic_search（证据工作流中断），
+	// reporter 绑定测试也会红。两种历史形态都兼容。
 	readers := `["worker","reporter"]`
 	for _, key := range []string{"traffic_search", "traffic_get", "traffic_blob"} {
-		if _, err := s.m.pg.Exec(`UPDATE tools SET agents=$2::jsonb WHERE key=$1 AND system AND (agents='["worker"]'::jsonb OR (agents @> '["worker","planner","mainagent","auto","pentest"]'::jsonb AND jsonb_array_length(agents)=5))`, key, readers); err != nil {
+		if _, err := s.m.pg.Exec(`UPDATE tools SET agents=$2::jsonb WHERE key=$1 AND system AND (agents='["worker"]'::jsonb
+         OR agents='["worker","planner","mainagent"]'::jsonb
+         OR (agents @> '["worker","planner","mainagent","auto","pentest"]'::jsonb AND jsonb_array_length(agents)=5))`, key, readers); err != nil {
 			return
 		}
 	}

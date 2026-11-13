@@ -53,6 +53,9 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 // One ToolSet is created per planner/worker run; per-run signals live here.
 type ToolSet struct {
 	findingRecorder FindingRecorder
+	// intentNotes 收集本轮 add_intent 产生的去重软提示（近似重复的提醒）。
+	// 由 add_intent 取走并回传给模型，见 agent/strategy.go。
+	intentNotes []string
 	as              *db.AssetStore   // asset store (optional; nil = asset tools not available)
 	cs              *db.CompanyStore // company store (optional)
 	ts              *db.ExplorationStore
@@ -1108,6 +1111,14 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 			return 0, fmt.Errorf("parent_id %d 是 %q 节点，不能作为意图锚点：意图只能锚在已确认的【事实(fact)/发现(finding)】上，不能挂在意图/目标/提示上；顶层全新方向请留空 parent_ids", pidv, n.Kind)
 		}
 	}
+	// 去重闸门：与「在跑/待跑」的意图实质重复（≥0.75 余弦相似度）直接拒收，并把它最像的
+	// 那条 id 回传给模型 —— 提示词里的"不要换措辞重派"在长回合里必然失守，只有代码闸门
+	// 拦得住。（见 agent/strategy.go 的校准说明。）
+	if err, note := checkIntentNovelty(t.ts, it.Summary); err != nil {
+		return 0, err
+	} else if note != "" {
+		t.intentNotes = append(t.intentNotes, note)
+	}
 	priority := it.Priority
 	if priority == 0 {
 		priority = 5
@@ -1195,15 +1206,23 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 				t.resumeTask()
 			}
 
+			notes := t.drainIntentNotes()
 			if !batch { // 单条：保持原返回
 				if e, bad := errs["0"]; bad {
 					return actool.Errorf(e), nil
 				}
-				return actool.Text(fmt.Sprintf("intent created: %d", ids[0])), nil
+				msg := fmt.Sprintf("intent created: %d", ids[0])
+				if notes != "" {
+					msg += "\n" + notes
+				}
+				return actool.Text(msg), nil
 			}
 			out := map[string]any{"ids": ids}
 			if len(errs) > 0 {
 				out["errors"] = errs
+			}
+			if notes != "" {
+				out["notes"] = notes // 近似重复的提醒（放行但要求模型确认差异）
 			}
 			return jsonResult(out)
 		})

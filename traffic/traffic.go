@@ -2407,7 +2407,60 @@ func (t *Traffic) Tools() []actool.CoreTool {
 		},
 	})
 
-	return []actool.CoreTool{search, get, blob}
+	curlOut := actool.Build(actool.Spec{
+		Name:        "traffic_curl",
+		Description: "把一条已抓流量导出为【可直接执行】的 curl 命令（含方法、头、Cookie、正文；二进制正文自动落文件）。复现漏洞时直接跑它即可重放，或贴进报告的复现步骤。",
+		Schema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"id":       map[string]any{"type": "string", "description": "traffic_search 返回的 id"},
+				"https":    map[string]any{"type": "boolean", "description": "用 https 还原 origin-form URL（默认 true；明文靶场显式传 false）"},
+				"insecure": map[string]any{"type": "boolean", "description": "加 -k 跳过证书校验（自签/内网靶场通常需要，默认 true）"},
+				"proxy":    map[string]any{"type": "string", "description": "显式 -x 代理（默认不写，让命令直连）"},
+			},
+			"required": []any{"id"},
+		},
+		ReadOnly:    ro,
+		Permissions: allow,
+		Run: func(ctx context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
+			var a struct {
+				ID       string
+				HTTPS    *bool
+				Insecure *bool
+				Proxy    string
+			}
+			_ = json.Unmarshal(in, &a)
+			if msg, err := t.exchangeInScope(ctx, a.ID); err != nil {
+				return actool.Errorf(err.Error()), nil
+			} else if msg != "" {
+				return actool.Errorf(msg), nil
+			}
+			req, _, err := t.Get(a.ID)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if strings.TrimSpace(req) == "" {
+				return actool.Errorf("该流量没有请求原文（可能只有响应）"), nil
+			}
+			// 索引里的 host 只有 hostname；URL 里有完整 host:port，用它补全最准
+			// （录到的请求常常没有 Host 头 —— 代理自己知道往哪送）。
+			fallback := t.exchangeHostPort(a.ID)
+			https := true
+			if a.HTTPS != nil {
+				https = *a.HTTPS
+			}
+			insecure := true
+			if a.Insecure != nil {
+				insecure = *a.Insecure
+			}
+			cmd, cerr := curlFromRequest(req, https, insecure, a.Proxy, fallback)
+			if cerr != nil {
+				return actool.Errorf(cerr.Error()), nil
+			}
+			return actool.Text(cmd), nil
+		},
+	})
+	return []actool.CoreTool{search, get, blob, curlOut}
 }
 
 // blobInScope reports whether any exchange referencing hash is in the run's
@@ -2461,4 +2514,43 @@ func clip(s string, max int) string {
 		return s
 	}
 	return s[:max] + fmt.Sprintf("\n... [截断，共 %d 字节；完整在流量文件树] ...", len(s))
+}
+
+// exchangeInScope 把单条交换按运行期的抓包范围设卡（与 traffic_get/traffic_blob
+// 同一套语义：不在范围内的主机拒绝读取；空范围拒绝一切）。"" = 允许。
+func (t *Traffic) exchangeInScope(ctx context.Context, id string) (string, error) {
+	scope, ok := capture.From(ctx)
+	if !ok {
+		return "", nil
+	}
+	var host string
+	err := t.db.QueryRow(`SELECT COALESCE(host,'') FROM exchanges WHERE id=?`, id).Scan(&host)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "流量不存在: " + id, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if scope.Allows(host) {
+		return "", nil
+	}
+	reason := scope.Reason
+	if reason == "" {
+		reason = "该主机不在当前任务的资产范围内"
+	}
+	return fmt.Sprintf("拒绝导出 %s 的流量：%s。", host, reason), nil
+}
+
+// exchangeHostPort 从索引 URL 里取出 host:port（含端口），用于给缺 Host 头的
+// 请求补全可执行 URL。
+func (t *Traffic) exchangeHostPort(id string) string {
+	var urlStr string
+	if err := t.db.QueryRow(`SELECT COALESCE(url,'') FROM exchanges WHERE id=?`, id).Scan(&urlStr); err != nil {
+		return ""
+	}
+	h := strings.TrimPrefix(strings.TrimPrefix(urlStr, "http://"), "https://")
+	if i := strings.IndexAny(h, "/?"); i >= 0 {
+		h = h[:i]
+	}
+	return h
 }

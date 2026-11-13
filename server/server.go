@@ -574,7 +574,9 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	s.cfgMu.Lock()
 	// chat agent serves MANY custom agents by key → it holds the GLOBAL opts
 	// (backend/key) and gates Enabled per-conversation-agent at Chat time. 对话始终用激活配置。
-	s.chatAgent = agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, win) // chat page runner
+	// 全局激活链按角色套路由模式：chat 用 balanced（不替用户做取舍）；planner/worker/
+	// pentest 的链在各自 buildPlannerWorker / agentsForTask 里按 deep 模式套（见 poolWithRole）。
+	s.chatAgent = agent.NewChatAgent(poolWithRole(prov, "chat"), cfg.Model, s.m.dir, tx, win) // chat page runner
 	s.chatAgent.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	s.chatAgent.SetWebSearch(s.m.WebSearchOpts())
 	s.chatAgent.SetGuard(s.chatGuard())

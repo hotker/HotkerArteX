@@ -2,6 +2,23 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2.4.0] - 2026-11-14
+
+### 新增
+
+- **`http_request` 结构化发包工具**（默认绑 worker/planner/mainagent/auto/pentest）：方法/头/正文/表单/JSON/Cookie 显式可控，**头顺序与大小写原样发送、同名头可重复**（CL.TE / TE.CL 这类走私构造靠这个能力，`Header.Set` 做不到）；默认经记录代理出网，每条请求自动落流量库、可直接进入复现证据链；`redirect:false` 只看第一跳；`raw_socket:true` 把 `body` 当整段原始报文直连发送（畸形请求行/半截请求/走私探测），并在返回里明说"直连不落库"。它不取代 Bash：链式交互仍走 Bash，`http_request` 负责"一次请求、留下证据"。
+- **`traffic_curl` 一键导出可执行复现命令**：把任一条已记录流量翻成 curl（origin-form/absolute-form 都支持、按原顺序输出头、二进制正文自动落文件、POSIX 单引号转义）。默认绑 worker/planner/mainagent——报告里的复现步骤直接就是个能跑的命令。
+- **规划停滞告警**：planner 每轮由代码统计"连续 N 轮图谱 facts/findings 零增长且没有在跑 work"，命中就在本轮态势里下硬告警：要么派一条**机理不同**的新方向，要么 prove_goal 收官。用绝对值是否增长判定，而不是"意图有没有跑完"——worker 跑完却 `WriteCounts=0` 正是最该被抓的空转。
+- **意图去重闸门**：`add_intent` 现在会对新方向与"在跑/待跑"意图做字符 bigram 余弦相似度（先剔中英文停用字）。≥0.75 直接拒收并回传最相似意图 id；≥0.30 放行但软提示要求确认差异。阈值按实测校准：逐字复述≈1.0、缩句复述≈0.77、换词同指≈0.31、不同机理≈0.06。
+- **任务成本可见**：planner 态势带上"本任务累计 tokens ≈ $X"（内置模型前缀价格表；未命中的模型只显示 token，绝不估一个假数字）。
+- **模型能力档位与角色路由**：LLM 配置新增「能力档位（0 未设 / 1 轻量 / 2 主力 / 3 前沿）」与「省钱档」。`llmpool` 新增 `Mode`——`deep`（质量降序、省钱档最后）/ `economy`（省钱档优先、再按最便宜）/ `balanced`（原序），按角色套用：planner/worker/pentest/mainagent/auto → deep，富化/摘要 → economy，chat → balanced。**模式只改同一条链内的顺序，从不排除配置**：强模型熔断时廉价成员立刻顶上，故障转移完整保留。
+- **渗透态上下文压缩**：上游摘要提示是 claude-code 的通用"代码工程"口径，长回合会把"已封锁路线""量化验收条件""PoC 原文"当细节压掉。现 planner/worker/mainagent 的 Compactor 包一层重写：先取通用摘要，再按「六类必留项」（目标与量化验收 / 已确认漏洞 PoC / 资产与凭据 / 已封锁路线及失败原因 / 串行链进度 / 产物路径）重写；重写失败自动退回通用摘要，阈值、micro-compact、skill 重注入全部不变。
+- **新增 4 个 skill**：`ssti-testing`（引擎判别表 + 沙箱绕过 + 误判表）、`http-request-smuggling`（四类可执行报文与证明路径）、`jwt-attack`（alg 混淆/none/kid/jku）、`graphql-testing`（字段级越权/内省绕过/复杂度）。
+
+### 修复
+
+- **reporter 的证据工作流在升级后断链**：`seedFindingWorkflowTools` 只把"原始默认绑定"升级到带 reporter，而默认绑定字面值跟着 `trafficAgents` 变成 `["worker","planner","mainagent"]` 后匹配不上，导致 reporter 永远拿不到 `traffic_search`/`traffic_get`。现兼容新旧两种字面值，reporter 恢复正常绑定。
+
 ## [Unreleased]
 
 ## [2.3.1] - 2026-10-22

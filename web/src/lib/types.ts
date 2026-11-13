@@ -1046,6 +1046,8 @@ export interface LLMProfile {
   priority?: number;
   // true = 不作为故障转移目标（仍可被 agent/任务显式绑定使用）。
   pool_exclude?: boolean;
+  quality?: number; // 能力档位 0=未设 1=轻量 2=主力 3=前沿
+  economy?: boolean; // 省钱档
   // true（默认）= 流式(SSE) | false = 真·非流式(stream:false，一次性返回)。
   streaming?: boolean;
   // 单次回复的输出上限(token)。0 = 不发送该字段，由服务端默认值决定。
