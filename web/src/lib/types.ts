@@ -1,4 +1,4 @@
-// ARTEX domain model — types used across the UI.
+// Foxker domain model — types used across the UI.
 // Derived from the functional spec (section 7: 关键数据形状).
 
 export type TaskStatus = "created" | "queued" | "running" | "paused" | "done" | "failed" | "timeout";

@@ -93,7 +93,7 @@ var loginLim = &loginLimiter{byKey: map[string]*loginFailEntry{}}
 // source IP, honouring an unvalidated XFF lets an attacker step the key with
 // every request (X-Forwarded-For: 10.0.0.1, 10.0.0.2, …) and never trip the
 // lock, which turns the 15-minute lockout into no protection at all. Only set
-// this when a reverse proxy in front of ARTEX is what writes the header.
+// this when a reverse proxy in front of Foxker is what writes the header.
 const trustedProxyEnv = "ARTEX_TRUST_XFF"
 
 func trustForwardedFor() bool {

@@ -87,7 +87,7 @@ func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
 	return buf, nil
 }
 
-// signJWT issues a generation-0 7-day HS256 token for user ARTEX (no generation
+// signJWT issues a generation-0 7-day HS256 token for user Foxker (no generation
 // claim). Kept as the one-arg form for tests and as the fresh-install path; the
 // server signs new tokens with the current generation via signJWTGen.
 func signJWT(key []byte) (string, error) { return signJWTGen(key, 0) }
@@ -104,10 +104,30 @@ type authClaims struct {
 // generation, see auth.token_gen). gen==0 — a fresh install that has never
 // rotated — is omitted, so such tokens look exactly like the legacy
 // (pre-generation) ones and nothing downstream needs to change.
+// loginUsernames 是登录页接受的用户名（大小写不敏感）。
+//
+// 改名为 Foxker 后仍保留 ARTEX 作为别名：现网可能有脚本 / 书签 / 反代配置里写死了旧
+// 用户名，一次改名就让它们全部登录失败，代价远大于多一个字符串。展示与 JWT sub 一律
+// 用新名（见 signJWTGen），别名只影响"能不能登进来"。
+var loginUsernames = []string{"foxker", "artex"}
+
+func validLoginUsername(u string) bool {
+	u = strings.TrimSpace(strings.ToLower(u))
+	if u == "" {
+		return false
+	}
+	for _, want := range loginUsernames {
+		if u == want {
+			return true
+		}
+	}
+	return false
+}
+
 func signJWTGen(key []byte, gen int64) (string, error) {
 	claims := authClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   "ARTEX",
+			Subject:   "Foxker",
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(jwtTTL)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
@@ -389,7 +409,7 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 	if loginThrottled(w, r, req.Username) {
 		return
 	}
-	if req.Username != "ARTEX" {
+	if !validLoginUsername(req.Username) {
 		loginNoteFail(r, req.Username)
 		writeErr(w, 401, "用户名或密码错误")
 		return

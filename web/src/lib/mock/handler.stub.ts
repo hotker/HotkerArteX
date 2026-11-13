@@ -8,7 +8,7 @@
 // 这里，宁可 loud-fail，也不要静默返回演示数据。
 export async function mockHandle<T>(): Promise<T> {
   throw new Error(
-    "[artex] mock handler 不应在生产构建中被调用（MOCK 未启用却触发了 mock 分支）",
+    "[foxker] mock handler 不应在生产构建中被调用（MOCK 未启用却触发了 mock 分支）",
   );
 }
 

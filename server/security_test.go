@@ -25,23 +25,23 @@ func TestLoginLimiterLocksAfterThreshold(t *testing.T) {
 	r := reqWithAddr("1.2.3.4:5678")
 
 	for i := 0; i < maxLoginFails-1; i++ {
-		if remain := loginLim.noteFail("1.2.3.4|ARTEX"); remain > 0 {
+		if remain := loginLim.noteFail("1.2.3.4|Foxker"); remain > 0 {
 			t.Fatalf("fail %d: locked early", i+1)
 		}
 	}
-	if remain := loginLim.noteFail("1.2.3.4|ARTEX"); remain <= 0 {
+	if remain := loginLim.noteFail("1.2.3.4|Foxker"); remain <= 0 {
 		t.Fatalf("expected lock after %d failures", maxLoginFails)
 	}
 	w := httptest.NewRecorder()
-	if !loginThrottled(w, r, "ARTEX") {
+	if !loginThrottled(w, r, "Foxker") {
 		t.Fatal("expected throttled response")
 	}
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("want 429, got %d", w.Code)
 	}
 	// 成功登录清零后不再锁定。
-	loginLim.clear("1.2.3.4|ARTEX")
-	if until := loginLim.lockedUntil("1.2.3.4|ARTEX"); !until.IsZero() {
+	loginLim.clear("1.2.3.4|Foxker")
+	if until := loginLim.lockedUntil("1.2.3.4|Foxker"); !until.IsZero() {
 		t.Fatal("still locked after successful login")
 	}
 }
@@ -50,13 +50,13 @@ func TestLoginLimiterIsPerIPAndUser(t *testing.T) {
 	resetLoginLimiter()
 	t.Cleanup(resetLoginLimiter)
 	for i := 0; i < maxLoginFails; i++ {
-		loginLim.noteFail("1.1.1.1|ARTEX")
+		loginLim.noteFail("1.1.1.1|Foxker")
 	}
 	// 同 IP 不同用户、同用户不同 IP 都不受影响。
 	if u := loginLim.lockedUntil("1.1.1.1|other"); !u.IsZero() {
 		t.Fatal("lock leaked across usernames")
 	}
-	if u := loginLim.lockedUntil("2.2.2.2|ARTEX"); !u.IsZero() {
+	if u := loginLim.lockedUntil("2.2.2.2|Foxker"); !u.IsZero() {
 		t.Fatal("lock leaked across IPs")
 	}
 }
@@ -65,16 +65,16 @@ func TestLoginLimiterWindowExpiry(t *testing.T) {
 	resetLoginLimiter()
 	t.Cleanup(resetLoginLimiter)
 	loginLim.mu.Lock()
-	loginLim.byKey["9.9.9.9|ARTEX"] = &loginFailEntry{
+	loginLim.byKey["9.9.9.9|Foxker"] = &loginFailEntry{
 		fails:     maxLoginFails,
 		lastFail:  time.Now().Add(-2 * loginFailWindow),
 		lockedOut: time.Now().Add(-1 * time.Hour),
 	}
 	loginLim.mu.Unlock()
-	if u := loginLim.lockedUntil("9.9.9.9|ARTEX"); !u.IsZero() {
+	if u := loginLim.lockedUntil("9.9.9.9|Foxker"); !u.IsZero() {
 		t.Fatal("stale lock not expired")
 	}
-	if _, ok := loginLim.byKey["9.9.9.9|ARTEX"]; ok {
+	if _, ok := loginLim.byKey["9.9.9.9|Foxker"]; ok {
 		t.Fatal("stale entry not pruned")
 	}
 }
@@ -115,7 +115,7 @@ func TestLoginLimiterGlobalCooldown(t *testing.T) {
 		loginLim.noteGlobalFail()
 	}
 	w := httptest.NewRecorder()
-	if !loginThrottled(w, reqWithAddr("198.51.100.1:1111"), "ARTEX") {
+	if !loginThrottled(w, reqWithAddr("198.51.100.1:1111"), "Foxker") {
 		t.Fatal("expected global cooldown to throttle a fresh source")
 	}
 	if w.Code != http.StatusTooManyRequests {

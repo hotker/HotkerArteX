@@ -5,7 +5,7 @@
 //
 // The UI polls a lot (task list, sessions, dashboard, logs badge — several timers
 // at 2–5 s each). Every one of them keeps hitting the backend when the tab is
-// backgrounded, which is exactly when nobody is looking: a laptop with five ARTEX
+// backgrounded, which is exactly when nobody is looking: a laptop with five Foxker
 // tabs open kept the server busy and, on a metered connection, kept the radio
 // awake. Browsers throttle background timers to ~1/minute but do not stop them,
 // and a throttled poll still costs a request.

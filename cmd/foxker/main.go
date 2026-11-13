@@ -1,4 +1,4 @@
-// Command artex runs the ARTEX backend: the dual SQLite graph stores,
+// Command foxker runs the Foxker backend: the dual SQLite graph stores,
 // the event-driven exploration engine, and the JSON HTTP API consumed by the
 // shadcn/ui frontend.
 package main
@@ -25,11 +25,11 @@ import (
 )
 
 // version is the build version. Default comes from the version package (the single
-// source of truth) so a plain `go build ./cmd/artex` reports the real repo version
+// source of truth) so a plain `go build ./cmd/foxker` reports the real repo version
 // instead of "dev" — that "dev" default is what used to make the admin console show
 // a stale/unknown version. Release builds still override it:
 //
-//	go build -ldflags "-X main.version=$(git describe --tags)" ./cmd/artex
+//	go build -ldflags "-X main.version=$(git describe --tags)" ./cmd/foxker
 var version = buildversion.Version
 
 const banner = `
@@ -157,7 +157,7 @@ func run() int {
 	warnIfPublic(*addr)
 
 	go func() {
-		log.Printf("ARTEX %s backend listening on %s (data=%s, workers=%d)", version, *addr, *dataDir, mgr.Workers())
+		log.Printf("Foxker %s backend listening on %s (data=%s, workers=%d)", version, *addr, *dataDir, mgr.Workers())
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("serve: %v", err)
 		}

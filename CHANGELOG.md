@@ -2,6 +2,33 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [3.0.0] - 2026-11-14
+
+### 变更（品牌）
+
+- **程序更名为 Foxker**，采用新 Logo（`brand/foxker-logo.png`；`web/public/logo.png`、
+  `apple-touch-icon.png`、`web/src/app/icon.png` 同源位图；旧的 `logo.svg` 已移除）。
+- **后端**：登录用户名、JWT `sub`、启动横幅、`/api/health` 的 `service` 字段一律为 `Foxker`；
+  登录**仍接受旧用户名 ARTEX**（`loginUsernames` 别名，大小写不敏感）——现网的脚本/书签/反代配置
+  里可能写死了旧名，一次改名不该让它们全部登不进来。
+- **二进制与命令行**：`cmd/artex` → `cmd/foxker`，产物 `foxker` / `foxker.exe`，
+  发布包 `foxker-<版本>-<os>-<arch>.zip`；`build.sh`、`start.sh`、`start.bat`、`install.sh`、
+  `dev.sh`、`Dockerfile`（`COPY dist/<arch>/foxker`）、CI（冒烟与 artifact 路径）、
+  `docker-compose*.yml`（service `foxker`、镜像 `hotker/foxker`）同步。
+- **一键更新**：暂存件与备份件随二进制名改为 `foxker.new` / `foxker.old` / `foxker.upgrade.json`
+  （由 `os.Executable()` 推导，天然跟随），资产名匹配同步。
+- **前端**：`APP_CONFIG.name`、页面文案、登录页/初始化页用户名、Logo 全部换成 Foxker。
+
+### 保持不变（有意为之）
+
+- **所有 `ARTEX_*` 环境变量名不变**：`ARTEX_PG_DSN`、`ARTEX_LLM_*`、`ARTEX_TARGETS`、`ARTEX_TAG`…
+  改名会让现网 `.env` / systemd / 反代配置全部失效。`docker-compose.yml` 认 `FOXKER_TAG` 并**回落**到
+  `ARTEX_TAG`，两种写法都能用。
+- **登录 cookie 与 localStorage 键 `artex_token` 不变**：改名会让所有已登录会话掉线。
+- **Go module 路径 `github.com/Autumn-27/artex` 不变**：改它等于改动全仓 import，与本轮无关，
+  且会与上游同步产生大量冲突。
+- **数据库账号/库名（`artex`）不变**：那是存量部署的数据层身份。
+
 ## [2.5.4] - 2026-11-14
 
 ### 修复

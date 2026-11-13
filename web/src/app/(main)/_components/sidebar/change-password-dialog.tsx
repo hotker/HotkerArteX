@@ -70,7 +70,7 @@ export function ChangePasswordDialog({
           <DialogHeader>
             <DialogTitle>修改密码</DialogTitle>
             <DialogDescription>
-              用户名固定为 <b>ARTEX</b>。需先输入当前密码验证；修改后其他设备/标签页已签发的登录 token 将立即失效，当前会话自动续用。
+              用户名固定为 <b>Foxker</b>。需先输入当前密码验证；修改后其他设备/标签页已签发的登录 token 将立即失效，当前会话自动续用。
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-3 py-4">

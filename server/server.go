@@ -34,13 +34,13 @@ import (
 	"github.com/Autumn-27/norma/transcript"
 )
 
-// BuildVersion is the backend application version, injected from cmd/artex at
+// BuildVersion is the backend application version, injected from cmd/foxker at
 // startup (which takes it from the version package, overridable by
 // -ldflags "-X main.version=<tag>"). Exposed to the frontend via GET /api/health
 // and compared against the latest GitHub release by GET /api/update/check.
 var BuildVersion = buildversion.Version
 
-// Server exposes the ARTEX backend over a JSON HTTP API for the shadcn/ui
+// Server exposes the Foxker backend over a JSON HTTP API for the shadcn/ui
 // frontend.
 type Server struct {
 	m      *Manager
@@ -1067,7 +1067,7 @@ func (s *Server) Handler() http.Handler {
 // --- handlers ---
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"ok": true, "service": "artex", "version": BuildVersion})
+	writeJSON(w, 200, map[string]any{"ok": true, "service": "foxker", "version": BuildVersion})
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
@@ -2255,7 +2255,7 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stage, err := os.MkdirTemp("", "artex-finding-export-")
+	stage, err := os.MkdirTemp("", "foxker-finding-export-")
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return

@@ -14,8 +14,8 @@ services:
       retries: 10
     restart: unless-stopped
 
-  artex:
-    image: autumn27/artex:${ARTEX_TAG:-latest}
+  foxker:
+    image: hotker/foxker:${FOXKER_TAG:-${ARTEX_TAG:-latest}}
     depends_on:
       postgres:
         condition: service_healthy

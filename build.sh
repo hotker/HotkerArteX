@@ -9,7 +9,7 @@
 #   ARTEX_TARGET_ARCH=amd64           One target arch in single-target mode.
 #   ARTEX_TARGETS=linux/amd64,...     Comma-separated targets for multi-target mode.
 #   ARTEX_BUILD_VERSION=v0.3.3        Version embedded in the binary and archive name.
-#   ARTEX_OUTPUT=/path/to/artex       Explicit binary path in single-target mode.
+#   ARTEX_OUTPUT=/path/to/foxker      Explicit binary path in single-target mode.
 #   ARTEX_OUTPUT_DIR=dist             Directory for default binary paths.
 #   ARTEX_PACKAGE=1                   Create a zip archive for each target.
 #   ARTEX_PACKAGE_DIR=dist            Directory for release archives.
@@ -165,7 +165,7 @@ package_binary() {
   binary="$1"
   goos="$2"
   goarch="$3"
-  package_name="artex-${ARTEX_BUILD_VERSION}-${goos}-${goarch}"
+  package_name="foxker-${ARTEX_BUILD_VERSION}-${goos}-${goarch}"
   package_root="${ARTEX_PACKAGE_DIR}/${package_name}"
   archive="${ARTEX_PACKAGE_DIR}/${package_name}.zip"
 
@@ -174,7 +174,7 @@ package_binary() {
   mkdir -p "$package_root"
   cp "$binary" "$package_root/"
   # 守护启动脚本是正式入口：页面上的一键更新要靠它在进程退出后重新拉起，
-  # 直接跑 artex 本体的话更新完就再也起不来了。按目标系统只带对应的那一份。
+  # 直接跑 foxker 本体的话更新完就再也起不来了。按目标系统只带对应的那一份。
   if [ "$goos" = "windows" ]; then
     cp start.bat "$package_root/"
   else
@@ -202,12 +202,12 @@ build_target() {
     *) die "不支持的系统：$goos（支持 linux、darwin、windows）" ;;
   esac
 
-  binary_name="artex"
-  [ "$goos" = "windows" ] && binary_name="artex.exe"
+  binary_name="foxker"
+  [ "$goos" = "windows" ] && binary_name="foxker.exe"
   if [ -n "${ARTEX_OUTPUT:-}" ] && [ "$ARTEX_RELEASE" != "1" ]; then
     output="$ARTEX_OUTPUT"
   else
-    output="${ARTEX_OUTPUT_DIR}/artex-${goos}-${goarch}/${binary_name}"
+    output="${ARTEX_OUTPUT_DIR}/foxker-${goos}-${goarch}/${binary_name}"
   fi
   mkdir -p "$(dirname "$output")"
 
@@ -221,7 +221,7 @@ build_target() {
     -trimpath \
     -ldflags "-s -w -buildid= -X main.version=${ARTEX_BUILD_VERSION}" \
     -o "$output" \
-    ./cmd/artex
+    ./cmd/foxker
 
   compress_binary "$output" "$goos"
   if command -v file >/dev/null 2>&1; then file "$output"; fi

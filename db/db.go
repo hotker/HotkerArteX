@@ -1,4 +1,4 @@
-// Package db is the PostgreSQL data source for ARTEX (取代旧 graph 单文件 SQLite)。
+// Package db is the PostgreSQL data source for Foxker (取代旧 graph 单文件 SQLite)。
 // 它打开连接、应用 schema、并 seed 内置 agent 与变量目录。
 package db
 

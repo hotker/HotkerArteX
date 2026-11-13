@@ -2498,7 +2498,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
  * 被内联进每个引用 api.ts 的页面 chunk，demo 报告内容（含假漏洞细节）随生产分发。
  */
 export function mockReport(_task?: string): string {
-  return `# ARTEX 渗透测试报告 — Acme Corp
+  return `# Foxker 渗透测试报告 — Acme Corp
 
 ## 概览
 - 范围：acme.com（含 www / admin / api / shop / vpn 子域）
