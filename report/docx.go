@@ -32,6 +32,8 @@ type doc struct {
 	Blocks []block
 	// Footer 是页脚左侧文本（右侧是页码）。
 	Footer string
+	// Media 是正文引用的图片，按顺序打包进 word/media/。image rId 在渲染时确定。
+	Media []*imageRef
 }
 
 type metaRow struct{ Key, Value string }
@@ -45,6 +47,9 @@ const (
 	blockTable
 	blockCode
 	blockPageBreak
+	// blockImage 插入一张图片（证据截图）。Media 是图片在 docx 内的关系 id 与字节，
+	// 由 RenderDocx 在打包阶段统一分配 rId 并写入 word/media/。
+	blockImage
 	// blockTOC 插一个目录域（TOC \o "1-3"）。Word 打开时提示更新域即生成目录 ——
 	// 不预渲染页码，因为页数要到排版时才确定，硬编码只会给出错的页码。
 	blockTOC
@@ -61,6 +66,55 @@ type block struct {
 	Widths  []float64 // 单位 pt；空 = 均分
 	// blockCode：逐行渲染成等宽段落（不做语法高亮 —— 交付件要的是可复制，不是好看）
 	Code string
+	// blockImage：Media 指向 doc.Media 里的条目（由 Build 填入索引），Caption 渲染在图下方。
+	Media   *imageRef
+	Caption string
+}
+
+// imageRef 是一张待嵌入的图片。Bytes 已由调用方按内容校验并重编码（见 evidence.Sanitize），
+// 这里只负责排版，不再信任任何元数据。
+type imageRef struct {
+	Name   string // 文件名（仅用于 word/media/ 内的名字与扩展名判定）
+	Ext    string // ".png" | ".jpg"
+	Bytes  []byte // 图片字节
+	Width  int    // 像素
+	Height int
+	// 目标宽度（pt）。0 = 用默认 420pt（A4 版面内合适）。高度按像素比自动算，
+	// 绝不拉伸 —— 截图被拉变形等于证据失真。
+	TargetPT float64
+	// rid 是打包时分配的关系 id（由 RenderDocx 写入，Build 阶段不填）。
+	rid string
+}
+
+// mediaName 返回图片在 word/media/ 下的文件名（按序号派生，避免中文名与重名问题）。
+func (m *imageRef) mediaName() string {
+	ext := m.Ext
+	if ext == "" {
+		ext = ".png"
+	}
+	if ext != ".png" && ext != ".jpg" && ext != ".jpeg" {
+		ext = ".png"
+	}
+	return sanitizeName(m.Name) + ext
+}
+
+// sanitizeName 把文件名压成安全的 ASCII 片段：OOXML 的部件名不该带中文与空格。
+func sanitizeName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		}
+	}
+	out := b.String()
+	if out == "" {
+		out = "image"
+	}
+	if len(out) > 40 {
+		out = out[:40]
+	}
+	return out
 }
 
 // statusWriter 把写失败攒起来，避免每处 WriteString 都判一次错。
@@ -84,6 +138,16 @@ func (s *statusWriter) ws(strs ...string) {
 // RenderDocx 把 doc 渲染成 .docx 字节。返回的错误只可能是编码/压缩失败，
 // 不含任何"环境缺失"类错误。
 func RenderDocx(d *doc) ([]byte, error) {
+	// 图片 rId 在打包前统一分配：
+	//   rId1 styles / rId2 numbering / rId3 footer（固定），图片从 rId100 起，
+	//   这样 document.xml.rels 与正文引用一一对应，不会和固定关系撞号。
+	for i, m := range d.Media {
+		if m == nil {
+			continue
+		}
+		m.rid = fmt.Sprintf("rId%d", 100+i)
+	}
+
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 
@@ -98,8 +162,21 @@ func RenderDocx(d *doc) ([]byte, error) {
 		{"word/document.xml", func(w *statusWriter) { writeDocument(w, d) }},
 		{"word/styles.xml", writeStyles},
 		{"word/numbering.xml", writeNumbering},
-		{"word/_rels/document.xml.rels", writeDocumentRels},
+		{"word/_rels/document.xml.rels", func(w *statusWriter) { writeDocumentRels(w, d.Media) }},
 		{"word/footer1.xml", func(w *statusWriter) { writeFooter(w, d) }},
+	}
+	// 图片字节作为独立 zip 部件写入（不压缩走默认 deflate 即可；PNG/JPG 本身已压缩）。
+	for _, m := range d.Media {
+		if m == nil || len(m.Bytes) == 0 {
+			continue
+		}
+		f, err := zw.Create("word/media/" + m.mediaName())
+		if err != nil {
+			return nil, fmt.Errorf("创建图片部件失败: %w", err)
+		}
+		if _, err := f.Write(m.Bytes); err != nil {
+			return nil, fmt.Errorf("写入图片 %s 失败: %w", m.Name, err)
+		}
 	}
 	for _, p := range parts {
 		f, err := zw.Create(p.name)
@@ -124,6 +201,9 @@ func writeContentTypes(w *statusWriter) {
 	w.ws(xmlHead, `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">`,
 		`<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>`,
 		`<Default Extension="xml" ContentType="application/xml"/>`,
+		`<Default Extension="png" ContentType="image/png"/>`,
+		`<Default Extension="jpeg" ContentType="image/jpeg"/>`,
+		`<Default Extension="jpg" ContentType="image/jpeg"/>`,
 		`<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>`,
 		`<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>`,
 		`<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>`,
@@ -141,12 +221,18 @@ func writeRootRels(w *statusWriter) {
 		`</Relationships>`)
 }
 
-func writeDocumentRels(w *statusWriter) {
+func writeDocumentRels(w *statusWriter, media []*imageRef) {
 	w.ws(xmlHead, `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">`,
 		`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>`,
 		`<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>`,
-		`<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>`,
-		`</Relationships>`)
+		`<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>`)
+	for _, m := range media {
+		if m == nil || m.rid == "" {
+			continue
+		}
+		w.ws(`<Relationship Id="` + m.rid + `" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/` + esc(m.mediaName()) + `"/>`)
+	}
+	w.ws(`</Relationships>`)
 }
 
 func writeCoreProps(w *statusWriter, d *doc) {
@@ -215,6 +301,8 @@ func writeDocument(w *statusWriter, d *doc) {
 			}
 		case blockPageBreak:
 			w.ws(`<w:p><w:r><w:br w:type="page"/></w:r></w:p>`)
+		case blockImage:
+			writeImage(w, b.Media, b.Caption)
 		case blockTOC:
 			w.ws(`<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr></w:p>`,
 				`<w:p><w:fldSimple w:instr=" TOC \o &quot;1-3&quot; \h \z \u ">`,
@@ -227,6 +315,51 @@ func writeDocument(w *statusWriter, d *doc) {
 		`<w:pgSz w:w="11906" w:h="16838"/>`, // A4 竖向（twips）
 		`<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="851" w:footer="992" w:gutter="0"/>`,
 		`</w:sectPr></w:body></w:document>`)
+}
+
+// EMU 换算：1pt = 12700 EMU（OOXML 用 EMU 表示长度，1 英寸 = 914400 EMU）。
+const emuPerPT = 12700
+
+// writeImage 渲染一张内联图片 + 图注。
+//
+// 尺寸计算是关键：Word 里图片宽高都写 EMU，且必须保持像素宽高比 —— 一旦算错，图会被
+// 拉扁或被裁。这里按 TargetPT（缺省 420pt，A4 正文宽度的合适值）等比缩放。
+func writeImage(w *statusWriter, m *imageRef, caption string) {
+	if m == nil || m.rid == "" {
+		return
+	}
+	wpt := m.TargetPT
+	if wpt <= 0 {
+		wpt = 420
+	}
+	// 高度按像素比推出来；像素尺寸缺失时退回 3:2，绝不除零。
+	hpt := wpt * 0.66
+	if m.Width > 0 && m.Height > 0 {
+		hpt = wpt * float64(m.Height) / float64(m.Width)
+	}
+	cx := int(wpt * emuPerPT)
+	cy := int(hpt * emuPerPT)
+
+	w.ws(`<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:after="60"/></w:pPr><w:r><w:drawing>`,
+		`<wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"`,
+		` distT="0" distB="0" distL="0" distR="0">`,
+		`<wp:extent cx="`, itoa(cx), `" cy="`, itoa(cy), `"/>`,
+		`<wp:docPr id="1" name="`, esc(m.Name), `"/>`,
+		// a:graphic 需要完整命名空间声明；缺任何一个，Word 都会报"内容有问题"。
+		`<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">`,
+		`<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">`,
+		`<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">`,
+		`<pic:nvPicPr><pic:cNvPr id="1" name="`, esc(m.Name), `"/><pic:cNvPicPr/></pic:nvPicPr>`,
+		`<pic:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="`, m.rid, `"/>`,
+		`<a:stretch><a:fillRect/></a:stretch></pic:blipFill>`,
+		`<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="`, itoa(cx), `" cy="`, itoa(cy), `"/></a:xfrm>`,
+		`<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>`,
+		`</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>`)
+	if strings.TrimSpace(caption) != "" {
+		w.ws(`<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:before="0" w:after="240"/></w:pPr>`)
+		run(w, caption)
+		w.ws(`</w:p>`)
+	}
 }
 
 // writeTable 渲染表格：首行加粗底纹，列宽按 Widths（pt→twips）或均分。

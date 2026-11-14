@@ -232,6 +232,19 @@ type Finding struct {
 	Traffic     []string // 形如 "GET https://host/path → 200"
 	// Provenance 是结构化复现里的攻击链来源/依赖（从哪些事实/漏洞串起来）。
 	Provenance string
+	// Images 是证据截图（已重编码的字节 + 图注 + 归属步骤）。StepIndex 为 0 表示总览图，
+	// 由调用方决定插在"复现过程"之前还是某一步之后 —— Build 按步骤序号装配。
+	Images []Image
+}
+
+// Image 是一张证据截图（字节由调用方按内容校验并重编码过）。
+type Image struct {
+	Bytes     []byte
+	Ext       string // ".png" | ".jpg"
+	Width     int
+	Height    int
+	Caption   string
+	StepIndex int // 0 = 总览
 }
 
 // DocInput 是渲染一份报告所需的全部数据。
@@ -374,6 +387,12 @@ func Build(in DocInput) *doc {
 		block{Kind: blockHeading, Level: 1, Text: ls.SecAppendix},
 		block{Kind: blockPara, Text: ls.AppendixLead},
 	)
+	// 收集图片：blocks 里引用的每张图都要登记到 doc.Media，RenderDocx 才能打包。
+	for _, b := range d.Blocks {
+		if b.Kind == blockImage && b.Media != nil {
+			d.Media = append(d.Media, b.Media)
+		}
+	}
 	if in.AssetCount > 0 || len(in.Assets) > 0 {
 		d.Blocks = append(d.Blocks, block{
 			Kind:    blockTable,
@@ -454,7 +473,11 @@ func findingBlocks(ls langSet, n int, f Finding) []block {
 		if st.Proves != "" {
 			out = append(out, block{Kind: blockPara, Text: st.Proves})
 		}
+		// 该步的证据截图：跟在步骤内容之后、下一段之前，图文同页最容易对照。
+		out = append(out, imageBlocks(f.Images, i+1)...)
 	}
+	// 未归属到具体步骤的截图（step_index=0 或越界）放在复现过程末尾，不丢证据。
+	out = append(out, imageBlocks(f.Images, 0)...)
 	if len(f.Traffic) > 0 {
 		out = append(out, block{Kind: blockHeading, Level: 3, Text: ls.LblTraffic},
 			block{Kind: blockBullets, Items: clipList(f.Traffic, 20)})
@@ -462,6 +485,22 @@ func findingBlocks(ls langSet, n int, f Finding) []block {
 	out = append(out, section(ls.LblEvidence, f.Evidence)...)
 	out = append(out, section(ls.LblRemediation, f.Remediation)...)
 	out = append(out, block{Kind: blockPageBreak})
+	return out
+}
+
+// imageBlocks 把归属到某一步的截图转成文档块。step=0 表示"不属于任何具体步骤"。
+func imageBlocks(imgs []Image, step int) []block {
+	var out []block
+	for _, im := range imgs {
+		if im.StepIndex != step || len(im.Bytes) == 0 {
+			continue
+		}
+		ref := &imageRef{
+			Name: fmt.Sprintf("evidence-s%d-%d", step, len(out)+1), Ext: im.Ext,
+			Bytes: im.Bytes, Width: im.Width, Height: im.Height, TargetPT: 420,
+		}
+		out = append(out, block{Kind: blockImage, Media: ref, Caption: im.Caption})
+	}
 	return out
 }
 

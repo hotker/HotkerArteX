@@ -283,6 +283,8 @@ func (s *Server) toReportFindings(fs []*db.DBFinding) []report.Finding {
 				rf.EntryPoint = e.Target
 			}
 		}
+		// 证据截图：按 step_index 归属到复现步骤，报告里图文对照。
+		rf.Images = s.reportImagesFor(f.ID)
 		for _, aid := range f.AssetIDs {
 			if a, ok := assets[aid]; ok {
 				if label := reportAssetLabel(a); label != "" {

@@ -1131,6 +1131,25 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS reproduction    JSONB;
 
 
 
+
+-- 漏洞证据截图：文件落 <dataDir>/evidence/<finding_id>/，行里只存文件名与图注。
+-- 键用独立漏洞记录 id（findings.id）：报告、富化、权限体系都以它为句柄，截图跟着它走
+-- 才能在漏洞被删除时由 FK 级联清理，也才能被报告按 id 找到。
+CREATE TABLE IF NOT EXISTS finding_evidence (
+    id         BIGSERIAL PRIMARY KEY,
+    finding_id BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    filename   TEXT NOT NULL DEFAULT '',
+    caption    TEXT NOT NULL DEFAULT '',
+    -- 归属的复现步骤序号（0 = 总览图）：报告据此把截图插到对应步骤下方
+    step_index INT NOT NULL DEFAULT 0,
+    sort_order INT NOT NULL DEFAULT 0,
+    width      INT NOT NULL DEFAULT 0,   -- 原始像素尺寸，报告排版按它算比例
+    height     INT NOT NULL DEFAULT 0,
+    bytes      BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_finding_evidence_finding ON finding_evidence(finding_id, sort_order);
+
 -- 漏洞富化：AI 生成 / 人工编辑的结构化覆盖层，键为「独立漏洞记录 id」（findings.id）。
 -- 为什么不改 findings 表：findings 是 worker 的原始产出（graph_overview 每轮都会读），
 -- 把叙述性正文与 CVSS 结构塞进去会让图谱膨胀；富化是交付层的东西，独立成表更干净。

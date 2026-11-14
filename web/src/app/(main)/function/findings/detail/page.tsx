@@ -26,7 +26,15 @@ import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ApiError, api } from "@/lib/api";
 import { statusMeta } from "@/lib/status";
-import type { EnrichJob, Finding, FindingStatus, ReproStep, Reproduction, Severity } from "@/lib/types";
+import type {
+  EnrichJob,
+  Finding,
+  FindingEvidenceEntry,
+  FindingStatus,
+  ReproStep,
+  Reproduction,
+  Severity,
+} from "@/lib/types";
 
 import { FindingLineageView } from "./lineage";
 
@@ -45,6 +53,152 @@ const FINDING_STATUSES: FindingStatus[] = [
 
 function fmtTime(ts: string) {
   return new Date(ts).toLocaleString("zh-CN");
+}
+
+// EvidenceCard 管理漏洞证据截图：上传（按步骤归属）/ 改图注 / 删除。
+//
+// 文件存服务器 evidence/<finding_id>/；取图走 cookie 鉴权（<img> 带不了 Authorization），
+// 服务端固定图片 Content-Type + nosniff + inline —— 上传点不会变成 XSS 入口。
+function EvidenceCard({ finding, onChanged }: { finding: Finding; onChanged: () => void }) {
+  const id = finding.finding_id || finding.id;
+  const [items, setItems] = React.useState<FindingEvidenceEntry[]>([]);
+  const [step, setStep] = React.useState(0);
+  const [busy, setBusy] = React.useState(false);
+  const [editing, setEditing] = React.useState<number | null>(null);
+  const [caption, setCaption] = React.useState("");
+
+  const load = React.useCallback(() => {
+    void api
+      .evidence(id)
+      .then(setItems)
+      .catch((e) => toast.error(`读取截图失败：${(e as Error).message}`));
+  }, [id]);
+  React.useEffect(() => {
+    load();
+  }, [load]);
+
+  async function upload(file: File) {
+    setBusy(true);
+    try {
+      await api.uploadEvidence(id, file, { step_index: step });
+      toast.success("已上传");
+      load();
+      onChanged();
+    } catch (e) {
+      toast.error(`上传失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveCaption(eid: number) {
+    try {
+      await api.updateEvidence(id, String(eid), { caption });
+      setEditing(null);
+      load();
+    } catch (e) {
+      toast.error(`保存失败：${(e as Error).message}`);
+    }
+  }
+
+  async function remove(eid: number) {
+    if (!window.confirm("删除这张截图？文件会一并移除。")) return;
+    try {
+      await api.deleteEvidence(id, String(eid));
+      load();
+      onChanged();
+    } catch (e) {
+      toast.error(`删除失败：${(e as Error).message}`);
+    }
+  }
+
+  const steps = finding.reproduction?.steps?.length ?? 0;
+
+  return (
+    <Card>
+      <CardHeader className="flex-row items-center justify-between">
+        <CardTitle className="text-sm">证据截图</CardTitle>
+        <div className="flex items-center gap-2">
+          <select
+            className="h-8 rounded-md border bg-transparent px-2 text-xs"
+            value={step}
+            onChange={(e) => setStep(Number(e.target.value))}
+          >
+            <option value={0}>总览（不归属步骤）</option>
+            {Array.from({ length: steps }, (_, i) => (
+              <option key={i + 1} value={i + 1}>
+                步骤 {i + 1}
+              </option>
+            ))}
+          </select>
+          <label className="inline-flex">
+            <input
+              type="file"
+              accept="image/png,image/jpeg,image/gif"
+              className="hidden"
+              disabled={busy}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void upload(f);
+                e.target.value = "";
+              }}
+            />
+            <Button size="sm" variant="outline" asChild disabled={busy}>
+              <span>上传截图</span>
+            </Button>
+          </label>
+        </div>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        {items.length === 0 ? (
+          <p className="text-muted-foreground text-sm">
+            还没有截图。报告里图文对照最容易让客户确认问题真实存在。
+          </p>
+        ) : (
+          items.map(({ evidence, url }) => (
+            <div key={evidence.id} className="flex flex-col gap-1 rounded-md border p-2">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={url}
+                alt={evidence.caption || evidence.filename}
+                className="max-h-72 w-full rounded object-contain"
+              />
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  {editing === evidence.id ? (
+                    <div className="flex gap-1">
+                      <Input className="h-7 text-xs" value={caption} onChange={(e) => setCaption(e.target.value)} />
+                      <Button size="sm" variant="outline" onClick={() => saveCaption(evidence.id)}>
+                        保存
+                      </Button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      className="truncate text-left text-xs hover:underline"
+                      onClick={() => {
+                        setEditing(evidence.id);
+                        setCaption(evidence.caption);
+                      }}
+                    >
+                      {evidence.caption || "（无图注）"}
+                    </button>
+                  )}
+                  <div className="text-muted-foreground text-[11px]">
+                    {evidence.step_index > 0 ? `步骤 ${evidence.step_index}` : "总览"} · {evidence.width}×
+                    {evidence.height} · {Math.round(evidence.bytes / 1024)} KB
+                  </div>
+                </div>
+                <Button variant="ghost" size="icon" aria-label="删除" onClick={() => remove(evidence.id)}>
+                  <Trash2Icon className="size-4" />
+                </Button>
+              </div>
+            </div>
+          ))
+        )}
+      </CardContent>
+    </Card>
+  );
 }
 
 // EnrichmentCard 展示 AI 富化的结构化交付字段（CVSS / 描述 / 影响 / 修复 / 复现步骤）。
@@ -593,6 +747,7 @@ function FindingDetailInner() {
                 </CardContent>
               </Card>
               <EnrichmentCard finding={finding} onChanged={load} />
+              <EvidenceCard finding={finding} onChanged={load} />
               <ReportFieldsCard finding={finding} onSaved={setFinding} />
               <ReproductionCard finding={finding} onSaved={setFinding} />
               <FindingRetestPanel key={id} findingId={id} readOnly={finding.inherited} onCompleted={load} />

@@ -38,6 +38,8 @@ import type {
   AuditLog,
   EnrichJob,
   FindingEnrichment,
+  FindingEvidenceEntry,
+  FindingEvidenceItem,
   KnowledgeConfig,
   KnowledgeDoc,
   RBACMe,
@@ -1490,6 +1492,29 @@ export const api = {
   // per-agent 绑定 / 轮询 / 中断消耗都覆盖）。
   tokensByModel: (task: string) =>
     get<{ models: ModelTokenStat[] }>(`/llm/records/by-model?task=${encodeURIComponent(task)}`),
+
+  // ---- 漏洞证据截图 ----
+  evidence: (findingId: string) =>
+    get<{ items: FindingEvidenceEntry[] }>(`/findings/${encodeURIComponent(findingId)}/evidence`).then((r) =>
+      arr(r.items),
+    ),
+  uploadEvidence: (findingId: string, file: File, opts: { caption?: string; step_index?: number } = {}) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    if (opts.caption) fd.append("caption", opts.caption);
+    if (opts.step_index) fd.append("step_index", String(opts.step_index));
+    return http<{ evidence: FindingEvidenceItem; url: string }>(`/findings/${encodeURIComponent(findingId)}/evidence`, {
+      method: "POST",
+      body: fd,
+    });
+  },
+  updateEvidence: (findingId: string, id: string, p: { caption?: string; step_index?: number; sort_order?: number }) =>
+    put<{ ok: boolean }>(`/findings/${encodeURIComponent(findingId)}/evidence/${encodeURIComponent(id)}`, p),
+  deleteEvidence: (findingId: string, id: string) =>
+    del<{ deleted: number }>(`/findings/${encodeURIComponent(findingId)}/evidence/${encodeURIComponent(id)}`),
+  // 图片 URL 直接给 <img src>（同源，cookie 鉴权）
+  evidenceURL: (findingId: string, filename: string) =>
+    `/api/findings/${encodeURIComponent(findingId)}/evidence/${encodeURIComponent(filename)}`,
 
   // ---- 漏洞 AI 富化 ----
   // 返回 202 + analyzing；用 enrichStatus 轮询。重复点击会复用正在跑的 job。

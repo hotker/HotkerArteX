@@ -1821,3 +1821,23 @@ export interface EnrichJob {
   started_at?: string;
   ended_at?: string;
 }
+
+// ---- 漏洞证据截图 ----
+// 文件存服务器 evidence/<finding_id>/；url 走 cookie 鉴权（<img> 无法带 Authorization）。
+export interface FindingEvidenceItem {
+  id: number;
+  finding_id: number;
+  filename: string;
+  caption: string;
+  step_index: number; // 0 = 总览；>0 = 归属于第 N 个复现步骤
+  sort_order: number;
+  width: number;
+  height: number;
+  bytes: number;
+  created_at: string;
+}
+
+export interface FindingEvidenceEntry {
+  evidence: FindingEvidenceItem;
+  url: string;
+}

@@ -2,6 +2,45 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [3.4.0] - 2026-11-14
+
+### 新增
+
+- **漏洞证据截图**：`finding_evidence` 表 + `evidence` 包（内容级校验与重编码）+
+  上传/列表/编辑/删除/取图五条 API。文件落 `<dataDir>/evidence/<finding_id>/`，
+  库行只存元数据（文件名/图注/步骤归属/尺寸）—— 几 MB 的 PNG 进库会让备份与迁移全变慢。
+- **报告内嵌图片**：`report/docx.go` 现在会打包 `word/media/*`、注册 `[Content_Types]`、
+  写 `document.xml.rels` 关系、并在正文生成 `<w:drawing>`（含 EMU 尺寸换算）。
+  图按 `step_index` 归属到复现步骤之后，图文对照；未归属的放在复现过程末尾，一张不丢。
+- **详情页证据面板**：按步骤上传、改图注、删除，显示尺寸/大小。
+
+### 安全基线（上传点不能成为恶意文件入口）
+
+- **不信扩展名与客户端 MIME**：按内容识别 → `DecodeConfig` 看尺寸（挡解压炸弹，先于
+  整幅解码）→ 整幅解码 → **重编码**后落盘。重编码会丢弃尾部追加内容、EXIF（含 GPS）、
+  polyglot 结构 —— "校验通过就存"做不到这一点，而这是安全平台的上传点。
+- 取图响应固定图片 Content-Type + `X-Content-Type-Options: nosniff` + `inline`，
+  文件名过 `filepath.Base` 与 `IsLocal`（防穿越）。三道一起才挡得住"图片扩展名里塞 HTML"。
+
+### 尺寸计算
+
+EMU 换算为 1pt = 12700 EMU；默认目标宽 420pt（A4 正文合适），**高度按像素比推算、
+绝不拉伸**——截图被拉变形等于证据失真。缺像素尺寸时退回 3:2 而不是除零。
+
+### 测试
+
+- `evidence/image_test.go`：尾部追加 PHP 载荷被重编码丢弃、非图片全拒、头部尺寸超限在
+  解码前拒绝、jpeg 保持 jpg。
+- `report/docx_image_test.go`：媒体部件数、Content_Types 注册、rels 关系数、
+  `<w:drawing>` 数量、**EMU 宽高比**（800x400 → cx 正好是 cy 的两倍）、
+  二进制不进 document.xml、无图时不产生任何 media 部件。
+- `server/finding_evidence_test.go`：上传→列表→取图→删除（含盘上文件清理）、
+  图注从复现步骤自动派生、路径穿越被挡、非图片 400、报告装配按步骤分组。
+- 实机联调：上传 → cookie 取图（`image/png` + nosniff）→ 生成报告 → python-docx 读回
+  `inline_shapes=1`、`5.83×2.92 in`、`word/media/evidence-s0-1.png` 存在、图注在正文里。
+
+版本 3.3.0 → 3.4.0
+
 ## [3.3.0] - 2026-11-14
 
 ### 新增

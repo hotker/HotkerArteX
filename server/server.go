@@ -930,6 +930,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/settings/web-search/test", s.testWebSearch)
 	mux.HandleFunc("GET /api/report", s.getReport)
 
+	// --- 漏洞证据截图（上传/列表/编辑/删除/取图）---
+	mux.HandleFunc("POST /api/findings/{id}/evidence", s.uploadFindingEvidence)
+	mux.HandleFunc("GET /api/findings/{id}/evidence", s.listFindingEvidence)
+	mux.HandleFunc("GET /api/findings/{id}/evidence/{file}", s.serveFindingEvidence)
+	mux.HandleFunc("PUT /api/findings/{id}/evidence/{eid}", s.updateFindingEvidence)
+	mux.HandleFunc("DELETE /api/findings/{id}/evidence/{eid}", s.deleteFindingEvidence)
+
 	// --- 漏洞 AI 富化（结构化交付字段）---
 	mux.HandleFunc("POST /api/findings/{id}/enrich", s.findingEnrich)
 	mux.HandleFunc("GET /api/findings/{id}/enrich/status", s.findingEnrichStatus)
