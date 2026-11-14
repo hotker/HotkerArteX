@@ -1130,6 +1130,31 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS reproduction    JSONB;
 -- 组织级报告设置：单行表（id 恒为 true），存出具方/客户/密级/默认语言/署名人员/版本。
 
 
+
+-- 漏洞富化：AI 生成 / 人工编辑的结构化覆盖层，键为「独立漏洞记录 id」（findings.id）。
+-- 为什么不改 findings 表：findings 是 worker 的原始产出（graph_overview 每轮都会读），
+-- 把叙述性正文与 CVSS 结构塞进去会让图谱膨胀；富化是交付层的东西，独立成表更干净。
+-- 也不用 node_id 做键：独立 findings 行才是报告与权限体系的句柄。
+CREATE TABLE IF NOT EXISTS finding_enrichment (
+    finding_id    BIGINT PRIMARY KEY REFERENCES findings(id) ON DELETE CASCADE,
+    name          TEXT NOT NULL DEFAULT '',
+    target        TEXT NOT NULL DEFAULT '',
+    module        TEXT NOT NULL DEFAULT '',
+    severity      TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'open',
+    cvss_score    DOUBLE PRECISION NOT NULL DEFAULT 0,
+    cvss_vector   TEXT NOT NULL DEFAULT '',
+    cvss_metrics  JSONB NOT NULL DEFAULT '{}'::jsonb,
+    description   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    test_process  JSONB NOT NULL DEFAULT '[]'::jsonb,
+    risk_analysis JSONB NOT NULL DEFAULT '[]'::jsonb,
+    remediation   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    source        TEXT NOT NULL DEFAULT 'ai',      -- ai | manual
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_finding_enrichment_updated ON finding_enrichment(updated_at DESC);
+
 -- =====================================================================
 -- U. 多用户权限（RBAC）：用户 / 角色 / 权限 / 授权
 -- =====================================================================

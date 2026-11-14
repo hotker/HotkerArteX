@@ -26,7 +26,7 @@ import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ApiError, api } from "@/lib/api";
 import { statusMeta } from "@/lib/status";
-import type { Finding, FindingStatus, ReproStep, Reproduction, Severity } from "@/lib/types";
+import type { EnrichJob, Finding, FindingStatus, ReproStep, Reproduction, Severity } from "@/lib/types";
 
 import { FindingLineageView } from "./lineage";
 
@@ -45,6 +45,137 @@ const FINDING_STATUSES: FindingStatus[] = [
 
 function fmtTime(ts: string) {
   return new Date(ts).toLocaleString("zh-CN");
+}
+
+// EnrichmentCard 展示 AI 富化的结构化交付字段（CVSS / 描述 / 影响 / 修复 / 复现步骤）。
+//
+// 复现步骤来自真实证据（agent 就地记录的 reproduction），不是模型复述 —— 所以这里
+// 与报告里看到的内容完全一致。AI 只负责"改写散文"，这也是富化快而稳的原因。
+function EnrichmentCard({ finding, onChanged }: { finding: Finding; onChanged: () => void }) {
+  const id = finding.finding_id || finding.id;
+  const [job, setJob] = React.useState<EnrichJob | null>(null);
+  const [running, setRunning] = React.useState(false);
+
+  const load = React.useCallback(() => {
+    void api
+      .getEnrichment(id)
+      .then((r) => setJob({ status: r.enriched ? "done" : "idle", result: r.enrichment ?? undefined }))
+      .catch(() => setJob({ status: "idle" }));
+  }, [id]);
+  React.useEffect(() => {
+    load();
+  }, [load]);
+
+  // 轮询：analyzing 期间每 1.5s 取一次，直到 done/failed。
+  React.useEffect(() => {
+    if (job?.status !== "analyzing") return;
+    const timer = window.setInterval(() => {
+      void api.enrichStatus(id).then((j) => {
+        setJob(j);
+        if (j.status === "done") {
+          setRunning(false);
+          onChanged();
+        }
+        if (j.status === "failed") setRunning(false);
+      });
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [job?.status, id, onChanged]);
+
+  async function run() {
+    setRunning(true);
+    try {
+      const j = await api.enrichFinding(id, document.documentElement.lang || "zh-CN");
+      setJob(j);
+    } catch (e) {
+      setRunning(false);
+      toast.error(`AI 分析失败：${(e as Error).message}`);
+    }
+  }
+
+  const e = job?.result;
+
+  return (
+    <Card>
+      <CardHeader className="flex-row items-center justify-between">
+        <CardTitle className="text-sm">AI 结构化分析</CardTitle>
+        <Button size="sm" variant="outline" onClick={run} disabled={running || job?.status === "analyzing"}>
+          {job?.status === "analyzing" ? "分析中…" : e ? "重新分析" : "AI 分析"}
+        </Button>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        {job?.status === "failed" && (
+          <p className="rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs">
+            分析失败：{job.error}
+          </p>
+        )}
+        {!e && job?.status !== "analyzing" && job?.status !== "failed" && (
+          <p className="text-muted-foreground text-sm">
+            尚未做结构化分析。点「AI 分析」会生成 CVSS、描述、影响与修复建议（复现步骤由真实证据直接渲染）。
+          </p>
+        )}
+        {e && (
+          <>
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              {e.cvss_score > 0 && (
+                <Badge variant="secondary" className="font-mono">
+                  CVSS {e.cvss_score.toFixed(1)}
+                </Badge>
+              )}
+              {e.cvss_vector && (
+                <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px]">{e.cvss_vector}</code>
+              )}
+              <Badge variant="outline">{e.source === "ai" ? "AI 生成" : "人工编辑"}</Badge>
+              {e.module && <span className="text-muted-foreground">模块：{e.module}</span>}
+              {e.target && <span className="text-muted-foreground">目标：{e.target}</span>}
+            </div>
+            {e.description.length > 0 && (
+              <div className="text-sm leading-relaxed">
+                {e.description.map((d, i) => (
+                  <p key={i}>{d}</p>
+                ))}
+              </div>
+            )}
+            {e.risk_analysis.length > 0 && (
+              <div>
+                <div className="mb-1 font-medium text-xs">影响</div>
+                <ul className="list-disc pl-5 text-sm">
+                  {e.risk_analysis.map((d, i) => (
+                    <li key={i}>{d}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {e.remediation.length > 0 && (
+              <div>
+                <div className="mb-1 font-medium text-xs">修复建议</div>
+                <ul className="list-disc pl-5 text-sm">
+                  {e.remediation.map((d, i) => (
+                    <li key={i}>{d}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {e.test_process.length > 0 && (
+              <div>
+                <div className="mb-1 font-medium text-xs">复现步骤（真实证据）</div>
+                {e.test_process.map((st, i) => (
+                  <div key={i} className="mb-1 flex flex-col gap-1">
+                    <div className="text-xs text-muted-foreground">步骤 {i + 1}{st.expected ? ` · ${st.expected}` : ""}</div>
+                    {st.request && (
+                      <pre className="max-h-40 overflow-auto rounded bg-muted px-2 py-1 font-mono text-[11px] whitespace-pre-wrap">
+                        {st.request}
+                      </pre>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
 }
 
 // ReproductionCard 展示/编辑结构化复现过程：入口 → 前置 → 逐步（请求/响应/预期/证明）→ 来源。
@@ -461,6 +592,7 @@ function FindingDetailInner() {
                   <p className="text-sm leading-relaxed whitespace-pre-wrap">{finding.summary || "（无摘要）"}</p>
                 </CardContent>
               </Card>
+              <EnrichmentCard finding={finding} onChanged={load} />
               <ReportFieldsCard finding={finding} onSaved={setFinding} />
               <ReproductionCard finding={finding} onSaved={setFinding} />
               <FindingRetestPanel key={id} findingId={id} readOnly={finding.inherited} onCompleted={load} />

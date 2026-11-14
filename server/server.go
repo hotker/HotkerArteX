@@ -54,6 +54,10 @@ type Server struct {
 
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
+	// enrichMu / enrichJobsMap：漏洞 AI 富化的在跑任务表（每次点击的进度，非持久数据）。
+	enrichMu      sync.Mutex
+	enrichJobsMap map[int64]*enrichJob
+
 	// tokenGen is the current JWT generation, mirrored in memory from the
 	// auth.token_gen setting (loaded at startup). Each token embeds the gen it was
 	// signed under; bumping it on password change revokes every older token. 0 is
@@ -925,6 +929,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/notify/deliveries/{id}/retry", s.notifyRetryDelivery)
 	mux.HandleFunc("POST /api/settings/web-search/test", s.testWebSearch)
 	mux.HandleFunc("GET /api/report", s.getReport)
+
+	// --- 漏洞 AI 富化（结构化交付字段）---
+	mux.HandleFunc("POST /api/findings/{id}/enrich", s.findingEnrich)
+	mux.HandleFunc("GET /api/findings/{id}/enrich/status", s.findingEnrichStatus)
+	mux.HandleFunc("GET /api/findings/{id}/enrichment", s.getFindingEnrichment)
+	mux.HandleFunc("PUT /api/findings/{id}/enrichment", s.updateFindingEnrichment)
 
 	// --- 多用户权限（RBAC）：身份 / 用户 / 角色 / 权限目录 ---
 	mux.HandleFunc("GET /api/rbac/me", s.rbacMe)

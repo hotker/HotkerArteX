@@ -2,6 +2,45 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [3.3.0] - 2026-11-14
+
+### 新增
+
+- **漏洞 AI 富化（结构化交付字段）**：`finding_enrichment` 表以**独立漏洞记录 id** 为键，
+  存 `cvss_score / cvss_vector / cvss_metrics / description[] / risk_analysis[] / remediation[]`。
+  与原始 findings 分离：findings 是 worker 的原始产出（planner 每轮都读，塞正文会让图谱膨胀），
+  富化是交付层，谁写的（ai/manual）也记在 `source` 上。
+- **异步 job + 状态轮询**：`POST /api/findings/{id}/enrich` 立即返回 202 `analyzing`，
+  `GET .../enrich/status` 轮询；重复点击**复用**正在跑的 job，不会并发打两次。
+  job 只存内存（是"这次点击的进度"），结果落库 —— 重启后 status 会从库里读回 done。
+- **人工局部编辑**：`PUT /api/findings/{id}/enrichment`，空字段**保留原值**（改状态不该把
+  AI 写好的 name/target 冲掉），源标记翻为 `manual`。
+- **报告读富化**：标题/描述/影响/修复/CVSS 逐字段优先取富化，缺失回落原始字段 ——
+  一份报告里不会出现半条空白漏洞。
+
+### 与上游的关键分野：不生成测试步骤
+
+上游（v2.0.3）把 `test_process` 也交给模型生成。这里**把它从模型职责里拿掉**：
+报告的「复现过程」由 `findings.reproduction`（agent 就地记录的真实步骤）或原始 PoC 渲染，
+页面与报告用的是同一份证据。让模型复述请求/响应既慢又容易编，而"编出来的复现步骤"
+正是报告最容易失真的地方。模型只负责改写散文（标题/描述/影响/修复 + CVSS 三要素）。
+
+### 稳健性
+
+- 解析容错：容忍 ```json 围栏与前后夹话；CVSS 向量形状不对（不以 `AV:` 开头 / 无 `:`）一律丢弃，
+  宁可没有也不在报告里放一个假值；分数夹到 0..10。
+- 没配 LLM 时 job 干净地 `failed` 并给出可读原因（实机联调时曾因状态返回顺序问题一直卡
+  `analyzing`，已修：analyzing → failed → 持久结果 → idle）。
+
+### 测试
+
+- `report/enrich_test.go`：四种模型输出形态解析、假向量丢弃、分数夹逼、全空结果判定、
+  提示词必须禁止编造步骤、长证据按 rune 截断。
+- `server/findings_enrich_test.go`：落库往返 + 报告合并优先富化、局部更新保留 AI 字段、
+  无 LLM 时干净失败、状态回落持久结果、路由在真实中间件链下可达。
+
+版本 3.2.0 → 3.3.0
+
 ## [3.2.0] - 2026-11-14
 
 ### 新增

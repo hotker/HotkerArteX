@@ -222,6 +222,13 @@ func (s *Server) toReportFindings(fs []*db.DBFinding) []report.Finding {
 		ids = append(ids, f.AssetIDs...)
 	}
 	assets := s.resolveAssetIDs(ids)
+	// 富化（AI 生成 / 人工编辑的结构化字段）优先于原始字段：报告要的是交付口吻，
+	// 而不是 worker 写回的一句话摘要。没有富化就原样用原始字段，绝不因为"没富化"而空着。
+	var fids []int64
+	for _, f := range fs {
+		fids = append(fids, f.ID)
+	}
+	enrich, _ := s.m.pg.GetFindingEnrichments(fids)
 	for _, f := range fs {
 		rf := report.Finding{
 			ID: f.ID, Name: f.Name, VulnClass: f.VulnClass, Severity: f.Severity,
@@ -243,6 +250,37 @@ func (s *Server) toReportFindings(fs []*db.DBFinding) []report.Finding {
 			if p := strings.TrimSpace(r.Provenance); p != "" {
 				// 来源并进"详细说明"之前不合适 —— 单独一段更清楚，用 Evidence 承载会误导。
 				rf.Provenance = p
+			}
+		}
+		// 富化覆盖：标题 / 描述 / 影响 / 修复 / CVSS。逐字段取"有富化就用富化"，
+		// 缺失的仍回落到原始字段 —— 一份报告里不该出现半条空白漏洞。
+		if e := enrich[f.ID]; e != nil {
+			if e.Name != "" {
+				rf.Name = e.Name
+			}
+			var desc, risk, rem []string
+			_ = json.Unmarshal(e.Description, &desc)
+			_ = json.Unmarshal(e.RiskAnalysis, &risk)
+			_ = json.Unmarshal(e.Remediation, &rem)
+			if len(desc) > 0 {
+				rf.Summary = strings.Join(desc, "\n\n")
+			}
+			if len(risk) > 0 {
+				rf.Impact = strings.Join(risk, "\n")
+			}
+			if len(rem) > 0 {
+				rf.Remediation = strings.Join(rem, "\n")
+			}
+			if e.CVSSVector != "" {
+				rf.CVSS = fmt.Sprintf("%.1f · %s", e.CVSSScore, e.CVSSVector)
+			} else if e.CVSSScore > 0 {
+				rf.CVSS = fmt.Sprintf("%.1f", e.CVSSScore)
+			}
+			if e.Severity != "" {
+				rf.Severity = e.Severity
+			}
+			if e.Target != "" && rf.EntryPoint == "" {
+				rf.EntryPoint = e.Target
 			}
 		}
 		for _, aid := range f.AssetIDs {

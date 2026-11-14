@@ -1784,3 +1784,40 @@ export interface AuditLog {
   message: string;
   detail?: Record<string, unknown>;
 }
+
+// ---- 漏洞 AI 富化（结构化交付字段）----
+// test_process 不由模型生成：它来自 findings.reproduction（agent 就地记录）或原始 PoC，
+// 与报告渲染完全一致 —— 页面看到的步骤就是报告里的步骤。
+
+export interface EnrichmentStep {
+  request?: string;
+  response?: string;
+  expected?: string;
+  proves?: string;
+}
+
+export interface FindingEnrichment {
+  finding_id: number;
+  name: string;
+  target: string;
+  module: string;
+  severity: string;
+  status: string;
+  cvss_score: number;
+  cvss_vector: string;
+  cvss_metrics: Record<string, string>;
+  description: string[];
+  test_process: EnrichmentStep[];
+  risk_analysis: string[];
+  remediation: string[];
+  source: "ai" | "manual";
+  updated_at?: string;
+}
+
+export interface EnrichJob {
+  status: "idle" | "analyzing" | "done" | "failed";
+  error?: string;
+  result?: FindingEnrichment;
+  started_at?: string;
+  ended_at?: string;
+}

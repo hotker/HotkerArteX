@@ -36,6 +36,8 @@ import type {
   DeleteTaskResult,
   GenerateReportInput,
   AuditLog,
+  EnrichJob,
+  FindingEnrichment,
   KnowledgeConfig,
   KnowledgeDoc,
   RBACMe,
@@ -1488,6 +1490,20 @@ export const api = {
   // per-agent 绑定 / 轮询 / 中断消耗都覆盖）。
   tokensByModel: (task: string) =>
     get<{ models: ModelTokenStat[] }>(`/llm/records/by-model?task=${encodeURIComponent(task)}`),
+
+  // ---- 漏洞 AI 富化 ----
+  // 返回 202 + analyzing；用 enrichStatus 轮询。重复点击会复用正在跑的 job。
+  enrichFinding: (id: string, lang?: string) =>
+    post<EnrichJob>(`/findings/${encodeURIComponent(id)}/enrich${lang ? `?lang=${encodeURIComponent(lang)}` : ""}`),
+  enrichStatus: (id: string) => get<EnrichJob>(`/findings/${encodeURIComponent(id)}/enrich/status`),
+  // 直接读持久化结果（不触发生成）
+  getEnrichment: (id: string) =>
+    get<{ enrichment: FindingEnrichment | null; enriched: boolean }>(`/findings/${encodeURIComponent(id)}/enrichment`),
+  // 人工改结构化字段（空值保留原值）
+  updateEnrichmentFields: (
+    id: string,
+    p: { name?: string; target?: string; severity?: string; status?: string },
+  ) => put<{ enrichment: FindingEnrichment | null }>(`/findings/${encodeURIComponent(id)}/enrichment`, p),
 
   // ---- 多用户权限（RBAC）----
   rbacMe: () => get<RBACMe>("/rbac/me"),
