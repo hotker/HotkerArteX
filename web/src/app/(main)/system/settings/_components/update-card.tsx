@@ -59,6 +59,7 @@ export function UpdateCard() {
         if (!quiet) {
           if (r.error) toast.error("检查更新失败：" + r.error);
           else if (r.has_update) toast.success(`发现新版本 ${r.latest}`);
+          else if (r.ahead) toast.info(`本地 ${r.current} 高于线上 ${r.latest}，无法比对更新`);
           else if (r.comparable) toast.success("当前已是最新版本");
         }
       })
@@ -289,10 +290,18 @@ export function UpdateCard() {
           </p>
         )}
 
-        {info && !info.has_update && info.comparable && !info.error && (
+        {info && !info.has_update && info.comparable && !info.error && !info.ahead && (
           <p className="flex items-center gap-2 text-xs text-muted-foreground">
             <CheckCircle2Icon className="size-3.5 text-emerald-600" />
             当前已是最新版本。
+          </p>
+        )}
+
+        {info?.ahead && (
+          <p className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-400">
+            <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+            本地版本高于 GitHub 上的最新发布：线上还没有这个版本的发布包，无法比对是否有更新。
+            若刚发布过，请确认 tag 与 release 资产已上传。
           </p>
         )}
 

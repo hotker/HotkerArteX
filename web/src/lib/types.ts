@@ -1597,6 +1597,9 @@ export interface UpdateCheck {
   asset_available?: boolean;
   size?: number;
   has_update?: boolean;
+  /** 本地版本高于线上最新发布（发布流程没跟上，或跑的是自编译的正式版号）。
+   *  true 时不能显示"已是最新"，否则运维会误以为线上也是这版而漏掉发版。 */
+  ahead?: boolean;
   /** 双方版本号是否可比较；开发构建为 false，此时禁用一键更新。 */
   comparable?: boolean;
   /** comparable 为 false 时的说明。 */

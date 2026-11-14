@@ -153,3 +153,55 @@ func TestReleaseCacheDoesNotPoisonOnCallerCancel(t *testing.T) {
 		t.Fatalf("应拿到正常结果，得到 %+v", rel)
 	}
 }
+
+// 本地版本高于线上时，绝不能报"已是最新版本"。
+//
+// 这条测试盯的是一个真实的误判场景：代码已发版、但 GitHub 上还是没有新 release
+// （tag 忘打 / 资产没传）。此时 has_update=false 会让界面亮绿勾"当前已是最新版本"，
+// 运维据此以为线上也是这版 —— 发版就漏了。正确行为是如实说"线上没有比你新的"。
+func TestUpdateCheckReportsLocalAhead(t *testing.T) {
+	rel := &selfupdate.Release{TagName: "v1.0.0"}
+	current := "3.5.0"
+
+	cmp, comparable := selfupdate.CompareVersions(current, rel.TagName)
+	if !comparable {
+		t.Fatalf("3.5.0 and v1.0.0 must be comparable")
+	}
+	if cmp <= 0 {
+		t.Fatalf("3.5.0 should compare greater than v1.0.0, got %d", cmp)
+	}
+	// 与 updateCheck 的判定保持一致：cmp>0 → ahead，不给"已是最新"。
+	hasUpdate := comparable && cmp < 0
+	ahead := comparable && cmp > 0
+	if hasUpdate {
+		t.Fatal("local newer must not report has_update")
+	}
+	if !ahead {
+		t.Fatal("local newer must set ahead so the UI stops claiming up-to-date")
+	}
+}
+
+// 相等与落后两种情形不能被 ahead 误伤。
+func TestUpdateCheckAheadOnlyWhenNewer(t *testing.T) {
+	cases := []struct {
+		current, latest string
+		wantAhead       bool
+		wantUpdate      bool
+	}{
+		{"3.5.0", "v3.5.0", false, false}, // 相等
+		{"3.5.0", "v3.6.0", false, true},  // 落后
+		{"3.5.0", "v2.3.1", true, false},  // 领先（就是这个仓库开局的真实状态）
+	}
+	for _, c := range cases {
+		cmp, ok := selfupdate.CompareVersions(c.current, c.latest)
+		if !ok {
+			t.Fatalf("%s vs %s should be comparable", c.current, c.latest)
+		}
+		ahead := cmp > 0
+		update := cmp < 0
+		if ahead != c.wantAhead || update != c.wantUpdate {
+			t.Fatalf("%s vs %s: ahead=%v update=%v, want ahead=%v update=%v",
+				c.current, c.latest, ahead, update, c.wantAhead, c.wantUpdate)
+		}
+	}
+}

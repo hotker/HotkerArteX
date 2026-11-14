@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -259,6 +260,18 @@ func (s *Server) updateCheck(w http.ResponseWriter, r *http.Request) {
 		// 开发构建（dev / git describe 带后缀）没有可比较的版本号。放行只会
 		// 用正式版覆盖掉本地正在调试的二进制，所以直接不给更新。
 		out["reason"] = fmt.Sprintf("当前版本 %q 不是正式发布版本，已禁用一键更新", current)
+	} else if cmp > 0 {
+		// 本地比线上新。三种情况都会走到这里，而它们的处置完全不同：
+		//   1. 发布流程没跟上（代码已发版但没打 tag / 没传 release）—— 最常见；
+		//   2. 跑的是自己编译的正式版号（比如手工改成 9.9.9）；
+		//   3. 从线上版本回退过。
+		// 无论哪种，都不能说"当前已是最新版本"：那句绿勾会让运维误以为线上也是这版，
+		// 从而漏掉发版。必须如实说明"线上没有比你新的版本"。
+		out["ahead"] = true
+		out["reason"] = fmt.Sprintf(
+			"本地版本 %s 高于 GitHub 上的最新发布 %s：线上还没有对应这个版本的发布包，"+
+				"因此无法通过一键更新比对。若是刚发布，请确认 tag 与 release 资产已上传。",
+			current, strings.TrimPrefix(latest, "v"))
 	}
 	writeJSON(w, 200, out)
 }
