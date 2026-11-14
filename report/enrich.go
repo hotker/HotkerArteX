@@ -182,3 +182,112 @@ func clipRunes(s string, max int) string {
 // CompleteText 是富化 / 报告叙述共用的"一次性文本补全"。
 // 用接口而不是具体 provider，让 report 包不依赖 server 的选路逻辑。
 type CompleteFunc func(ctx context.Context, system, user string, maxTokens int) (string, error)
+
+// ---------------------------------------------------------------------------
+// 会话漏洞补录（extract-findings）
+// ---------------------------------------------------------------------------
+
+// ExtractedFinding 是一条从会话记录里"补录"出来的漏洞。
+//
+// 场景：agent 跑完一轮，报告发现漏了东西 —— 可能是它只在回复里提了一句、或在探索图里
+// 记了 fact 却没升级成 finding。这时把转录 + 已记录事实一起喂给模型，让它把"确实已经
+// 验证过、但没落库"的漏洞补出来。
+//
+// 关键约束：只补**已验证**的，不许推测。所以要求模型给出 evidence（转录里的原文依据），
+// 并由调用方做去重（同名/同类型 + 同目标已经存在的，不重复补）。
+type ExtractedFinding struct {
+	VulnClass string   `json:"vulnclass"`
+	Name      string   `json:"name"`
+	Severity  string   `json:"severity"`
+	Summary   string   `json:"summary"`
+	Evidence  string   `json:"evidence"`
+	Target    string   `json:"target"`
+	Assets    []string `json:"assets"`
+}
+
+// ExtractSystemPrompt 是补录的系统提示。
+func ExtractSystemPrompt() string {
+	return "你是渗透测试的交付整理员。你的任务是从一轮测试的会话记录里，找出【已经实际验证过、" +
+		"但还没有被记录成漏洞】的问题，把它们补录成结构化漏洞条目。严格只输出 JSON，不要 markdown 代码块。" +
+		"绝不能凭推测补录：没有证据支撑的一律不要。"
+}
+
+// ExtractUserPrompt 拼补录指令。existing 是已落库漏洞的"类型+名称"清单，用来去重。
+func ExtractUserPrompt(transcript, facts, existing string, lang string) string {
+	var b strings.Builder
+	b.WriteString("下面是这一轮渗透测试的会话记录与探索图里已记录的事实。请找出其中【已被实际验证、但没有被记录成漏洞】的问题。\n\n")
+	b.WriteString("=== 会话记录 ===\n")
+	b.WriteString(clipRunes(transcript, 40000))
+	if strings.TrimSpace(facts) != "" {
+		b.WriteString("\n\n=== 探索图已记录的事实（可能含未升级成漏洞的暴露/信息泄露）===\n")
+		b.WriteString(clipRunes(facts, 8000))
+	}
+	if strings.TrimSpace(existing) != "" {
+		b.WriteString("\n\n=== 已经记录的漏洞（这些不要重复补录）===\n")
+		b.WriteString(existing)
+	}
+	b.WriteString(`
+补录规则（宁可少补，不可乱补）：
+- 只补有【实际请求/响应、命令输出、或明确的界面现象】支撑的问题；只是"可能"、"建议进一步测试"的一律不补。
+- evidence 必须引用转录里的真实片段（请求行、响应片段、输出），不要自己编造。
+- name 是规范的中文漏洞名（10-26 字）；severity 只能是 critical/high/medium/low。
+- vulnclass 是简短类型（如 SQL注入 / 越权 / 未授权访问 / 信息泄露 / 文件上传）。
+- target 填受影响的 host 或 URL；无法确定留空字符串。
+- assets 列出涉及的域名/IP（可为空数组）。
+- 如果确实没有新东西可补，返回 {"findings":[]}。
+
+只输出 JSON：{"findings":[{"vulnclass":"...","name":"...","severity":"high","summary":"...","evidence":"...","target":"...","assets":["..."]}]}`)
+	if dir := langDirective(lang); dir != "" {
+		b.WriteString("\n\n输出语言要求：" + dir)
+	}
+	return b.String()
+}
+
+// ParseExtracted 解析补录结果并做基本清洗（严重度归一、必填校验）。
+func ParseExtracted(raw string) ([]ExtractedFinding, error) {
+	var wrap struct {
+		Findings []ExtractedFinding `json:"findings"`
+	}
+	s := strings.TrimSpace(raw)
+	s = strings.TrimPrefix(s, "```json")
+	s = strings.TrimPrefix(s, "```")
+	s = strings.TrimSuffix(s, "```")
+	s = strings.TrimSpace(s)
+	if i := strings.Index(s, "{"); i >= 0 {
+		if j := strings.LastIndex(s, "}"); j > i {
+			s = s[i : j+1]
+		}
+	}
+	if err := json.Unmarshal([]byte(s), &wrap); err != nil {
+		return nil, fmt.Errorf("补录结果解析失败: %w", err)
+	}
+	out := make([]ExtractedFinding, 0, len(wrap.Findings))
+	for _, f := range wrap.Findings {
+		f.VulnClass = strings.TrimSpace(f.VulnClass)
+		f.Name = strings.TrimSpace(f.Name)
+		f.Severity = normalizeSeverityAI(f.Severity)
+		f.Summary = strings.TrimSpace(f.Summary)
+		f.Evidence = strings.TrimSpace(f.Evidence)
+		f.Target = strings.TrimSpace(f.Target)
+		// 没有证据的一律丢弃 —— 这是"不许推测"的执行点，不能只写在提示里。
+		if f.Evidence == "" || (f.VulnClass == "" && f.Name == "") {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out, nil
+}
+
+// normalizeSeverityAI 把模型的自由写法归一成四档；认不出就当 medium（并不可怕，人工可改）。
+func normalizeSeverityAI(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "critical", "严重", "致命":
+		return "critical"
+	case "high", "高", "高危":
+		return "high"
+	case "low", "低", "低危", "info", "信息":
+		return "low"
+	default:
+		return "medium"
+	}
+}

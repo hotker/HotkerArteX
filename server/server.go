@@ -930,6 +930,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/settings/web-search/test", s.testWebSearch)
 	mux.HandleFunc("GET /api/report", s.getReport)
 
+	// --- 会话漏洞补录（把转录+事实里漏记的漏洞补出来）---
+	mux.HandleFunc("POST /api/tasks/{id}/extract-findings", s.extractFindings)
+
 	// --- 漏洞证据截图（上传/列表/编辑/删除/取图）---
 	mux.HandleFunc("POST /api/findings/{id}/evidence", s.uploadFindingEvidence)
 	mux.HandleFunc("GET /api/findings/{id}/evidence", s.listFindingEvidence)

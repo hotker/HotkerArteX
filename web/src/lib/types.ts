@@ -1841,3 +1841,17 @@ export interface FindingEvidenceEntry {
   evidence: FindingEvidenceItem;
   url: string;
 }
+
+// ---- 会话漏洞补录（extract-findings）----
+// 只补"转录里确有证据、但没落库"的漏洞；没 evidence 的条目后端已丢弃。
+// duplicate=true 表示与已落库漏洞重复（不会写入），前端可灰显。
+export interface ExtractedFinding {
+  vulnclass: string;
+  name: string;
+  severity: string;
+  summary: string;
+  evidence: string;
+  target: string;
+  assets: string[];
+  duplicate: boolean;
+}

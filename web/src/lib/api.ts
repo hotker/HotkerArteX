@@ -37,6 +37,7 @@ import type {
   GenerateReportInput,
   AuditLog,
   EnrichJob,
+  ExtractedFinding,
   FindingEnrichment,
   FindingEvidenceEntry,
   FindingEvidenceItem,
@@ -1492,6 +1493,14 @@ export const api = {
   // per-agent 绑定 / 轮询 / 中断消耗都覆盖）。
   tokensByModel: (task: string) =>
     get<{ models: ModelTokenStat[] }>(`/llm/records/by-model?task=${encodeURIComponent(task)}`),
+
+  // ---- 会话漏洞补录 ----
+  // dry_run=true 只预览（不落库）；补录出来的漏洞状态是 pending，需人工确认后才进报告。
+  extractFindings: (taskId: string, p: { dry_run?: boolean; lang?: string } = {}) =>
+    post<{ findings: ExtractedFinding[]; created: number; ids?: number[]; dry_run?: boolean }>(
+      `/tasks/${encodeURIComponent(taskId)}/extract-findings`,
+      { dry_run: p.dry_run, lang: p.lang },
+    ),
 
   // ---- 漏洞证据截图 ----
   evidence: (findingId: string) =>

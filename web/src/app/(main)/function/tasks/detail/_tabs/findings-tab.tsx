@@ -4,17 +4,26 @@ import * as React from "react";
 
 import Link from "next/link";
 
-import { ArrowDownIcon, ArrowUpIcon, ArrowUpRightIcon, ChevronRightIcon } from "lucide-react";
+import { ArrowDownIcon, ArrowUpIcon, ArrowUpRightIcon, ChevronRightIcon, SparklesIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger } from "@/components/ui/select";
 import { api } from "@/lib/api";
 import { useStoredSortPreference } from "@/lib/sort-preference";
 import { statusMeta } from "@/lib/status";
-import type { Finding, FindingStatus } from "@/lib/types";
+import type { ExtractedFinding, Finding, FindingStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 type FindingSortField = "time";
@@ -137,8 +146,113 @@ function Row({
   );
 }
 
+// ExtractButton：会话漏洞补录入口。
+//
+// 先 dry_run 预览（不落库），确认了再真正写入 —— AI 补录最容易出的问题是幻觉与重复，
+// 让人先看一眼成本很低。重复项（已落库）灰显且不可选。补录出的漏洞是 pending，
+// 需要人工确认才进报告。
+function ExtractButton({ taskId, onImported }: { taskId: string; onImported: () => void }) {
+  const [open, setOpen] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const [items, setItems] = React.useState<ExtractedFinding[] | null>(null);
+  const [error, setError] = React.useState("");
+
+  async function preview() {
+    setOpen(true);
+    setBusy(true);
+    setError("");
+    setItems(null);
+    try {
+      const r = await api.extractFindings(taskId, { dry_run: true, lang: "zh-CN" });
+      setItems(r.findings);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function commit() {
+    setBusy(true);
+    try {
+      const r = await api.extractFindings(taskId, { dry_run: false, lang: "zh-CN" });
+      toast.success(r.created > 0 ? `已补录 ${r.created} 条漏洞（待确认）` : "没有需要补录的新漏洞");
+      setOpen(false);
+      onImported();
+    } catch (e) {
+      toast.error(`补录失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const fresh = (items ?? []).filter((f) => !f.duplicate).length;
+
+  return (
+    <>
+      <Button size="sm" variant="ghost" className="mr-2 h-7 text-xs" onClick={preview}>
+        <SparklesIcon className="size-3.5" /> 补录遗漏
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="sm:max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>会话漏洞补录</DialogTitle>
+            <DialogDescription>
+              从本任务的会话记录与已记录事实里，找出「已实际验证、但还没落库」的漏洞。
+              只补有请求/响应证据的；与现有漏洞重复的不会写入。补录结果是「待确认」状态。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex max-h-[60vh] flex-col gap-2 overflow-auto py-2">
+            {busy && <p className="text-muted-foreground text-sm">分析中…（读会话与事实，可能要十几秒）</p>}
+            {error && (
+              <p className="rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs">{error}</p>
+            )}
+            {items && items.length === 0 && (
+              <p className="text-muted-foreground text-sm">没有发现遗漏的漏洞。</p>
+            )}
+            {(items ?? []).map((f, i) => (
+              <div
+                key={i}
+                className={`flex flex-col gap-1 rounded-md border p-2 ${f.duplicate ? "opacity-50" : ""}`}
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge variant="secondary" className="text-xs">
+                    {f.severity}
+                  </Badge>
+                  <span className="text-sm font-medium">{f.name || f.vulnclass}</span>
+                  {f.duplicate && (
+                    <Badge variant="outline" className="text-xs">
+                      与已有漏洞重复，不写入
+                    </Badge>
+                  )}
+                </div>
+                {f.summary && <p className="text-xs">{f.summary}</p>}
+                {f.evidence && (
+                  <pre className="max-h-32 overflow-auto rounded bg-muted px-2 py-1 font-mono text-[11px] whitespace-pre-wrap">
+                    {f.evidence}
+                  </pre>
+                )}
+              </div>
+            ))}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOpen(false)}>
+              取消
+            </Button>
+            <Button onClick={commit} disabled={busy || fresh === 0}>
+              {busy ? "处理中…" : `确认补录 ${fresh} 条`}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
 export function FindingsTab({ taskId }: { taskId: string }) {
   const [findings, setFindings] = React.useState<Finding[]>([]);
+  // 补录完成后手动触发一次重载（不必等 3s 轮询）
+  const [reload, setReload] = React.useState(0);
   const [sortPreference, setSortPreference] = useStoredSortPreference(
     FINDING_SORT_PREFERENCE_KEY,
     FINDING_SORT_FIELDS,
@@ -164,7 +278,7 @@ export function FindingsTab({ taskId }: { taskId: string }) {
       active = false;
       clearInterval(t);
     };
-  }, [taskId]);
+  }, [taskId, reload]);
 
   const onStatus = React.useCallback(async (f: Finding, next: FindingStatus) => {
     if (f.inherited || !f.finding_id || next === f.status) return;
@@ -192,6 +306,7 @@ export function FindingsTab({ taskId }: { taskId: string }) {
       <CardContent className="px-0">
         <div className="flex items-center border-b px-4 py-2 text-xs text-muted-foreground">
           <span className="min-w-0 flex-1">漏洞</span>
+          <ExtractButton taskId={taskId} onImported={() => setReload((n) => n + 1)} />
           <button
             type="button"
             className="inline-flex items-center gap-1 outline-none focus-visible:underline"

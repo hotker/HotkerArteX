@@ -94,3 +94,68 @@ func TestEnrichPromptClipsEvidence(t *testing.T) {
 		t.Fatal("clip marker missing")
 	}
 }
+
+// 补录：没有 evidence 的条目必须被丢弃 —— "不许推测"写在提示里不算，代码里才算。
+func TestParseExtractedDropsUnsupported(t *testing.T) {
+	raw := `{"findings":[
+		{"vulnclass":"SQL注入","name":"登录接口SQL注入","severity":"严重","summary":"s","evidence":"POST /api/login -> 500 报错","target":"app.local"},
+		{"vulnclass":"越权","name":"越权访问订单","severity":"high","summary":"s","evidence":"","target":"app.local"},
+		{"vulnclass":"","name":"","severity":"high","summary":"无类型无名","evidence":"库里只有一条空记录"}
+	]}`
+	got, err := ParseExtracted(raw)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("only the supported entry should survive, got %d: %+v", len(got), got)
+	}
+	if got[0].Severity != "critical" {
+		t.Fatalf("severity should normalize 严重→critical, got %q", got[0].Severity)
+	}
+	if got[0].Name != "登录接口SQL注入" || got[0].Target != "app.local" {
+		t.Fatalf("fields lost: %+v", got[0])
+	}
+}
+
+// 空结果必须被当作合法的"没东西可补"，而不是解析失败。
+func TestParseExtractedEmptyIsFine(t *testing.T) {
+	got, err := ParseExtracted(`{"findings":[]}`)
+	if err != nil {
+		t.Fatalf("empty findings should parse: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected none, got %+v", got)
+	}
+	if _, err := ParseExtracted("这不是 JSON"); err == nil {
+		t.Fatal("garbage should error")
+	}
+}
+
+// 严重度归一：模型的自由写法（中文/大小写/未知）都要落到四档之一。
+func TestNormalizeSeverityAI(t *testing.T) {
+	cases := map[string]string{
+		"严重": "critical", "Critical": "critical", "高危": "high",
+		"medium": "medium", "低": "low", "info": "low", "不清楚": "medium", "": "medium",
+	}
+	for in, want := range cases {
+		if got := normalizeSeverityAI(in); got != want {
+			t.Fatalf("normalizeSeverityAI(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// 提示里必须明确"只补已验证的、evidence 要引用真实片段"，否则模型会大面积推测。
+func TestExtractPromptConstrains(t *testing.T) {
+	p := ExtractUserPrompt("转录内容", "事实清单", "- [high] SQL注入：登录", "zh-CN")
+	for _, want := range []string{"已被实际验证", "evidence", "不要重复补录", "不要自己编造"} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("prompt missing constraint %q", want)
+		}
+	}
+	if !strings.Contains(p, "转录内容") || !strings.Contains(p, "事实清单") {
+		t.Fatal("prompt must carry both transcript and facts")
+	}
+	if !strings.Contains(p, "已经记录的漏洞") {
+		t.Fatal("prompt must carry the dedup list")
+	}
+}
